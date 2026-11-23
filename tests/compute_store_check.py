@@ -1449,6 +1449,53 @@ def lds_overlap_reference(groups):
     return words
 
 
+LDS_COUNTERS = {
+    "ds_inc_u32": lambda old: old + 1 if old < 7 else 0,
+    "ds_dec_u32": lambda old: old - 1 if 1 <= old <= 7 else 7,
+    "ds_inc_rtn_u32": lambda old: old + 1 if old < 7 else 0,
+    "ds_dec_rtn_u32": lambda old: old - 1 if 1 <= old <= 7 else 7,
+    "ds_wrap_rtn_b32": lambda old: old - 7 if old >= 7 else old + 3,
+}
+
+
+def lds_counter_instruction(op):
+    if op == "ds_wrap_rtn_b32":
+        return f"{op} v10, v5, v10, v7"
+    if "_rtn_" in op:
+        return f"{op} v10, v5, v10"
+    return f"{op} v5, v6"
+
+
+def lds_counter_program(op):
+    snapshot = ["v_mov_b32_e32 v10, 7"] if "_rtn_" in op else ["ds_read_b32 v10, v5", "s_waitcnt lgkmcnt(0)"]
+    return DS_PREFIX + [
+        "v_lshlrev_b32_e32 v5, 2, v0",
+        "v_mad_u32_u24 v6, 1, v8, 0xfffffff0",
+        "ds_write_b32 v5, v6",
+        "s_waitcnt lgkmcnt(0)",
+        "v_mov_b32_e32 v6, 7",
+        "v_mov_b32_e32 v7, 3",
+    ] + snapshot + [
+        lds_counter_instruction(op),
+        "s_waitcnt lgkmcnt(0)",
+        "ds_read_b32 v11, v5",
+        "s_waitcnt lgkmcnt(0)",
+        "buffer_store_dwordx2 v[10:11], v8, s[20:23], 0 idxen",
+        "s_endpgm",
+    ]
+
+
+def lds_counter_reference(op, groups):
+    words = []
+    for lane in range(groups * 32):
+        old = (lane - 16) & 0xffffffff
+        words.extend((old, LDS_COUNTERS[op](old), SENTINEL))
+    return words
+
+
+LDS_CASES += [(op, lds_counter_program(op), LDS_BINDING) for op in LDS_COUNTERS]
+
+
 def lds_reference(groups):
     words = []
     for lane in range(groups * 32):
@@ -1510,7 +1557,7 @@ def lds_controls():
         ("ds_add_u32 v5, v254", "Unverified private LDS update"),
         ("ds_add_u32 v5, v6 offset:4", "Unsupported compute instruction"),
         ("ds_add_u32 v5, v6 gds", "Unsupported compute instruction"),
-        ("ds_inc_rtn_u32 v10, v5, v6", "Unsupported compute instruction"),
+        ("ds_inc_rtn_u64 v[10:11], v5, v[6:7]", "Unsupported compute instruction"),
     ):
         rejects(message, aot.lower, variant(lines, (update, bad)), 32, **LDS_BINDING)
     i = lines.index(update)
@@ -1521,6 +1568,21 @@ def lds_controls():
     pair = [update, "s_waitcnt lgkmcnt(0)"]
     rejects("LDS expression exceeds the profile limit", aot.lower,
             lines[:i] + pair * 32 + lines[i:], 32, **LDS_BINDING)
+
+
+    wrap = lds_counter_instruction("ds_wrap_rtn_b32")
+    lines = lds_counter_program("ds_wrap_rtn_b32")
+    for bad, message in (
+        (wrap + " offset:4", "Unsupported compute instruction"),
+        (wrap + " gds", "Unsupported compute instruction"),
+        (wrap.replace(", v7", ""), "Unverified LDS counter operands"),
+        (wrap.replace("v7", "v254"), "Unverified private LDS counter update"),
+        (wrap.replace("v5", "v8"), "Unverified private LDS counter update"),
+    ):
+        rejects(message, aot.lower, variant(lines, (wrap, bad)), 32, **LDS_BINDING)
+    i = lines.index(wrap)
+    rejects("Expected immediate s_waitcnt lgkmcnt(0) after DS", aot.lower,
+            lines[:i + 1] + lines[i + 2:], 32, **LDS_BINDING)
 
 
     update = "ds_add_rtn_u32 v10, v5, v10"
@@ -1639,6 +1701,10 @@ def ds_mutants(name, lines, binding, source):
         yield aot.lower(no_halfword, 32, **binding), 1
         no_byte = variant(lines, ("ds_write_b8 v5, v7 offset:1", "s_nop 0"))
         yield aot.lower(no_byte, 32, **binding), 2
+    elif name in LDS_COUNTERS:
+        no_update = "ds_read_b32 v10, v5" if "_rtn_" in name else "s_nop 0"
+        changed = variant(lines, (lds_counter_instruction(name), no_update))
+        yield aot.lower(changed, 32, **binding), 1
     elif name == "private":
         yield source.replace(" >> 16u) & 0xffffu)", " >> 0u) & 0xffffu)"), 2
     else:
@@ -1668,6 +1734,8 @@ def ds_draw(directory, compiler, renderer, backend, *, private=False):
                 words = lds_d16_reference(name, groups)
             elif name == "lds_overlap":
                 words = lds_overlap_reference(groups)
+            elif name in LDS_COUNTERS:
+                words = lds_counter_reference(name, groups)
             elif private:
                 words = lds_reference(groups)
             else:

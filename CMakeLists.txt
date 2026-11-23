@@ -3024,6 +3024,20 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_startup_exe>" "$<TARGET_FILE:cpu_startup_a>" "$<TARGET_FILE:cpu_startup_b>"
         "$<TARGET_FILE:cpu_startup_b_noinit>" "$<TARGET_FILE:cpu_startup_a_alt>"
         "$<TARGET_FILE:cpu_startup_exe_timeout>" "$<TARGET_FILE:cpu_startup_exe_create>")
+    # EXE-own TLS: a CRT-free EXE with a page-spanning initialized template and two TLS callbacks, launched
+    # by Windows and started with pe_map_run; the startup log and exit code must match (Refs #165, #870).
+    # The _early variant starts a thread inside its first process-attach callback (mapped only).
+    foreach(target IN ITEMS cpu_exe_tls cpu_exe_tls_early)
+        add_executable(${target} tests/cpu/exe_tls.cpp)
+        target_compile_options(${target} PRIVATE /GS- /Zl)
+        target_link_options(${target} PRIVATE /ENTRY:exe_entry /NODEFAULTLIB /SUBSYSTEM:CONSOLE /DYNAMICBASE
+            /INCREMENTAL:NO)
+        target_link_libraries(${target} PRIVATE kernel32)
+    endforeach()
+    target_compile_definitions(cpu_exe_tls_early PRIVATE EARLY_THREAD)
+    add_test(NAME cpu_native_exe_tls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/native_exe_tls_check.py" "$<TARGET_FILE:pe_map>" "$<TARGET_FILE:cpu_exe_tls>"
+        "$<TARGET_FILE:cpu_exe_tls_early>")
     # Lifecycle fixtures: two DLLs with the static MSVC runtime (B imports A) and a CRT-free event sink.
     add_library(cpu_life_sink SHARED tests/cpu/life_sink.cpp)
     target_compile_options(cpu_life_sink PRIVATE /GS- /Zl)

@@ -467,6 +467,34 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     raise ValueError("LDS expression exceeds the profile limit")
                 vector[dst] = ("alu", expression)
             ds_wait = True
+        elif m := re.fullmatch(r"ds_((?:inc|dec)(?:_rtn)?_u32|wrap_rtn_b32) "
+                               r"(v\d+(?:, v\d+){1,3})(?: offset:0)?", line):
+            op = m[1]
+            returns = "_rtn_" in op
+            wraps = op == "wrap_rtn_b32"
+            regs = [int(token[1:]) for token in m[2].split(", ")]
+            if len(regs) != 2 + returns + wraps:
+                raise ValueError("Unverified LDS counter operands")
+            addr, src, *step = regs[returns:]
+            value = vector.get(src)
+            advance = vector.get(step[0]) if wraps else None
+            if (not lds_enabled or guard_span is not None or max(regs) > 255
+                    or vector.get(addr) != ("lds_address",) or lds_word is None or not is_word(value)
+                    or (wraps and not is_word(advance))):
+                raise ValueError("Unverified private LDS counter update")
+            old, limit = hlsl_word(lds_word), hlsl_word(value)
+            if wraps:
+                expression = f"(({old} >= {limit}) ? ({old} - {limit}) : ({old} + {hlsl_word(advance)}))"
+            elif op.startswith("inc_"):
+                expression = f"(({old} >= {limit}) ? 0u : ({old} + 1u))"
+            else:
+                expression = f"((({old} == 0u) || ({old} > {limit})) ? {limit} : ({old} - 1u))"
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("LDS expression exceeds the profile limit")
+            if returns:
+                vector[regs[0]] = lds_word
+            lds_word = ("alu", expression)
+            ds_wait = True
         elif m := re.fullmatch(r"v_lshl_add_u32 v(\d+), v(\d+), (\d+), v(\d+)", line):
             dst, row, shift, column = map(int, m.groups())
             row_tag, column_tag = vector.get(row), vector.get(column)

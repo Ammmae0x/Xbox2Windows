@@ -134,6 +134,23 @@ LLVM_LIB=libLLVM-15.so.1 LLVM_MC=llvm-mc-15 LLVM_OBJCOPY=llvm-objcopy-15 \
   ./out/pe-env/bin/python -B tests/rdna2_tools_check.py
 ```
 
+On Fedora, the system `python3` creates the virtual environment without an extra package. Install the `llvm15` compatibility package. The package also installs versioned tool names such as `llvm-mc-15` and `llvm-objcopy-15`. The commands below use the package's full paths on x86-64 to select LLVM 15 explicitly:
+
+```bash
+sudo dnf install -y llvm15
+LLVM15=/usr/lib64/llvm15
+./out/pe-env/bin/python -B tests/pixel_aot_check.py binary \
+  "$LLVM15/bin/llvm-mc" "$LLVM15/bin/llvm-objcopy" "$LLVM15/lib/libLLVM-15.so"
+./out/pe-env/bin/python -B tests/ffx_dispatch_aot_check.py \
+  "$LLVM15/bin/llvm-mc" "$LLVM15/bin/llvm-objcopy" "$LLVM15/lib/libLLVM-15.so"
+LLVM_LIB="$LLVM15/lib/libLLVM-15.so" \
+  LLVM_MC="$LLVM15/bin/llvm-mc" \
+  LLVM_OBJCOPY="$LLVM15/bin/llvm-objcopy" \
+  ./out/pe-env/bin/python -B tests/rdna2_tools_check.py
+```
+
+These commands were checked on Fedora 45 with `llvm15` 15.0.7 and Python 3.15.2. See the [Fedora 45 package file list](https://packages.fedoraproject.org/pkgs/llvm15/llvm15/fedora-45.html) for the versioned tools and their paths. Fedora's default `llvm` package is a newer major version (23 on Fedora 45), which the fixtures do not target.
+
 ## Optional Vulkan arithmetic check
 
 With the Linux build of DXC, a Vulkan device, and [VkRunner](https://gitlab.freedesktop.org/mesa/vkrunner), run the generated FP32 exponent helpers against a Python reference.
@@ -200,7 +217,7 @@ The resulting test binaries run under Wine and `vkd3d`, not Windows D3D12 or WAR
 ## Troubleshooting
 
 - **Homebrew `llvm@15` is keg-only:** Homebrew does not symlink `llvm@15` binaries into `PATH` by default. Pass `"$(brew --prefix llvm@15)"` explicitly instead of calling bare `llvm-mc`.
-- **Shared library filename (`libLLVM-15.dylib` vs `libLLVM-15.so.1`):** Pass `libLLVM-15.dylib` from `"$(brew --prefix llvm@15)/lib"` on macOS, and `libLLVM-15.so.1` on Ubuntu/Debian.
+- **Shared library filename (`libLLVM-15.dylib` vs `libLLVM-15.so.1`):** Pass `libLLVM-15.dylib` from `"$(brew --prefix llvm@15)/lib"` on macOS, `libLLVM-15.so.1` on Ubuntu/Debian, and `/usr/lib64/llvm15/lib/libLLVM-15.so` on Fedora.
 - **LLVM versions newer than 15:** CI and the test fixtures target LLVM 15. Newer LLVM versions may print a different `exp` instruction spelling during AMDGPU disassembly.
 - **`tests/shader_probe_check.py` and `tests/dxil_retarget_check.py` with vs without arguments:** Running either script with no arguments runs its platform-independent controls (`shader_metadata_controls` and `dxil_retarget_controls`). Passing compiled `.cso` shaders, `root_probe`, and `dxil.dll` (`shader_metadata_probe`, `dxil_retarget_probe`) requires Windows and DXC.
 - **`tests/rdna2_tools_check.py` skips one test without `LLVM_LIB`:** Without `LLVM_LIB`, the script runs its pure-Python disassembler, extractor, and scanner checks and skips `test_llvm_comparison`. Setting `LLVM_LIB`, `LLVM_MC`, and `LLVM_OBJCOPY` runs the LLVM 15 comparison check as well.
