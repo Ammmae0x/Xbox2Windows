@@ -282,10 +282,10 @@ nj_overflow:
 neg_jcc ENDP
 
 ; uint64_t setcc_mix(uint64_t a, uint64_t b, uint8_t* out)
-; Seeds RAX so SETcc byte writes must retain bits 8..63, and records CMP/NEG flags to memory.
+; Seeds RAX (non-zero AL) so SETcc overwrites AL on both true and false outcomes while retaining bits 8..63, and records CMP/NEG flags to memory.
 setcc_mix PROC FRAME
     .endprolog
-    mov rax, 123456789abcde00h
+    mov rax, 123456789abcde5ah
     cmp ecx, edx
     mov r9d, eax
 IFDEF SWAP_OPERANDS
@@ -312,9 +312,6 @@ IFDEF SWAP_OPERANDS
 ELSE
     cmovg eax, DWORD PTR [r8]
 ENDIF
-    shl rax, 32
-    mov r9, 1122334455667788h
-    or rax, r9
     neg rcx
     cmovo rax, QWORD PTR [r8+8]
     cmove rax, rdx
