@@ -15,7 +15,7 @@ import zlib
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from disasm_rdna2 import disasm_rdna2, decode_instruction, disassemble_binary
 from extract_shaders import extract_shaders, extract_native_rdna2_code, sanitize_filename
-from pixel_aot import fma_mix_operand, native_program, parse_fma_mix
+from pixel_aot import fma_mix_operand, lower, native_program, parse_fma_mix
 from scan_unsupported_shaders import (
     analyze_shader_instructions,
     is_instruction_supported,
@@ -884,6 +884,79 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(trunc_insns[0]["length"], 8)
         self.assertIn("<truncated>", trunc_insns[0]["assembly"])
 
+        # End-to-end disasm_rdna2 -> pixel_aot.lower check on a minimal pixel shader with asymmetric
+        # v_fma_mix* modifiers and packed v_pk_* forms: swapping abs/neg across sources must change HLSL.
+        def encode_vop3p_2src(op, vdst, src0, src1, sel=(0, 0), sel_hi=(1, 1), neg_lo=(0, 0), neg_hi=(0, 0)):
+            w0 = (
+                0xcc000000
+                | (op << 16)
+                | (1 << 14)
+                | (sel[1] << 12)
+                | (sel[0] << 11)
+                | (neg_hi[1] << 9)
+                | (neg_hi[0] << 8)
+                | vdst
+            )
+            w1 = (
+                (neg_lo[1] << 30)
+                | (neg_lo[0] << 29)
+                | (sel_hi[1] << 28)
+                | (sel_hi[0] << 27)
+                | (src1 << 9)
+                | src0
+            )
+            return struct.pack("<2I", w0, w1)
+
+        def build_fma_mix_shader(swap_modifiers=False):
+            abs_b = (0, 1, 0) if swap_modifiers else (1, 0, 0)
+            neg_b = (1, 0, 0) if swap_modifiers else (0, 1, 0)
+            return b"".join([
+                struct.pack("<I", 0xbe800300 | (21 << 16) | 0x80),                    # s_mov_b32 s21, 0
+                struct.pack("<2I", 0xf4000000 | (0x02 << 18) | (28 << 6) | 10, 125 << 25),  # s_load_dwordx4 s[28:31], s[20:21], 0x0
+                bytes.fromhex("7fc08cbf"),                                            # s_waitcnt lgkmcnt(0)
+                struct.pack("<2I", 0xf4000000 | (0x0a << 18) | (28 << 6) | 14, 125 << 25),  # s_buffer_load_dwordx4 s[28:31], s[28:31], 0x0
+                bytes.fromhex("7fc08cbf"),                                            # s_waitcnt lgkmcnt(0)
+                struct.pack("<I", 0x7e000000 | (8 << 17) | (0x01 << 9) | 29),         # v_mov_b32_e32 v8, s29
+                struct.pack("<I", 0x7e000000 | (9 << 17) | (0x01 << 9) | 30),         # v_mov_b32_e32 v9, s30
+                struct.pack("<I", 0x7e000000 | (10 << 17) | (0x01 << 9) | 31),        # v_mov_b32_e32 v10, s31
+                encode_fma_mix(0x20, 12, 28, 256 + 8, 256 + 9, abs_bits=abs_b, neg_bits=neg_b,
+                               sel=(1, 1, 0), sel_hi=(1, 0, 0)),
+                encode_fma_mix(0x22, 10, 256 + 8, 256 + 12, 256 + 9, abs_bits=(1, 0, 0), neg_bits=(1, 0, 0),
+                               sel=(1, 0, 0), sel_hi=(1, 0, 0), use_clamp=True),
+                struct.pack("<I", 0x7e000000 | (13 << 17) | (0x0b << 9) | (256 + 10)),  # v_cvt_f32_f16_e32 v13, v10
+                encode_vop3p_2src(0x0f, 11, 28, 256 + 8, sel=(1, 0), sel_hi=(0, 1), neg_lo=(0, 1)),
+                encode_vop3p_2src(0x10, 11, 256 + 11, 256 + 9, neg_hi=(1, 0)),
+                encode_fma_mix(0x20, 14, 256 + 11, 0xf2, 0x80, sel=(1, 0, 0), sel_hi=(1, 0, 0)),
+                struct.pack("<I", 0x7e000000 | (15 << 17) | (0x01 << 9) | 0xf2),      # v_mov_b32_e32 v15, 1.0
+                struct.pack("<I", (0x2f << 25) | (16 << 17) | (13 << 9) | (256 + 12)),# v_cvt_pkrtz_f16_f32_e32 v16, v12, v13
+                struct.pack("<I", (0x2f << 25) | (17 << 17) | (15 << 9) | (256 + 14)),# v_cvt_pkrtz_f16_f32_e32 v17, v14, v15
+                bytes.fromhex("0f1c00f810110000"),                                    # exp mrt0 v16, v16, v17, v17 done compr vm
+                bytes.fromhex("000081bf"),                                            # s_endpgm
+            ])
+
+        shader_asm = [rec["assembly"] for rec in disasm_rdna2(build_fma_mix_shader(False))]
+        swapped_asm = [rec["assembly"] for rec in disasm_rdna2(build_fma_mix_shader(True))]
+        self.assertIn("v_fma_mix_f32 v12, |s28|, -v8, v9 op_sel:[1,1,0] op_sel_hi:[1,0,0]", shader_asm)
+        self.assertIn("v_fma_mix_f32 v12, -s28, |v8|, v9 op_sel:[1,1,0] op_sel_hi:[1,0,0]", swapped_asm)
+        self.assertIn("v_fma_mixhi_f16 v10, -|v8|, v12, v9 op_sel:[1,0,0] op_sel_hi:[1,0,0] clamp", shader_asm)
+        self.assertIn("v_pk_add_f16 v11, s28, v8 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[0,1]", shader_asm)
+        self.assertIn("v_pk_mul_f16 v11, v11, v9 neg_hi:[1,0]", shader_asm)
+
+        hlsl = lower(shader_asm, 20, 24, None, constant_descriptor=0)
+        swapped_hlsl = lower(swapped_asm, 20, 24, None, constant_descriptor=0)
+        self.assertNotEqual(hlsl, swapped_hlsl)
+        self.assertIn("mad(abs(widen16(asuint(params[0].x) >> 16)), (-widen16(asuint(alu5))), alu6)", hlsl)
+        self.assertIn("mad((-widen16(asuint(params[0].x) >> 16)), abs(widen16(asuint(alu5))), alu6)", swapped_hlsl)
+        self.assertIn("saturate(mad((-abs(widen16(asuint(alu5) >> 16))), alu8, alu6))", hlsl)
+
+        bad_shader_asm = [
+            "v_fma_mix_f32 v12, s28, v8, v9 op_sel:[1,1,0] neg_lo:[0,1,0]"
+            if line.startswith("v_fma_mix_f32 v12,") else line
+            for line in shader_asm
+        ]
+        with self.assertRaises(ValueError):
+            lower(bad_shader_asm, 20, 24, None, constant_descriptor=0)
+
     def test_mubuf_opcode_table_synthetic_forms(self):
         """Every GFX1013 MUBUF opcode must decode with exact width, scanner recognition, and 8-byte alignment."""
         from disasm_rdna2 import MUBUF_OPS
@@ -1168,6 +1241,10 @@ class TestRdna2Disasm(unittest.TestCase):
             "s_bitcmp0_b32 s0, s1",
             "s_bitcmp0_b64 s[4:5], s6",
             "v_pk_add_u16 v4, v3, 1",
+            "v_pk_add_f16 v22, s44, v19 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[0,1]",
+            "v_pk_mul_f16 v23, v22, v20 neg_hi:[1,0]",
+            "v_fma_mix_f32 v12, |s44|, -v19, v20 op_sel:[1,1,0] op_sel_hi:[1,0,0]",
+            "v_fma_mixhi_f16 v22, -|v19|, v23, v20 op_sel:[1,0,0] op_sel_hi:[1,0,0] clamp",
             "v_cmp_lt_f32_e32 vcc_lo, v1, v2",
             "v_cmp_eq_u32_e32 vcc_lo, s1, v2",
             "v_cmpx_gt_i32_e32 v1, v2",
