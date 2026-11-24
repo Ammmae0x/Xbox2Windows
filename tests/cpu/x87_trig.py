@@ -10,6 +10,7 @@ tests/cpu/x87_moves.py. emit checks that every decoded x87 instruction is the fo
 The independent model uses 150-digit Decimal arithmetic and shares no code with tools/x87_soft.h.
 """
 from decimal import Decimal, ROUND_HALF_EVEN, getcontext
+import ctypes
 from pathlib import Path
 import platform
 import random
@@ -69,8 +70,8 @@ CONTROLS = {
     # The out-of-range threshold uses 2^62 instead of 2^63.
     "c262": (re.compile(r"if \(u\.e >= 63\) \{([^\n]*// trig range)"), r"if (u.e >= 62) {\1"),
     # FSINCOS writes cos into ST(1) and sin into ST(0).
-    "sincosswap": (re.compile(r"x87_slot\[(\d+)\] = x87_sincos\(([^;]+)\); x87_slot\[(\d+)\] = c;"),
-                   r"x87_slot[\3] = x87_sincos(\2); x87_slot[\1] = c;"),
+    "sincosswap": (re.compile(r"x87_slot\[(\d+)\] = x87_sincos\(([^;]+)\); if \(c2\) x87_trap\(\); x87_slot\[(\d+)\] = c;"),
+                   r"x87_slot[\3] = x87_sincos(\2); if (c2) x87_trap(); x87_slot[\1] = c;"),
     # FPTAN pushes 0.0 instead of 1.0.
     "ptanno1": (re.compile(r"one_out = \{x87_integer_bit, 0x3fff\};  // ptan one"),
                 "one_out = {0, 0};  // ptan one"),
@@ -657,16 +658,29 @@ def check(harness_path, native_path, lifted_path, *control_paths):
             raise AssertionError(f"{label}: {bad}/{len(expected)} mismatches")
     print(f"{len(expected)} cases over {len(SEQUENCES)} exports (output block and guards) matched the reference "
           "in native and translated DLLs; each export returned with control 0x027f and an empty stack")
-    # Out-of-range |x| >= 2^63 for FSINCOS/FPTAN is outside the static-depth native profile (hardware does
-    # not push when C2=1); verify the lifted DLL still sets C2=1 and writes INDEFINITE into the pushed slot.
-    lifted_run = base.Runner(harness_path, lifted_path)
-    for oor_v in ((J, 16383 + 63), (J, (16383 + 63) | 0x8000), (J, 16383 + 64)):
+    # Out-of-range |x| >= 2^63 for FSINCOS/FPTAN is outside the static-depth profile (hardware does not
+    # push when C2=1); verify the lifted DLL traps via x87_trap() (STATUS_ILLEGAL_INSTRUCTION) before
+    # writing the output buffer instead of continuing with a divergent stack.
+    lifted_lib = ctypes.CDLL(str(Path(lifted_path).resolve()))
+    in_buf = ctypes.create_string_buffer(INPUT)
+    out_buf = ctypes.create_string_buffer(OUTPUT)
+    for oor_v in ((J, 16383 + 63), (J, (16383 + 63) | 0x8000), (J, 16383 + 64), (J, 16383 + 100)):
         oor_data = m80_bytes(oor_v).ljust(INPUT, b"\0")
-        for seq_name in ("sincos_m80", "ptan_m80"):
-            got, state = lifted_run(seq_name, oor_data)
-            want = reference(seq_name, oor_data)
-            if not base.entry_state_ok(state) or got != want:
-                raise AssertionError(f"lifted {seq_name} out-of-range {oor_v} mismatch")
+        for seq_name in ("sincos_m80", "ptan_m80", "ptan_c2_reset"):
+            fn = getattr(lifted_lib, seq_name)
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            fn.restype = ctypes.c_uint64
+            ctypes.memmove(in_buf, oor_data, INPUT)
+            ctypes.memset(out_buf, 0xCC, OUTPUT)
+            try:
+                fn(ctypes.addressof(in_buf), ctypes.addressof(out_buf))
+            except OSError as exc:
+                if (getattr(exc, "winerror", 0) or 0) & 0xFFFFFFFF != 0xC000001D:
+                    raise AssertionError(f"lifted {seq_name} out-of-range {oor_v} unexpected SEH {exc!r}") from exc
+            else:
+                raise AssertionError(f"lifted {seq_name} out-of-range {oor_v} returned instead of trapping")
+            if out_buf.raw != b"\xcc" * OUTPUT:
+                raise AssertionError(f"lifted {seq_name} out-of-range {oor_v} wrote output before trapping")
     print(f"processor: {platform.processor()}")
     first = {}
     for name, data, want in expected:
@@ -681,7 +695,17 @@ def check(harness_path, native_path, lifted_path, *control_paths):
     for path in control_paths:
         control = Path(path).stem.rsplit("_", 1)[-1]
         run = base.Runner(harness_path, path)
-        bad = sum(1 for name, data, want in expected if not lifted_matches(name, run(name, data)[0], want))
+        bad = 0
+        for name, data, want in expected:
+            try:
+                got, _ = run(name, data)
+            except OSError as exc:
+                if (getattr(exc, "winerror", 0) or 0) & 0xFFFFFFFF == 0xC000001D:
+                    bad += 1
+                    continue
+                raise
+            if not lifted_matches(name, got, want):
+                bad += 1
         print(f"control {control}: {bad}/{len(expected)} mismatches")
         if not bad:
             raise AssertionError(f"control {control} matched every case")

@@ -752,6 +752,15 @@ static inline void x87_sincos_reduced(X87U128 r_val, int re, X87U128& sin_v, int
     x87_u128_norm(cos_v, cos_e);
 }
 
+// Trap when an instruction hits a case outside the static-depth profile (such as |ST(0)| >= 2^63 on FSINCOS/FPTAN).
+static inline void x87_trap() {
+#if defined(_MSC_VER) && !defined(__clang__)
+    __ud2();
+#else
+    __builtin_trap();
+#endif
+}
+
 // FSIN, FCOS and FSINCOS: 64-bit extended precision (precision control does not apply), C2 set when |ST(0)| >= 2^63.
 static inline void x87_sincos_core(X87Value a, uint16_t cw, bool& c2, X87Value* sin_out, X87Value* cos_out) {
     c2 = false;

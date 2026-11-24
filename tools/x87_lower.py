@@ -6,7 +6,7 @@ The profile accepts:
 - FSIN, FCOS, FSINCOS, FPTAN and FPATAN (64-bit precision; FSIN, FCOS, FSINCOS and FPTAN set C2 when
   |ST(0)| >= 2^63 and leave C0, C1 and C3 undefined; FPATAN leaves C0 to C3 undefined; finite |ST(0)| >= 2^63
   for FSINCOS and FPTAN is outside the static-depth profile because hardware leaves the stack unchanged
-  without pushing while static-depth lowering unconditionally pushes);
+  without pushing, so lowered FSINCOS and FPTAN trap via x87_trap() when |ST(0)| >= 2^63);
 - FXTRACT, which replaces ST(0) by its exponent and pushes its significand, and FSCALE;
 - the constant loads FLD1, FLDZ, FLDPI, FLDL2T, FLDL2E, FLDLG2 and FLDLN2;
 - FILD, FISTP and FISTTP with an m16, m32 or m64 integer operand, and FIST with m16 or m32;
@@ -779,10 +779,10 @@ def _statement(i, depth, address, checked, parity, status_word=False):
                 f"x87_sw = static_cast<uint16_t>(c2 ? 0x0400 : 0); }}  // {name}")
     if op == M.FSINCOS:
         return (f"{{ bool c2 = false; X87Value c; x87_slot[{top}] = x87_sincos(x87_slot[{top}], c, x87_cw, c2); "
-                f"x87_slot[{depth}] = c; x87_sw = static_cast<uint16_t>(c2 ? 0x0400 : 0); }}  // fsincos")
+                f"if (c2) x87_trap(); x87_slot[{depth}] = c; x87_sw = static_cast<uint16_t>(c2 ? 0x0400 : 0); }}  // fsincos")
     if op == M.FPTAN:
         return (f"{{ bool c2 = false; X87Value one; x87_slot[{top}] = x87_ptan(x87_slot[{top}], one, x87_cw, c2); "
-                f"x87_slot[{depth}] = one; x87_sw = static_cast<uint16_t>(c2 ? 0x0400 : 0); }}  // fptan")
+                f"if (c2) x87_trap(); x87_slot[{depth}] = one; x87_sw = static_cast<uint16_t>(c2 ? 0x0400 : 0); }}  // fptan")
     if op == M.FPATAN:
         return f"x87_slot[{top - 1}] = x87_patan(x87_slot[{top - 1}], x87_slot[{top}], x87_cw);  // fpatan"
     if op in (M.FCHS, M.FABS):
