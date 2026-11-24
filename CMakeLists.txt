@@ -2310,6 +2310,14 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_switch_shift_flags COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/switch_shift_flags_check.py" "$<TARGET_FILE:cpu_register_probe>"
         "$<TARGET_FILE:cpu_switch_shift_flags>" "$<TARGET_FILE:cpu_switch_shift_flags_lifted>")
+    cpu_asm_fixture(cpu_switch_sal switch_sal)
+    cpu_translation(cpu_switch_sal cpu_switch_aot
+        sal_reg_cl_8,sal_reg_cl_16,sal_reg_cl_32,sal_reg_cl_64,sal_mem_8_16,sal_mem_32_64,sal_mem_imm_edge,sal1_8,sal1_16,sal1_32,sal1_64,sal1_32_imm1,sal1_16m,saln_8,saln_16,saln_32,saln_64,salw_64,saln_32m,jcc_sal64_o,jcc_sal8_be,cmov_sal,sal_narrow_ret,sal_nonvolatile_frame)
+    add_test(NAME cpu_aot_switch_sal COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_sal_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_switch_sal>" "$<TARGET_FILE:cpu_switch_sal_lifted>" "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(cpu_aot_switch_sal PROPERTIES
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_switch_sal.txt")
     cpu_asm_fixture(cpu_switch_bit_tests switch_bit_tests)
     cpu_translation(cpu_switch_bit_tests cpu_switch_aot
         bt16_reg,bt32_reg,bt64_reg,bts16_reg,bts32_reg,bts64_reg,btr16_reg,btr32_reg,btr64_reg,btc16_reg,btc32_reg,btc64_reg,bt16_imm,bt32_imm,bt64_imm,bts16_imm,bts32_imm,bts64_imm,btr16_imm,btr32_imm,btr64_imm,btc16_imm,btc32_imm,btc64_imm,bt16_mem,bt32_mem,bt64_mem,bts16_mem,bts32_mem,bts64_mem,btr16_mem,btr32_mem,btr64_mem,btc16_mem,btc32_mem,btc64_mem,jcc_bt,jcc_btr_nc,cmov_bt)

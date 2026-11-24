@@ -10128,3 +10128,21 @@ ctest --preset dev --no-tests=error -R '^cpu_aot_switch_fsgsbase_rdpid$' -V
 The [MASM fixture](../tests/cpu/switch_fsgsbase_rdpid.asm) exports 9 translated functions covering 32- and 64-bit `rdfsbase`/`rdgsbase` (with high-bit prefill), nonvolatile `rbx`/`r12`/`r13` reads, `rdpid` single and repeated reads, `FLAG_NEUTRAL` flag preservation across `add` to `setb`/`sete`/`sets`/`seto`/`setp`, and unused reads, plus native-only `CPUID.07H`, `RDTSCP`, and `FS_BASE`-roundtrip helpers and 7 rejected negative exports (including 32- and 64-bit `wrfsbase`/`wrgsbase`). [The differential check](../tests/cpu/switch_fsgsbase_rdpid_check.py) exits 77 if `CPUID.07H` lacks `FSGSBASE` (`EBX[0]`) or `RDPID` (`ECX[22]`) and otherwise pins the thread to up to four logical processors, verifying 232 CMake-lifted and 232 `/O2`-lifted checks across `dev` and `release` builds against native execution (including canonical `FS_BASE` sweeps via the native-only helper and `RDTSCP` `IA32_TSC_AUX`), five `/O2` mutated-C++ negative controls (`keep_high32`, `truncate_64`, `swap_fs_gs`, `constant_rdpid`, `clobber_flags`), 27 unit/MASM rejection controls, and 9 PE-patched DLL rejection controls, while recording decoded mnemonics through `FORM_COVERAGE_RECORD`.
 
 Not covered by this experiment: host segment-base writes (`wrfsbase`/`wrgsbase`, which require an explicit isolation/restoration profile), cross-thread `FS_BASE`/`GS_BASE` migration, and title CPU code execution.
+
+## SAL (/6) lifting in cpu_switch_aot
+
+[The switch translator](../tools/cpu_switch_aot.py) adds `SAL` (the ModR/M `/6` encoding alias of `SHL` across `docs/coverage/x64_zen2.tsv` group `Integer` `sal`) to `SHIFTS` and `Lifter.lower` across 8-, 16-, 32-, and 64-bit register and memory destinations with immediate (`1`, `imm8`) and `CL` counts:
+
+- Non-flag-producing `SAL` masks the count to five bits (six for 64-bit operands), keeps upper register/memory bytes for 8- and 16-bit writes, and zero-extends 32-bit register writes.
+- Immediate `SAL` with a masked count of `1` to `width * 8 - 1` produces `CF`, `ZF`, `SF`, and `PF` (and `OF` when the masked count is `1`), refusing `CL` counts, masked count `0`, counts `>= width * 8`, and `OF`-reading conditions (`O`/`NO`/`L`/`GE`/`LE`/`G`) after counts above `1`.
+
+```powershell
+cmake --build --preset dev --target cpu_switch_sal cpu_switch_sal_lifted
+ctest --preset dev --no-tests=error -R '^(cpu_aot_switch_sal|cpu_aot_switch_shift_flags)$' -V
+```
+
+### Measured results and open scope
+
+The [MASM fixture](../tests/cpu/switch_sal.asm) emits explicit `/6` byte sequences (because ML64 assembles the `sal` mnemonic as `/4` `SHL`) across 24 translated functions covering all 12 `SAL` `Code` encodings (`SAL_RM{8,16,32,64}_{1,CL,IMM8}`), register and memory destinations, count-`1` all-16 `SETcc` checks, count->1 10-condition `SETcc` checks, `Jcc`, `CMOVcc`, narrow returns, and nonvolatile/stack-frame operands, plus 11 negative exports. [The differential check](../tests/cpu/switch_sal_check.py) verifies 28,024 `dev` and 28,024 `/O2` comparisons against native execution and the Python reference, four `/O2` mutated-C++ controls (`shift_dir`, `cf_mask`, `of_mask`, `cl_mask`), 11 MASM, 4 unit, and 7 PE-patched rejection controls, and records decoded mnemonics via `iced_x86.Mnemonic` to `FORM_COVERAGE_RECORD`.
+
+Not covered by this experiment: `SAL` outside leaf/switch-lifted functions, and title CPU code execution.
