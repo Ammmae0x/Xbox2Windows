@@ -136,6 +136,106 @@ class MeshOdPipelinePositiveTests(unittest.TestCase):
             self.assertTrue(hlsl.startswith(tool.HEADER))
             self.assertTrue(hlsl.endswith(tool.FOOTER))
 
+    def test_variant_info_hlsl_body_matches_expected_and_size(self):
+        import re
+
+        chain_re = re.compile(
+            r"^\s+h = \(h \^ \(h >> 15u\)\) \* 0x2c1b3c6du \+ (\d+)u;$"
+        )
+        branch_if_re = re.compile(
+            r"^\s+if \(\(\(tid \+ (\d+)u\) & (\d+)u\) != 0u\) h \+= (\d+)u \* 0x01000193u;$"
+        )
+        branch_else_re = re.compile(
+            r"^\s+else h \^= (\d+)u \* 0x85ebca6bu;$"
+        )
+        loop_for_re = re.compile(
+            r"^\s+for \(uint i(\d+) = 0u; i\1 < seed\[1\]\.x \+ \(\(tid \+ \1u\) & 3u\); \+\+i\1\)$"
+        )
+        loop_body_re = re.compile(
+            r"^\s+h = \(h \* 0x01000193u\) \^ \(i(\d+) \+ \1u\);$"
+        )
+
+        seed = 0x13572468
+        for name in (
+            "control",
+            "chain_1",
+            "chain_4",
+            "branches_1",
+            "branches_5",
+            "loops_1",
+            "loops_3",
+        ):
+            with self.subTest(variant=name):
+                family, size, hlsl, exp = tool.variant_info(name, seed=seed)
+                self.assertEqual(exp, tool.expected_values(family, size, seed=seed))
+                expected_line_prefix = "    static const uint expected[3] = {"
+                body_start = hlsl.index(expected_line_prefix)
+                body_start = hlsl.index("\n", body_start) + 1
+                body_end = len(hlsl) - len(tool.FOOTER)
+                body = hlsl[body_start:body_end]
+                body_lines = body.splitlines()
+
+                if family == "control":
+                    self.assertEqual(body_lines, [])
+                    sim = [seed & tool.MASK] * 3
+                elif family == "chain":
+                    self.assertEqual(len(body_lines), size)
+                    ks = []
+                    for line in body_lines:
+                        m = chain_re.fullmatch(line)
+                        self.assertIsNotNone(m, line)
+                        ks.append(int(m.group(1)))
+                    self.assertEqual(ks, list(range(size)))
+                    sim = []
+                    for _tid in range(3):
+                        h = seed & tool.MASK
+                        for k in ks:
+                            h = ((((h ^ (h >> 15)) * 0x2C1B3C6D) & tool.MASK) + k) & tool.MASK
+                        sim.append(h)
+                elif family == "branches":
+                    self.assertEqual(len(body_lines), size * 2)
+                    steps = []
+                    for idx in range(0, len(body_lines), 2):
+                        m_if = branch_if_re.fullmatch(body_lines[idx])
+                        m_else = branch_else_re.fullmatch(body_lines[idx + 1])
+                        self.assertIsNotNone(m_if, body_lines[idx])
+                        self.assertIsNotNone(m_else, body_lines[idx + 1])
+                        k_if, mask_val, k_then = map(int, m_if.groups())
+                        k_else = int(m_else.group(1))
+                        self.assertEqual((k_if, k_then, k_else), (idx // 2, idx // 2, idx // 2))
+                        steps.append((k_if, mask_val))
+                    sim = []
+                    for tid in range(3):
+                        h = seed & tool.MASK
+                        for k, mask_val in steps:
+                            if ((tid + k) & mask_val) != 0:
+                                h = (h + k * 0x01000193) & tool.MASK
+                            else:
+                                h = (h ^ (k * 0x85EBCA6B)) & tool.MASK
+                        sim.append(h)
+                else:
+                    self.assertEqual(family, "loops")
+                    self.assertEqual(len(body_lines), size * 2)
+                    ks = []
+                    for idx in range(0, len(body_lines), 2):
+                        m_for = loop_for_re.fullmatch(body_lines[idx])
+                        m_body = loop_body_re.fullmatch(body_lines[idx + 1])
+                        self.assertIsNotNone(m_for, body_lines[idx])
+                        self.assertIsNotNone(m_body, body_lines[idx + 1])
+                        self.assertEqual(m_for.group(1), m_body.group(1))
+                        ks.append(int(m_for.group(1)))
+                    self.assertEqual(ks, list(range(size)))
+                    sim = []
+                    for tid in range(3):
+                        h = seed & tool.MASK
+                        for k in ks:
+                            trips = (tool.LOOP_BASE + ((tid + k) & 3)) & tool.MASK
+                            for i in range(trips):
+                                h = ((h * 0x01000193) & tool.MASK) ^ ((i + k) & tool.MASK)
+                        sim.append(h)
+
+                self.assertEqual(sim, exp)
+
     def test_fixture_layout_and_reference_images(self):
         seed = 0x1234ABCD
         visible_blob = tool.fixture(seed=seed, visible=True)
