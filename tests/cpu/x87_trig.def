@@ -10,6 +10,7 @@ EXPORTS
     sincos_sum
     sincos_depth7
     ptan_m80
+    ptan_c2_reset
     ptan_to_m64
     ptan_depth7
     patan_m80

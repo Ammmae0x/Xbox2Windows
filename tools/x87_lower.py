@@ -4,7 +4,9 @@ The profile accepts:
 - FLD and FSTP with an m32, m64 or m80 operand, and FST with an m32 or m64 operand;
 - FLD, FST, FSTP and FXCH with ST(i), FCHS and FABS, FSQRT and FRNDINT;
 - FSIN, FCOS, FSINCOS, FPTAN and FPATAN (64-bit precision; FSIN, FCOS, FSINCOS and FPTAN set C2 when
-  |ST(0)| >= 2^63 and leave C0, C1 and C3 undefined; FPATAN leaves C0 to C3 undefined);
+  |ST(0)| >= 2^63 and leave C0, C1 and C3 undefined; FPATAN leaves C0 to C3 undefined; finite |ST(0)| >= 2^63
+  for FSINCOS and FPTAN is outside the static-depth profile because hardware leaves the stack unchanged
+  without pushing while static-depth lowering unconditionally pushes);
 - FXTRACT, which replaces ST(0) by its exponent and pushes its significand, and FSCALE;
 - the constant loads FLD1, FLDZ, FLDPI, FLDL2T, FLDL2E, FLDLG2 and FLDLN2;
 - FILD, FISTP and FISTTP with an m16, m32 or m64 integer operand, and FIST with m16 or m32;

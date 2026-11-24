@@ -146,6 +146,24 @@ ptan_m80 PROC FRAME
     ret
 ptan_m80 ENDP
 
+ptan_c2_reset PROC FRAME
+    .endprolog
+    fldz
+    fldz
+    fdivp st(1), st
+    ftst
+    fstp st(0)
+    fld tbyte ptr [rcx+0]
+    fptan
+    fnstsw ax
+    and ah, 04h
+    mov byte ptr [rdx+32], ah
+    fstp tbyte ptr [rdx+16]
+    fstp tbyte ptr [rdx+0]
+    mov eax, 0
+    ret
+ptan_c2_reset ENDP
+
 ptan_to_m64 PROC FRAME
     .endprolog
     fld tbyte ptr [rcx+0]

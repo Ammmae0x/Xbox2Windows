@@ -49,6 +49,9 @@ SEQUENCES = {
     # FPTAN replaces ST(0) with tan and pushes 1.0: ST(0)=1.0 -> [rdx+16], ST(1)=tan -> [rdx+0].
     "ptan_m80": ("m80_in", [("fld", "m80", 0), ("fptan",), ("sw_c2", 32),
                             ("fstp", "m80", 16), ("fstp", "m80", 0)]),
+    "ptan_c2_reset": ("m80_in", [("fldz",), ("fldz",), ("fdivp", "pop", 1), ("ftst",), ("pop",),
+                                 ("fld", "m80", 0), ("fptan",), ("sw_c2", 32),
+                                 ("fstp", "m80", 16), ("fstp", "m80", 0)]),
     "ptan_to_m64": ("m80_in", [("fld", "m80", 0), ("fptan",), ("pop",), ("fstp", "m64", 0)]),
     "ptan_depth7": ("m64x7_in", [("fld", "m64", 8 * k) for k in range(7)] + [("fptan",)]
                     + [("fstp", "m64", 8 * k) for k in range(8)]),
@@ -88,7 +91,7 @@ CONTROLS = {
 
 def asm_lines(step, name):
     op, *args = step
-    if op in ("fsin", "fcos", "fsincos", "fptan", "fpatan"):
+    if op in ("fsin", "fcos", "fsincos", "fptan", "fpatan", "fldz", "ftst"):
         return [f"    {op}"]
     if op == "fmul_st0":
         return ["    fmul st(0), st(0)"]
@@ -109,7 +112,7 @@ def asm_lines(step, name):
 
 def expected_forms(step):
     op, *args = step
-    if op in ("fsin", "fcos", "fsincos", "fptan", "fpatan"):
+    if op in ("fsin", "fcos", "fsincos", "fptan", "fpatan", "fldz", "ftst"):
         return [(op, "")]
     if op == "fmul_st0":
         return [("fmul", "st0,st0")]
@@ -351,6 +354,16 @@ def reference(name, data):
             is_fin = cy[0] == "finite" and cx[0] == "finite"
             slots.append(patan(y, x))
             inexact = inexact[:-2] + [is_fin]
+        elif op == "fldz":
+            slots.append((0, 0))
+            inexact.append(False)
+        elif op == "fdivp":
+            b = slots.pop()
+            a = slots.pop()
+            slots.append(_div(a, b))
+            inexact = inexact[:-2] + [False]
+        elif op == "ftst":
+            c2 = 1 if classify(slots[-1])[0] in ("nan", "unsupported") else 0
         elif op == "fld":
             raw = read(*args)
             slots.append((raw & (2 ** 64 - 1), raw >> 64) if args[0] == "m80" else from_binary(args[0], raw))
@@ -387,6 +400,11 @@ def reference(name, data):
 def _mul(a, b):
     import x87_mul
     return x87_mul.mul(a, b)
+
+
+def _div(a, b):
+    import x87_div
+    return x87_div.div(a, b)
 
 
 # ---- Inputs ----------------------------------------------------------------------------------------
@@ -567,7 +585,7 @@ def native_matches(name, data, got, want):
             return False
         gv, wv = unpack_m80(got[:10]), unpack_m80(want[:10])
         return m80_ulp_diff(gv, wv) <= 4.0
-    if name == "ptan_m80":
+    if name in ("ptan_m80", "ptan_c2_reset"):
         if got[10:16] != want[10:16] or got[16:26] != want[16:26] or got[26:32] != want[26:32] or got[32] != want[32] or got[33:] != want[33:]:
             return False
         gt, wt = unpack_m80(got[:10]), unpack_m80(want[:10])
@@ -607,7 +625,7 @@ def lifted_matches(name, got, want):
         return (got[10:16] == want[10:16] and got[26:] == want[26:]
                 and m80_ulp_diff(unpack_m80(got[:10]), unpack_m80(want[:10])) <= 1.0
                 and m80_ulp_diff(unpack_m80(got[16:26]), unpack_m80(want[16:26])) <= 1.0)
-    if name == "ptan_m80":
+    if name in ("ptan_m80", "ptan_c2_reset"):
         return (got[10:16] == want[10:16] and got[16:] == want[16:]
                 and m80_ulp_diff(unpack_m80(got[:10]), unpack_m80(want[:10])) <= 1.0)
     if name in ("sincos_depth7", "ptan_depth7"):
@@ -639,6 +657,16 @@ def check(harness_path, native_path, lifted_path, *control_paths):
             raise AssertionError(f"{label}: {bad}/{len(expected)} mismatches")
     print(f"{len(expected)} cases over {len(SEQUENCES)} exports (output block and guards) matched the reference "
           "in native and translated DLLs; each export returned with control 0x027f and an empty stack")
+    # Out-of-range |x| >= 2^63 for FSINCOS/FPTAN is outside the static-depth native profile (hardware does
+    # not push when C2=1); verify the lifted DLL still sets C2=1 and writes INDEFINITE into the pushed slot.
+    lifted_run = base.Runner(harness_path, lifted_path)
+    for oor_v in ((J, 16383 + 63), (J, (16383 + 63) | 0x8000), (J, 16383 + 64)):
+        oor_data = m80_bytes(oor_v).ljust(INPUT, b"\0")
+        for seq_name in ("sincos_m80", "ptan_m80"):
+            got, state = lifted_run(seq_name, oor_data)
+            want = reference(seq_name, oor_data)
+            if not base.entry_state_ok(state) or got != want:
+                raise AssertionError(f"lifted {seq_name} out-of-range {oor_v} mismatch")
     print(f"processor: {platform.processor()}")
     first = {}
     for name, data, want in expected:
