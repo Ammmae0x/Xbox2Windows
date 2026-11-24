@@ -1711,8 +1711,12 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
 void __stdcall list_graphics_root(Wrapper* self, void* root)
 {
     Wrapper* w = as_wrapper(root);
-    pass_of(self).root = w ? root_info(w) : nullptr;
-    pass_of(self).srv_bound = 0;
+    Pass& pass = pass_of(self);
+    const auto* params = w ? root_info(w) : nullptr;
+    if (pass.root != params)
+        std::fill_n(pass.root_address, 16, 0);
+    pass.root = params;
+    pass.srv_bound = 0;
     if (auto* list = recording(self); list && w && w->own().kind == root_signature_kind && w->own().real)
         list->SetGraphicsRootSignature(static_cast<ID3D12RootSignature*>(w->own().real));
 }
@@ -1866,6 +1870,24 @@ void __stdcall list_root_srv(Wrapper* self, UINT parameter, u64 address)
     if (!desktop) return;
     list->SetGraphicsRootShaderResourceView(parameter, desktop);
     pass.srv_bound |= 1u << parameter;
+}
+// List slot 42 (desktop 38 + 4), SetGraphicsRootConstantBufferView(parameter, title GPU address).
+// A translated shader reads a root CBV through the same pointer source as a root SRV (root_address). Nothing
+// is forwarded to the desktop list and srv_bound is left alone: bit 0 means a vertex-fetch SRV is bound.
+void __stdcall list_root_cbv(Wrapper* self, UINT parameter, u64 address)
+{
+    auto* list = recording(self);
+    if (!list) return;
+    Pass& pass = pass_of(self);
+    if (!pass.root || parameter >= pass.root->size() || parameter >= 16) return;
+    const D3D12_ROOT_PARAMETER_TYPE type = (*pass.root)[parameter].type;
+    if (type != D3D12_ROOT_PARAMETER_TYPE_CBV) {
+        static LONG refused;
+        if (first_calls(refused, 1))
+            log("x2w-render root CBV %u ignored: the root signature declares parameter type %d", parameter, static_cast<int>(type));
+        return;
+    }
+    pass.root_address[parameter] = (address && readable_window(address, 1)) ? address : 0;
 }
 extern LONG translated_draws, untranslated_draws, frame_number;
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
@@ -3209,6 +3231,7 @@ void build_tables()
         list_typed[32] = reinterpret_cast<ListTyped>(&list_set_descriptor_heaps);
         list_typed[34] = reinterpret_cast<ListTyped>(&list_graphics_root);
         list_typed[44] = reinterpret_cast<ListTyped>(&list_root_srv);
+        list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
         list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
         list_typed[36] = reinterpret_cast<ListTyped>(&list_table);
