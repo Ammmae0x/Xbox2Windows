@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 
 import pefile
-from iced_x86 import (Code as C, Decoder, EncodingKind, FlowControl, MemorySizeExt, Mnemonic as M, OpKind as K,
+from iced_x86 import (Code as C, Decoder, EncodingKind, FlowControl, MemorySizeExt, Mnemonic as M, OpAccess, OpKind as K,
                       Register as R, RegisterExt, RflagsBits as F)
 
 from cpu_leaf_aot import export_rva
@@ -431,6 +431,8 @@ def lahf_sources(body, host_ops):
                                               K.IMMEDIATE32TO64)):
                     sources.add(prev.ip)
                     break
+                if prev.mnemonic in (M.POPF, M.POPFQ):
+                    break
                 raise ValueError(f"{where} reads AF and PF after {prev} at {prev.ip:#x}; only a register ADD, "
                                  "SUB or CMP defines them for LAHF")
             if prev.ip in targets:
@@ -440,12 +442,193 @@ def lahf_sources(body, host_ops):
     return sources
 
 
+# Flag-stack operations (16-bit FLAGS and 64-bit RFLAGS) and their byte deltas on the private frame stack.
+FLAG_STACK_OPS = frozenset({M.PUSHF, M.PUSHFQ, M.POPF, M.POPFQ})
+FLAG_STACK_DELTAS = {C.PUSHFW: 2, C.PUSHFQ: 8, C.POPFW: -2, C.POPFQ: -8}
+FLAG_STACK_LIMIT = 8 * FRAME_WORDS
+FLAG_STATUS_BITS = F.CF | F.PF | F.AF | F.ZF | F.SF | F.OF
+FLAG_STATUS_NAMES = (("CF", F.CF), ("PF", F.PF), ("AF", F.AF), ("ZF", F.ZF), ("SF", F.SF), ("OF", F.OF))
+
+
+def _format_flag_names(mask):
+    return ", ".join(name for name, bit in FLAG_STATUS_NAMES if mask & bit)
+
+
+def flag_stack_depths(body, exits, host_ops=None):
+    """Track bounded flag-stack depth (bytes pushed below entry RSP) before each reachable instruction.
+
+    Requires every path from entry to return, call, indirect branch, or exit with balanced depth 0, rejects
+    underflow or overflow beyond FLAG_STACK_LIMIT, rejects mismatched depths at control-flow joins, rejects
+    disallowed prefixes on flag-stack operations, and forbids explicit RSP tampering or out-of-frame [rsp] access."""
+    if not body:
+        return {}
+    host_ops = host_ops or {}
+    for i in body:
+        if i.ip in host_ops:
+            continue
+        if any(i.op_kind(n) == K.REGISTER and RegisterExt.full_register(i.op_register(n)) == R.RSP
+               for n in range(i.op_count)):
+            raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} modifies or reads RSP alongside flag stack")
+        if any(i.op_kind(n) == K.MEMORY for n in range(i.op_count)):
+            if i.memory_index == R.RSP or (i.mnemonic == M.LEA and i.memory_base == R.RSP):
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} aliases RSP alongside flag stack")
+        if i.mnemonic in FLAG_STACK_OPS:
+            if (i.has_segment_prefix or i.has_lock_prefix or i.has_rep_prefix or i.has_repe_prefix
+                    or i.has_repne_prefix or i.has_xacquire_prefix or i.has_xrelease_prefix):
+                raise ValueError(f"unsupported instruction prefix at {i.ip:#x}: {i}")
+            if i.code not in FLAG_STACK_DELTAS:
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i}")
+    index = {i.ip: i for i in body}
+    depth = {body[0].ip: 0}
+    work = [body[0].ip]
+    while work:
+        i = index[work.pop()]
+        before = depth[i.ip]
+        if i.ip not in host_ops and any(i.op_kind(n) == K.MEMORY for n in range(i.op_count)) and i.memory_base == R.RSP:
+            size = MemorySizeExt.size(i.memory_size)
+            if (i.memory_index != R.NONE or i.segment_prefix != R.NONE
+                    or i.memory_displacement < 0 or i.memory_displacement + size > before):
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} accesses outside pushed flag stack")
+        if i.ip not in host_ops and i.mnemonic in FLAG_STACK_OPS:
+            delta = FLAG_STACK_DELTAS[i.code]
+            if delta < 0 and before < -delta:
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} underflows flag stack")
+            if delta > 0 and before + delta > FLAG_STACK_LIMIT:
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} exceeds flag stack bound {FLAG_STACK_LIMIT}")
+            after = before + delta
+        else:
+            after = before
+        flow = i.flow_control
+        if flow == FlowControl.RETURN and before != 0:
+            raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} returns with unbalanced flag stack depth {before}")
+        if flow in (FlowControl.CALL, FlowControl.INDIRECT_CALL) and before != 0:
+            raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} calls with unbalanced flag stack depth {before}")
+        if flow == FlowControl.INDIRECT_BRANCH and before != 0:
+            raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} branches indirectly with unbalanced flag stack depth {before}")
+        for target in x87_lower._successors(i):
+            if target in index:
+                if target not in depth:
+                    depth[target] = after
+                    work.append(target)
+                elif depth[target] != after:
+                    raise ValueError(f"unsupported query operation at {target:#x}: flag stack depths {depth[target]} and {after} meet at {target:#x}")
+            elif target in exits and after != 0:
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: unbalanced flag stack depth {after} at external edge {i.ip:#x} -> {target:#x}")
+    for i in body:
+        if i.ip not in depth and i.ip not in host_ops and i.mnemonic in FLAG_STACK_OPS:
+            raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} has unknown flag stack depth")
+    return depth
+
+
+def flag_definedness(body, exits, host_ops=None, flag_depths=None, entry_state="defined"):
+    """Verify status-flag definedness and DF=0 exit discipline across all reachable paths.
+
+    Tracks the defined subset of {CF, PF, AF, ZF, SF, OF}, whether DF may be set, and the per-byte DF taint
+    on the flag stack (top-first). Returns the ips of ADD/SUB/CMP instructions that must assign AF and PF."""
+    if entry_state not in ("defined", "canonical"):
+        raise ValueError(f"unsupported entry-state profile {entry_state!r}")
+    if not body:
+        return set()
+    host_ops = host_ops or {}
+    if flag_depths is None:
+        flag_depths = flag_stack_depths(body, exits, host_ops)
+    index = {i.ip: i for i in body}
+    init_flags = FLAG_STATUS_BITS if entry_state == "canonical" else 0
+    state = {body[0].ip: (init_flags, False, ())}
+    work = [body[0].ip]
+    while work:
+        i = index[work.pop()]
+        before_flags, before_df, before_stack = state[i.ip]
+        after_stack = before_stack
+        if i.ip in host_ops or i.flow_control in (FlowControl.CALL, FlowControl.INDIRECT_CALL):
+            after_flags = 0
+            after_df = False
+        elif i.mnemonic in (M.PUSHF, M.PUSHFQ):
+            width = 2 if i.mnemonic == M.PUSHF else 8
+            after_flags = before_flags
+            after_df = before_df
+            after_stack = (before_df,) * width + before_stack
+        elif i.mnemonic in (M.POPF, M.POPFQ):
+            width = 2 if i.mnemonic == M.POPF else 8
+            after_flags = FLAG_STATUS_BITS
+            after_df = before_stack[1]
+            after_stack = before_stack[width:]
+        elif i.mnemonic == M.CLD:
+            after_flags = before_flags
+            after_df = False
+        elif i.mnemonic == M.STD:
+            after_flags = before_flags
+            after_df = True
+        elif i.mnemonic in LAHF_WRITERS:
+            after_flags = FLAG_STATUS_BITS
+            after_df = before_df
+        else:
+            after_df = before_df
+            stack_list = None
+            for m in x87_lower._INFO.info(i).used_memory():
+                if m.base == R.RSP and m.access in (OpAccess.WRITE, OpAccess.READ_WRITE,
+                                                    OpAccess.COND_WRITE, OpAccess.READ_COND_WRITE):
+                    if stack_list is None:
+                        stack_list = list(before_stack)
+                    size = MemorySizeExt.size(m.memory_size)
+                    for idx in range(m.displacement, m.displacement + size):
+                        stack_list[idx] = True
+            if stack_list is not None:
+                after_stack = tuple(stack_list)
+            raw_after = x87_lower._flags_after(i, before_flags)
+            keep_af = (before_flags & F.AF) if not (i.rflags_modified & F.AF) else 0
+            keep_pf = F.PF if (i.mnemonic in PF_DEFINERS and not (i.rflags_undefined & F.PF)) else 0
+            if not (i.rflags_modified & F.PF):
+                keep_pf = before_flags & F.PF
+            after_flags = (raw_after & ~(F.AF | F.PF)) | keep_af | keep_pf
+        for target in x87_lower._successors(i):
+            if target in index:
+                if target not in state:
+                    state[target] = (after_flags, after_df, after_stack)
+                    work.append(target)
+                else:
+                    old_flags, old_df, old_stack = state[target]
+                    joined = (
+                        old_flags & after_flags,
+                        old_df or after_df,
+                        tuple(a or b for a, b in zip(old_stack, after_stack)),
+                    )
+                    if joined != state[target]:
+                        state[target] = joined
+                        work.append(target)
+            elif target in exits and after_df:
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: direction flag may be set at external edge {i.ip:#x} -> {target:#x}")
+    for i in body:
+        if i.ip in host_ops:
+            continue
+        if i.ip not in state:
+            if i.mnemonic in FLAG_STACK_OPS or (i.rflags_read & (FLAG_STATUS_BITS | F.DF)):
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} is unreachable")
+            continue
+        before_flags, before_df, _ = state[i.ip]
+        if i.mnemonic in (M.PUSHF, M.PUSHFQ):
+            missing = FLAG_STATUS_BITS & ~before_flags
+            if missing:
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} reads undefined flag(s) {_format_flag_names(missing)}")
+        elif i.mnemonic == M.LAHF:
+            missing = LAHF_FLAGS & ~before_flags
+            if missing:
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} reads undefined flag(s) {_format_flag_names(missing)}")
+        else:
+            missing = (i.rflags_read & FLAG_STATUS_BITS) & ~before_flags
+            if missing:
+                raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} reads undefined flag(s) {_format_flag_names(missing)}")
+        if i.flow_control in (FlowControl.RETURN, FlowControl.CALL, FlowControl.INDIRECT_CALL, FlowControl.INDIRECT_BRANCH) and before_df:
+            raise ValueError(f"unsupported query operation at {i.ip:#x}: direction flag may be set at {i}")
+    return {i.ip for i in body if i.ip not in host_ops and i.mnemonic in LAHF_WRITERS and i.ip in state}
+
+
 # Readers of PF in the integer lowering, and the instructions whose lowering assigns PF when the function declares
 # it: the VEX scalar compares (PF = unordered) and the tests and string compares that clear it. A register ADD, SUB
-# or CMP that a LAHF reads also assigns it (lahf_sources).
+# or CMP that a LAHF reads also assigns it (lahf_sources), as do POPF and POPFQ.
 PF_CONSUMERS = frozenset({M.JP, M.JNP, M.SETP, M.SETNP, M.CMOVP, M.CMOVNP})
 PF_DEFINERS = frozenset({M.VCOMISS, M.VUCOMISS, M.VCOMISD, M.VUCOMISD, M.VTESTPS, M.VTESTPD, M.VPTEST, M.PTEST,
-                         M.PCMPESTRI, M.PCMPESTRM, M.PCMPISTRI, M.PCMPISTRM})
+                         M.PCMPESTRI, M.PCMPESTRM, M.PCMPISTRI, M.PCMPISTRM, M.POPF, M.POPFQ})
 
 
 def check_parity(body, lahf_from, host_ops):
@@ -478,27 +661,44 @@ def check_parity(body, lahf_from, host_ops):
 
 
 def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, host_entropy=False,
-          host_cpu=False, host_mxcsr=None):
+          host_cpu=False, host_mxcsr=None, entry_state="defined"):
     """Emit only query integer operations. All external edges and calls need named bindings."""
+    if entry_state not in ("defined", "canonical"):
+        raise ValueError(f"unsupported entry-state profile {entry_state!r}")
+    host_ops_map = host_ops or {}
+    has_flag_stack = any(i.ip not in host_ops_map and i.mnemonic in FLAG_STACK_OPS for i in body)
     lines = [f"word frame[{FRAME_WORDS}]{{}};", "word " + ", ".join(r + "=0" for r in REGS.values()) + ";",
-             "bool zero=false, carry=false, overflow=false, sign=false;", "rsp = reinterpret_cast<word>(frame);", *initial]
+             "bool zero=false, carry=false, overflow=false, sign=false;",
+             f"rsp = reinterpret_cast<word>(frame + {FRAME_WORDS});" if has_flag_stack else "rsp = reinterpret_cast<word>(frame);",
+             *initial]
     allowed = {i.ip for i in body} | set(exits)
     # The x87 profile checks every x87 instruction of the body before any of it is lowered. x87 is True for
     # the fixed control word, or an x87_lower.Checked for the checked entry, which also accepts FLDCW.
     checked = x87 if isinstance(x87, x87_lower.Checked) else None
     x87_depth = x87_lower.depths(body, exits, checked) if x87 and any(map(x87_lower.is_x87, body)) else None
+    if x87_depth is not None and has_flag_stack:
+        bad = next(i for i in body if i.ip not in host_ops_map and i.mnemonic in FLAG_STACK_OPS)
+        raise ValueError(f"unsupported query operation at {bad.ip:#x}: {bad}")
+    flag_depths = None
+    flag_aux_from = set()
+    if has_flag_stack:
+        if any(re.search(r"\brsp\b", text) for text in (*initial, *calls.values(), *exits.values(), *host_ops_map.values())):
+            raise ValueError("RSP binding is unsupported alongside flag stack")
+        flag_depths = flag_stack_depths(body, exits, host_ops_map)
+        flag_aux_from = flag_definedness(body, exits, host_ops_map, flag_depths, entry_state=entry_state)
     # JP, JNP, FCMOVU and FCMOVNU read PF, which only a function the x87 profile has checked models
     # (x87_lower.check_flags); SAHF, the FCOMI family and the 8-bit TEST and AND set it there. Other functions
     # keep their two flags.
     # A register ADD, SUB or CMP that a LAHF reads also assigns AF and PF (lahf_sources).
-    lahf_from = lahf_sources(body, host_ops or {})
+    lahf_from = lahf_sources(body, host_ops_map)
+    aux_parity_from = lahf_from | flag_aux_from
     # Outside the x87 profile a PF reader needs a modeled PF definition on every path (check_parity).
     parity = any(i.mnemonic in PF_CONSUMERS | {M.FCMOVU, M.FCMOVNU} for i in body)
     if parity and x87_depth is None:
-        check_parity(body, lahf_from, host_ops or {})
+        check_parity(body, aux_parity_from, host_ops_map)
     if parity:
         lines[2] = "bool zero=false, carry=false, overflow=false, sign=false, parity=false;"
-    if lahf_from:
+    if aux_parity_from or has_flag_stack:
         lines[2] = lines[2][:-1] + ("" if parity else ", parity=false") + ", aux=false;"
     # FNSTSW is the only reader of the x87 status word (x87_lower.statement).
     status_word = x87_depth is not None and any(i.mnemonic == M.FNSTSW for i in body)
@@ -749,9 +949,11 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         M.VINSERTPS, M.VEXTRACTPS, M.VCOMISS, M.VUCOMISS, M.VCOMISD, M.VUCOMISD,
     }
     has_wide |= any(i.mnemonic in avx_scalar_ops for i in body)
-    if any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
+    if has_flag_stack or any(i.code in STRING_OPS or i.mnemonic in (M.CLD, M.STD) for i in body):
         # The x64 software conventions expect DF clear on function exit and before calls, so it starts clear.
         lines.append("bool direction=false;")
+    if has_flag_stack:
+        lines.append("bool nt_flag=false, id_flag=false;")
     avx2_perm_ops = (M.VBROADCASTI128, M.VEXTRACTI128, M.VINSERTI128, M.VPBLENDD,
                      M.VPERM2I128, M.VPERMD, M.VPERMPS, M.VPERMQ, M.VPERMPD)
     has_wide |= any(i.mnemonic in avx2_perm_ops for i in body)
@@ -788,6 +990,9 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         def in_frame():
             """The memory operand lies inside the function's own frame array, which a read cannot fault on."""
             size = MemorySizeExt.size(i.memory_size)
+            if flag_depths is not None:
+                return (i.memory_base == R.RSP and i.memory_index == R.NONE and i.segment_prefix == R.NONE
+                        and 0 <= i.memory_displacement and i.memory_displacement + size <= flag_depths[i.ip])
             return (rsp_fixed and i.memory_base == R.RSP and i.memory_index == R.NONE
                     and i.segment_prefix == R.NONE and 0 <= i.memory_displacement
                     and i.memory_displacement + size <= 8 * FRAME_WORDS)
@@ -888,6 +1093,27 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
         elif op == M.LAHF:  # AH = SF:ZF:0:AF:0:PF:1:CF; the rest of RAX is unchanged
             stmt = ("rax = (rax & ~0xff00ull) | (word(sign) << 15) | (word(zero) << 14) | (word(aux) << 12) | "
                     "(word(parity) << 10) | 0x200ull | (word(carry) << 8);")
+        elif op == M.PUSHF:
+            stmt = ("{ const uint16_t flags = static_cast<uint16_t>(0x0202u | (static_cast<uint16_t>(carry) << 0) | "
+                    "(static_cast<uint16_t>(parity) << 2) | (static_cast<uint16_t>(aux) << 4) | "
+                    "(static_cast<uint16_t>(zero) << 6) | (static_cast<uint16_t>(sign) << 7) | "
+                    "(static_cast<uint16_t>(direction) << 10) | (static_cast<uint16_t>(overflow) << 11) | "
+                    "(static_cast<uint16_t>(nt_flag) << 14)); rsp -= 2ull; store<uint16_t>(rsp, flags); }")
+        elif op == M.PUSHFQ:
+            stmt = ("{ const uint64_t flags = 0x0202ull | (word(carry) << 0) | (word(parity) << 2) | "
+                    "(word(aux) << 4) | (word(zero) << 6) | (word(sign) << 7) | (word(direction) << 10) | "
+                    "(word(overflow) << 11) | (word(nt_flag) << 14) | (word(id_flag) << 21); "
+                    "rsp -= 8ull; store<uint64_t>(rsp, flags); }")
+        elif op == M.POPF:
+            stmt = ("{ const uint16_t flags = load<uint16_t>(rsp); rsp += 2ull; "
+                    "carry = (flags & 0x0001u) != 0; parity = (flags & 0x0004u) != 0; aux = (flags & 0x0010u) != 0; "
+                    "zero = (flags & 0x0040u) != 0; sign = (flags & 0x0080u) != 0; direction = (flags & 0x0400u) != 0; "
+                    "overflow = (flags & 0x0800u) != 0; nt_flag = (flags & 0x4000u) != 0; }")
+        elif op == M.POPFQ:
+            stmt = ("{ const uint64_t flags = load<uint64_t>(rsp); rsp += 8ull; "
+                    "carry = (flags & 0x0001ull) != 0; parity = (flags & 0x0004ull) != 0; aux = (flags & 0x0010ull) != 0; "
+                    "zero = (flags & 0x0040ull) != 0; sign = (flags & 0x0080ull) != 0; direction = (flags & 0x0400ull) != 0; "
+                    "overflow = (flags & 0x0800ull) != 0; nt_flag = (flags & 0x4000ull) != 0; id_flag = (flags & 0x200000ull) != 0; }")
         elif op == M.SAHF and x87_depth is not None:
             # CF, PF and ZF from bits 0, 2 and 6 of AH; SF from bit 7; AF is not modelled.
             stmt = ("{ const uint8_t h = static_cast<uint8_t>(rax >> 8); carry = (h & 1) != 0; zero = (h & 0x40) != 0; sign = (h & 0x80) != 0;"
@@ -946,7 +1172,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
                     f"d = static_cast<{width}>(a - b); "
                     f"zero = a == b; carry = a < b; overflow = (((a ^ b) & (a ^ d)) >> {8 * size - 1}) != 0; "
                     f"sign = ((d >> {8 * size - 1}) & 1) != 0;"
-                    + (f" aux = ((a ^ b ^ d) & 0x10u) != 0; {x87_lower.parity_statement('d')}" if i.ip in lahf_from else "")
+                    + (f" aux = ((a ^ b ^ d) & 0x10u) != 0; {x87_lower.parity_statement('d')}" if i.ip in aux_parity_from else "")
                     + " }")
         elif op == M.TEST and parity and x87_lower.assigns_parity(i):
             stmt = (f"{{ const uint8_t v = static_cast<uint8_t>({operand(0)} & {operand(1)}); zero = v == 0; "
@@ -1092,7 +1318,7 @@ def lower(body, initial, globals_, calls, exits, *, host_ops=None, x87=False, ho
             update += f" sign = ((v >> {sign_shift}) & 1) != 0;"
             if op == M.AND and parity and x87_lower.assigns_parity(i):
                 update += " " + x87_lower.parity_statement("v")
-            if i.ip in lahf_from:  # ADD or SUB (lahf_sources)
+            if i.ip in aux_parity_from:  # ADD or SUB (lahf_sources or flag_definedness)
                 update += f" aux = ((a ^ b ^ v) & 0x10u) != 0; {x87_lower.parity_statement('v')}"
             stmt = (f"{{ const {width} a = {operand(0)}, b = static_cast<{width}>({rhs}); "
                     f"const {width} v = static_cast<{width}>({expr}); {update} zero = v == 0; {write('v')} }}")
