@@ -4568,6 +4568,25 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME cpu_aot_x87_bcd COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_bcd.py"
         check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_bcd>"
         "$<TARGET_FILE:cpu_x87_bcd_lifted>" ${x87_bcd_control_files})
+    cpu_asm_fixture(cpu_x87_trig x87_trig)
+    # The lifted DLL and eight mutated controls that the check requires to mismatch.
+    set(x87_trig_control_files "")
+    foreach(variant IN ITEMS lifted noc2 c262 sincosswap ptanno1 patanswap sinnegzero snan pc53)
+        set(x87_trig_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_trig_${variant}.cpp")
+        add_custom_command(OUTPUT "${x87_trig_fixture}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_trig.py"
+                emit "$<TARGET_FILE:cpu_x87_trig>" "${x87_trig_fixture}" ${variant}
+            DEPENDS cpu_x87_trig tests/cpu/x87_trig.py tests/cpu/x87_moves.py tests/cpu/x87_div.py
+                tests/cpu/x87_mul.py tests/cpu/x87_add.py tools/ffx_version_query.py tools/x87_lower.py
+                tools/x87_soft.h tools/cpu_ranges.py tools/cpu_leaf_aot.py VERBATIM)
+        add_library(cpu_x87_trig_${variant} SHARED "${x87_trig_fixture}")
+        if(NOT variant STREQUAL "lifted")
+            list(APPEND x87_trig_control_files "$<TARGET_FILE:cpu_x87_trig_${variant}>")
+        endif()
+    endforeach()
+    add_test(NAME cpu_aot_x87_trig COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_trig.py"
+        check "$<TARGET_FILE:cpu_x87_harness>" "$<TARGET_FILE:cpu_x87_trig>"
+        "$<TARGET_FILE:cpu_x87_trig_lifted>" ${x87_trig_control_files})
     cpu_asm_fixture(cpu_create create_context)
     set(create_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_create_lifted.cpp")
     add_custom_command(OUTPUT "${create_fixture}"
