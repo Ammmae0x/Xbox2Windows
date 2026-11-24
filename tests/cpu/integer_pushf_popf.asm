@@ -370,6 +370,23 @@ op_popf_normalize PROC FRAME
     ret
 op_popf_normalize ENDP
 
+op_pushf_df_nt PROC FRAME
+    .endprolog
+    mov r9, QWORD PTR [rcx]
+    and r9, -040101h
+    mov rax, QWORD PTR [rcx+8]
+    add rax, 0
+    pushfq
+    mov QWORD PTR [rsp], r9
+    popfq
+    pushf
+    movzx eax, WORD PTR [rsp]
+    popf
+    mov QWORD PTR [r8], rax
+    cld
+    ret
+op_pushf_df_nt ENDP
+
 ; The discarded read must still fault after the first store and before the second.
 op_discarded_read PROC FRAME
     .endprolog

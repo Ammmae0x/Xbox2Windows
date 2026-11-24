@@ -55,6 +55,7 @@ SPECIAL_EXPORTS = (
     "op_nested_push_pop",
     "op_popfq_normalize",
     "op_popf_normalize",
+    "op_pushf_df_nt",
 )
 
 EXPORTS = tuple(ARITH_SPECS.keys()) + SPECIAL_EXPORTS
@@ -93,6 +94,10 @@ CPP_MUTATIONS = (
     ("op_sub64_pushfq", "ctrl_of_dropped", re.compile(r"\(word\(overflow\) << 11\)"), "(word(false) << 11)"),
     ("op_popfq_normalize", "ctrl_id_dropped", re.compile(r"\(word\(id_flag\) << 21\)"), "(word(false) << 21)"),
     ("op_nested_push_pop", "ctrl_rsp_step_wrong", re.compile(r"rsp -= 2ull;"), "rsp -= 8ull;"),
+    ("op_pushf_df_nt", "ctrl_pushf_df_dropped", re.compile(r"\(static_cast<uint16_t>\(direction\) << 10\)"),
+     "(static_cast<uint16_t>(false) << 10)"),
+    ("op_pushf_df_nt", "ctrl_pushf_nt_dropped", re.compile(r"\(static_cast<uint16_t>\(nt_flag\) << 14\)"),
+     "(static_cast<uint16_t>(false) << 14)"),
 )
 
 
@@ -328,6 +333,13 @@ def reference(name: str, a_bytes: bytes, b_bytes: bytes, altered: bool = False):
         out[8:14] = bytes((cf, int(sf != of), zf, sf, of, pf))
         return bytes(out), norm
 
+    if name == "op_pushf_df_nt":
+        norm = ring3_popf_normalize(a0, width=64)
+        word16 = norm & 0xFFFF
+        out = bytearray(FILL)
+        struct.pack_into("<Q", out, 0, word16)
+        return bytes(out), norm & ~0x400
+
     raise AssertionError(f"unknown export {name}")
 
 
@@ -448,6 +460,12 @@ def special_inputs(name: str):
             pre = 0x00200202 if (i % 2 == 0) else 0x00000202
             cases.append((pack_u64s(0x0F, 0x01, 0, 0), pack_u64s(cand & 0xFFFF, pre, 0, 0)))
         return cases
+
+    if name == "op_pushf_df_nt":
+        return [
+            (pack_u64s(cand, 0x0F, 0, 0), pack_u64s(0, 0, 0, 0))
+            for cand in (0x0000, 0x0400, 0x4000, 0x4400, 0x08D5, 0x204400)
+        ]
 
     raise AssertionError(f"no inputs defined for {name}")
 
@@ -678,6 +696,47 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
                     Instruction.create_mem_reg(Code.MOV_RM8_R8, MemoryOperand(R.RSP), R.CL),
                     popfq_ins, ret_ins),
          "id_flag = (flags & 0x200000ull) != 0;", "defined"),
+        ("high_byte_ch_masked_popf",
+         encode_seq(ld_rax, Instruction.create_reg_i32(Code.AND_RM32_IMM32, R.ECX, -0x101),
+                    add_eax_1, pushf_ins,
+                    Instruction.create_mem_reg(Code.MOV_RM8_R8, MemoryOperand(R.RSP, displ=1, displ_size=1), R.CH),
+                    popf_ins, Instruction.create(Code.CLD), ret_ins),
+         "direction = (flags & 0x0400u) != 0;", "defined"),
+        ("or_safe_reg_popfq",
+         encode_seq(ld_rax, Instruction.create_reg_i32(Code.AND_RM64_IMM32, R.RCX, -0x40101),
+                    Instruction.create_reg_i32(Code.OR_RM64_IMM32, R.RCX, 0x400),
+                    add_eax_1, pushfq_ins,
+                    Instruction.create_mem_reg(Code.MOV_RM64_R64, MemoryOperand(R.RSP), R.RCX),
+                    popfq_ins, Instruction.create(Code.CLD), ret_ins),
+         "direction = false;", "defined"),
+        ("xor_safe_reg_popfq",
+         encode_seq(ld_rax, Instruction.create_reg_i32(Code.AND_RM64_IMM32, R.RCX, -0x40101),
+                    Instruction.create_reg_i32(Code.XOR_RM64_IMM32, R.RCX, 0x400),
+                    add_eax_1, pushfq_ins,
+                    Instruction.create_mem_reg(Code.MOV_RM64_R64, MemoryOperand(R.RSP), R.RCX),
+                    popfq_ins, Instruction.create(Code.CLD), ret_ins),
+         "direction = false;", "defined"),
+        ("shl_safe_reg_popfq",
+         encode_seq(ld_rax, Instruction.create_reg_i32(Code.AND_RM64_IMM32, R.RCX, 0xFF),
+                    Instruction.create_reg_i32(Code.SHL_RM64_IMM8, R.RCX, 20),
+                    add_eax_1, pushfq_ins,
+                    Instruction.create_mem_reg(Code.MOV_RM64_R64, MemoryOperand(R.RSP), R.RCX),
+                    popfq_ins, Instruction.create(Code.CLD), ret_ins),
+         "id_flag = (flags & 0x200000ull) != 0;", "defined"),
+        ("shr_safe_reg_popfq",
+         encode_seq(ld_rax, Instruction.create_reg_i32(Code.AND_RM32_IMM32, R.ECX, 0xFF00),
+                    Instruction.create_reg_i32(Code.SHR_RM32_IMM8, R.ECX, 8),
+                    add_eax_1, pushfq_ins,
+                    Instruction.create_mem_reg(Code.MOV_RM64_R64, MemoryOperand(R.RSP), R.RCX),
+                    popfq_ins, Instruction.create(Code.CLD), ret_ins),
+         "carry = (flags & 0x0001ull) != 0;", "defined"),
+        ("btr_reg_tf_cleared_popfq",
+         encode_seq(ld_rax, Instruction.create_reg_i32(Code.AND_RM64_IMM32, R.RCX, -0x40001),
+                    Instruction.create_reg_i32(Code.BTR_RM64_IMM8, R.RCX, 8),
+                    add_eax_1, pushfq_ins,
+                    Instruction.create_mem_reg(Code.MOV_RM64_R64, MemoryOperand(R.RSP), R.RCX),
+                    popfq_ins, Instruction.create(Code.CLD), ret_ins),
+         "direction = false;", "defined"),
     ]
     for label, raw, expected_snippet, entry_state in alt_accept:
         decoded = list(Decoder(64, raw, ip=0x1000))
@@ -688,6 +747,26 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
         src = lower(decoded, ["rcx = a; rdx = b; r8 = c;"], {}, {}, {}, entry_state=entry_state)
         if expected_snippet not in src:
             raise AssertionError(f"{label}: expected {expected_snippet!r} in generated C++:\n{src}")
+
+    # Direct flag_definedness pair for BTR [rsp], imm (stack-edit may-be-1 tracking)
+    btr_stack_ok = list(Decoder(64, encode_seq(
+        ld_rax, add_eax_1, pushf_ins,
+        Instruction.create_mem_reg(Code.MOV_RM16_R16, MemoryOperand(R.RSP), R.CX),
+        Instruction.create_mem_i32(Code.BTR_RM16_IMM8, MemoryOperand(R.RSP), 8),
+        popf_ins, Instruction.create(Code.CLD), ret_ins), ip=0x1000))
+    flag_definedness(btr_stack_ok, {}, flag_depths=flag_stack_depths(btr_stack_ok, {}))
+    btr_stack_bad = list(Decoder(64, encode_seq(
+        ld_rax, add_eax_1, pushf_ins,
+        Instruction.create_mem_reg(Code.MOV_RM16_R16, MemoryOperand(R.RSP), R.CX),
+        Instruction.create_mem_i32(Code.BTR_RM16_IMM8, MemoryOperand(R.RSP), 9),
+        popf_ins, Instruction.create(Code.CLD), ret_ins), ip=0x1000))
+    try:
+        flag_definedness(btr_stack_bad, {}, flag_depths=flag_stack_depths(btr_stack_bad, {}))
+    except ValueError as exc:
+        if "may set unmodeled control flag(s) TF" not in str(exc):
+            raise AssertionError(f"btr_stack_bad: unexpected {exc!r}") from exc
+    else:
+        raise AssertionError("btr_stack_bad was unexpectedly accepted by flag_definedness")
 
     # Direct unit test on stack bound limit (128 bytes = 16 PUSHFQs allowed, 17 rejected)
     max_seq = encode_seq(ld_rax, add_eax_1, *([pushfq_ins] * (FLAG_STACK_LIMIT // 8)),
@@ -806,6 +885,55 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
          "may set unmodeled control flag(s) AC"),
         ("unconstrained_join_one_arm_popfq", bytes.fromhex("85c974074881e1fffefbff83c0019c48890c249dfcc3"),
          "may set unmodeled control flag(s) TF, AC"),
+        ("non_rsp_mem_load_popfq", encode_seq(
+            Instruction.create_reg_mem(Code.MOV_R64_RM64, R.RCX, MemoryOperand(R.RDX)),
+            ld_rax, add_eax_1, pushfq_ins,
+            Instruction.create_mem_reg(Code.MOV_RM64_R64, MemoryOperand(R.RSP), R.RCX),
+            popfq_ins, Instruction.create(Code.CLD), ret_ins),
+         "may set unmodeled control flag(s) TF, AC"),
+        ("high_byte_ch_unmasked_popf", encode_seq(
+            ld_rax, Instruction.create_reg_i32(Code.AND_RM32_IMM32, R.ECX, -2),
+            add_eax_1, pushf_ins,
+            Instruction.create_mem_reg(Code.MOV_RM8_R8, MemoryOperand(R.RSP, displ=1, displ_size=1), R.CH),
+            popf_ins, Instruction.create(Code.CLD), ret_ins),
+         "may set unmodeled control flag(s) TF"),
+        ("or_tf_reg_popfq", encode_seq(
+            ld_rax, Instruction.create_reg_i32(Code.AND_RM64_IMM32, R.RCX, -0x40101),
+            Instruction.create_reg_i32(Code.OR_RM64_IMM32, R.RCX, 0x100),
+            add_eax_1, pushfq_ins,
+            Instruction.create_mem_reg(Code.MOV_RM64_R64, MemoryOperand(R.RSP), R.RCX),
+            popfq_ins, Instruction.create(Code.CLD), ret_ins),
+         "may set unmodeled control flag(s) TF"),
+        ("xor_tf_reg_popfq", encode_seq(
+            ld_rax, Instruction.create_reg_i32(Code.AND_RM64_IMM32, R.RCX, -0x40101),
+            Instruction.create_reg_i32(Code.XOR_RM64_IMM32, R.RCX, 0x100),
+            add_eax_1, pushfq_ins,
+            Instruction.create_mem_reg(Code.MOV_RM64_R64, MemoryOperand(R.RSP), R.RCX),
+            popfq_ins, Instruction.create(Code.CLD), ret_ins),
+         "may set unmodeled control flag(s) TF"),
+        ("shl_tf_reg_popfq", encode_seq(
+            ld_rax, Instruction.create_reg_i32(Code.AND_RM64_IMM32, R.RCX, 0xFF),
+            Instruction.create_reg_i32(Code.SHL_RM64_IMM8, R.RCX, 8),
+            add_eax_1, pushfq_ins,
+            Instruction.create_mem_reg(Code.MOV_RM64_R64, MemoryOperand(R.RSP), R.RCX),
+            popfq_ins, Instruction.create(Code.CLD), ret_ins),
+         "may set unmodeled control flag(s) TF"),
+        ("shr_tf_reg_popfq", encode_seq(
+            ld_rax, Instruction.create_reg_i32(Code.AND_RM64_IMM32, R.RCX, 0x10000),
+            Instruction.create_reg_i32(Code.SHR_RM64_IMM8, R.RCX, 8),
+            add_eax_1, pushfq_ins,
+            Instruction.create_mem_reg(Code.MOV_RM64_R64, MemoryOperand(R.RSP), R.RCX),
+            popfq_ins, Instruction.create(Code.CLD), ret_ins),
+         "may set unmodeled control flag(s) TF"),
+        ("btr_reg_wrong_bit_popfq", encode_seq(
+            ld_rax, Instruction.create_reg_i32(Code.AND_RM64_IMM32, R.RCX, -0x101),
+            Instruction.create_reg_i32(Code.BTR_RM64_IMM8, R.RCX, 9),
+            add_eax_1, pushfq_ins,
+            Instruction.create_mem_reg(Code.MOV_RM64_R64, MemoryOperand(R.RSP), R.RCX),
+            popfq_ins, Instruction.create(Code.CLD), ret_ins),
+         "may set unmodeled control flag(s) AC"),
+        ("join_stack_one_arm_ac_popfq", bytes.fromhex("4801c89c85c9740848810c24000004009dfcc3"),
+         "may set unmodeled control flag(s) AC"),
         # Disallowed prefixes, out-of-scope ops, addressing & stream boundaries
         ("prefix_rep_pushfq", bytes.fromhex("f39c9dc3"), "unsupported instruction prefix"),
         ("prefix_repne_pushfq", bytes.fromhex("f29c9dc3"), "unsupported instruction prefix"),

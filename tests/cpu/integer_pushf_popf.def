@@ -22,4 +22,5 @@ EXPORTS
     op_nested_push_pop
     op_popfq_normalize
     op_popf_normalize
+    op_pushf_df_nt
     op_discarded_read
