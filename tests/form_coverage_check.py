@@ -122,7 +122,10 @@ def check_example():
     for spelling in ("3", "3h", "03h"):
         assert fc.masm_mnemonics(f"    int {spelling}\n    ud2\n") == {"int3", "ud2"}, spelling
     assert fc.masm_mnemonics("    int 29h\n") == {"int"}
+    # ML64 assembles FSETPM as DB E4 with no WAIT, the reference's fnsetpm; FCLEX keeps its 9B WAIT.
+    assert fc.masm_mnemonics("    fsetpm\n    FSETPM\n    fclex\n") == {"fnsetpm", "fclex"}
     reference = fc.load_reference("x64_zen2.tsv")
+    assert fc.x64_forms({"fnsetpm"}, reference) == {("x87", "fnsetpm")}
     assert fc.x64_forms(branch, reference) == {("Integer", m) for m in branch}
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -274,9 +277,20 @@ def check_shader_records():
     _controls_accepted()
     assert {"s_nop", "s_clause", "s_setprio", "s_sleep", "image_sample"} <= pixel.ACCEPTED
     assert "s_branch" in pixel.ACCEPTED and "s_code_end" not in pixel.ACCEPTED
-    # The mode-register fixture records the immediate write; the register forms reach only rejections.
-    assert ("SOPK", "s_setreg_imm32_b32") in gfx and "s_setreg_imm32_b32" in pixel.ACCEPTED
-    assert not {"s_setreg_b32", "s_getreg_b32"} & pixel.ACCEPTED
+    # The mode-register fixtures record the immediate write and, with the SGPR write and the read of MODE[3:2], the
+    # two register forms. A program the controls expect to be rejected is never recorded.
+    sopk_hwreg = {("SOPK", "s_setreg_imm32_b32"), ("SOPK", "s_setreg_b32"), ("SOPK", "s_getreg_b32")}
+    assert sopk_hwreg <= gfx and {"s_setreg_imm32_b32", "s_setreg_b32", "s_getreg_b32"} <= pixel.ACCEPTED
+    assert sopk_hwreg <= fc.gfx_forms(pixel.ACCEPTED, gfx)
+    # The SOPK neighbours that stay refused are not recorded: the call and the subvector loop forms.
+    assert not {"s_call_b64", "s_subvector_loop_begin", "s_subvector_loop_end"} & pixel.ACCEPTED
+    with tempfile.TemporaryDirectory() as tmp:
+        root = sample_repo(Path(tmp) / "repo", {})
+        accepted = set(pixel.ACCEPTED)
+        covered = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": accepted})["gfx1013"]["covered"]
+        without = fc.measure({"pixel_aot_warp": "pass"}, root,
+                             {"pixel_aot_warp": accepted - {"s_setreg_b32", "s_getreg_b32"}})["gfx1013"]["covered"]
+        assert covered == without + 2
     # The trigonometry fixture covers both encodings of v_sin_f32 and v_cos_f32 once its test passes.
     trig = {("VOP1", "v_sin_f32"), ("VOP1", "v_cos_f32"), ("VOP3", "v_sin_f32_e64"), ("VOP3", "v_cos_f32_e64")}
     assert trig <= gfx and trig <= fc.gfx_forms(pixel.ACCEPTED, gfx)
@@ -460,7 +474,7 @@ def check_shader_records():
         assert cmpx_forms <= reference and cmpx_forms <= covered, (name, sorted(cmpx_forms - covered))
         assert {form for _, form in covered if form.startswith("v_cmpx_")} == {form for _, form in cmpx_forms}, name
     # The scalar ALU fixture counts its SOP1, SOP2, SOPK and SOPC forms; the neighbours the controls
-    # reject (s_addc_u32, s_cmp_lt_u64, s_getreg_b32) stay out.
+    # reject (s_addc_u32, s_cmp_lt_u64) stay out; s_getreg_b32 joined the accepted forms with the mode-register fixture.
     scalar = {"s_movk_i32", "s_cmovk_i32", "s_not_b32", "s_add_u32", "s_sub_u32", "s_add_i32", "s_sub_i32",
               "s_mul_i32", "s_min_u32", "s_max_u32", "s_min_i32", "s_max_i32", "s_and_b32", "s_or_b32",
               "s_xor_b32", "s_andn2_b32", "s_orn2_b32", "s_lshl_b32", "s_lshr_b32", "s_ashr_i32",
@@ -469,7 +483,7 @@ def check_shader_records():
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         forms = fc.gfx_forms(pixel.ACCEPTED, fc.load_reference(name))
         assert {form for _, form in forms} >= scalar, sorted(scalar - {form for _, form in forms})
-        assert not {"s_addc_u32", "s_cmp_lt_u64", "s_getreg_b32"} & {f for _, f in forms}
+        assert not {"s_addc_u32", "s_cmp_lt_u64"} & {f for _, f in forms}
         assert {group for group, form in forms if form in scalar} == {"SOP1", "SOP2", "SOPC", "SOPK"}
     # The rounding fixture covers both encodings of v_ceil_f32 and v_rndne_f32 once its test passes.
     rounding = {("VOP1", "v_ceil_f32"), ("VOP1", "v_rndne_f32"),
@@ -483,20 +497,24 @@ def check_shader_records():
         without = fc.measure({"pixel_aot_warp": "pass"}, root, {"pixel_aot_warp": pixel.ACCEPTED - words})
         assert covered["gfx1013"]["covered"] == without["gfx1013"]["covered"] + len(rounding)
     # Float-to-word conversions (truncate, floor, round-to-+inf) cover VOP1 e32 and VOP3 e64;
-    # DPP/SDWA variants stay excluded.
+    # SDWA variants stay excluded while DPP16/DPP8 flr, rpi and pkrtz are covered.
     cvt_f32_int = {
         ("VOP1", "v_cvt_u32_f32"), ("VOP1", "v_cvt_i32_f32"),
         ("VOP1", "v_cvt_flr_i32_f32"), ("VOP1", "v_cvt_rpi_i32_f32"),
         ("VOP3", "v_cvt_u32_f32_e64"), ("VOP3", "v_cvt_i32_f32_e64"),
         ("VOP3", "v_cvt_flr_i32_f32_e64"), ("VOP3", "v_cvt_rpi_i32_f32_e64"),
     }
-    cvt_f32_excluded = {"v_cvt_flr_i32_f32_dpp", "v_cvt_flr_i32_f32_sdwa",
-                        "v_cvt_rpi_i32_f32_dpp", "v_cvt_rpi_i32_f32_sdwa"}
+    cvt_dpp_forms = {
+        (group, form)
+        for group in ("DPP16", "DPP8")
+        for form in ("v_cvt_flr_i32_f32_dpp", "v_cvt_rpi_i32_f32_dpp", "v_cvt_pkrtz_f16_f32_dpp")
+    }
+    cvt_f32_excluded = {"v_cvt_flr_i32_f32_sdwa", "v_cvt_rpi_i32_f32_sdwa"}
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
-        assert cvt_f32_int <= reference, name
+        assert cvt_f32_int | cvt_dpp_forms <= reference, name
         forms = fc.gfx_forms(pixel.ACCEPTED, reference)
-        assert cvt_f32_int <= forms, (name, sorted(cvt_f32_int - forms))
+        assert cvt_f32_int | cvt_dpp_forms <= forms, (name, sorted((cvt_f32_int | cvt_dpp_forms) - forms))
         assert not ({form for _, form in forms} & cvt_f32_excluded), name
 
 
@@ -1275,19 +1293,22 @@ def check_sse_fp_native_driver():
 
 def check_swap_coverage():
     """v_swap_b32 is VOP1 in both references and counts as covered only through the accepted spelling.
-    The _e64, DPP and SDWA spellings reach only rejections, and the neighbouring v_swaprel_b32 stays uncovered."""
+    The _e64, DPP and SDWA spellings reach only rejections. The neighbouring v_swaprel_b32 is lowered since #1795
+    and is covered through its own accepted spelling, not through v_swap_b32."""
     import pixel_aot_check as pixel
     _controls_accepted()
     assert "v_swap_b32" in pixel.ACCEPTED
-    assert not {"v_swap_b32_e64", "v_swap_b32_dpp", "v_swap_b32_sdwa", "v_swaprel_b32"} & pixel.ACCEPTED
+    assert "v_swaprel_b32" in pixel.ACCEPTED
+    assert not {"v_swap_b32_e64", "v_swap_b32_dpp", "v_swap_b32_sdwa"} & pixel.ACCEPTED
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
         assert ("VOP1", "v_swap_b32") in reference, name
         covered = fc.gfx_forms(pixel.ACCEPTED, reference)
         assert ("VOP1", "v_swap_b32") in covered, name
-        assert ("VOP1", "v_swaprel_b32") not in covered, name
-        # Control: without the accepted word the form is not covered.
+        assert ("VOP1", "v_swaprel_b32") in covered, name
+        # Controls: without the accepted word the form is not covered, and each form needs its own word.
         assert ("VOP1", "v_swap_b32") not in fc.gfx_forms(pixel.ACCEPTED - {"v_swap_b32"}, reference), name
+        assert ("VOP1", "v_swaprel_b32") not in fc.gfx_forms(pixel.ACCEPTED - {"v_swaprel_b32"}, reference), name
 
 
 def check_pk_fmac_coverage():
@@ -1305,6 +1326,40 @@ def check_pk_fmac_coverage():
         # Control: without the accepted spellings the form is not covered.
         stripped = pixel.ACCEPTED - {"v_pk_fmac_f16", "v_pk_fmac_f16_e32"}
         assert ("VOP2", "v_pk_fmac_f16") not in fc.gfx_forms(stripped, reference), name
+
+
+def check_sdwa_cmp_coverage():
+    """The 46 non-cmpx VOPC SDWA comparisons count in both references, and their non-SDWA
+    neighbours do not: the isolated fixture accepts only the selected forms and its own mask/ALU
+    support instructions. This is the coverage half of the negative control; the draw carries the
+    selection and signedness mismatches."""
+    import pixel_aot_check as pixel
+    wanted = {("SDWA", entry["form"]) for entry in pixel.SDWA_CMP_FORMS}
+    assert len(wanted) == 46
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        pixel.translate_int(pixel.uncompressed_export(pixel.sdwa_cmp_body()))
+        accepted = set(pixel.ACCEPTED)
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert wanted <= reference, (name, sorted(wanted - reference))
+        covered = fc.gfx_forms(accepted, reference)
+        assert wanted <= covered, (name, sorted(wanted - covered))
+        # Non-SDWA neighbours and the exec-writing cmpx forms are not in this fixture's record.
+        assert not {("VOPC", f"v_cmp_{op}_f16") for op in pixel.PREDICATES} & covered, name
+        assert not {("VOPC", f"v_cmp_{op}_f32") for op in pixel.PREDICATES} & covered, name
+        assert not {("VOPC", f"v_cmp_{op}_{kind}") for op in pixel.INT_PREDICATES
+                    for kind in ("i32", "u32")} & covered, name
+        assert not {("VOPC", f"v_cmp_{op}_{kind}") for op in ("eq", "ne", "lt", "le", "gt", "ge")
+                    for kind in ("i16", "u16")} & covered, name
+        assert not {("SDWA", f"v_cmpx_{op}_f16_sdwa") for op in pixel.PREDICATES} & covered, name
+        # Control: removing one accepted SDWA word removes exactly that form from the count.
+        stripped = accepted - {"v_cmp_lt_f16_sdwa"}
+        assert ("SDWA", "v_cmp_lt_f16_sdwa") not in fc.gfx_forms(stripped, reference), name
 
 
 if __name__ == "__main__":
@@ -1329,6 +1384,7 @@ if __name__ == "__main__":
     check_f16_to_int16_forms()
     check_swap_coverage()
     check_pk_fmac_coverage()
+    check_sdwa_cmp_coverage()
     check_sopk_wait_forms()
     check_s_version_form()
     check_parsing()

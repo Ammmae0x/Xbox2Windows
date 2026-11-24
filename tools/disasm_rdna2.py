@@ -1029,7 +1029,8 @@ VOP3_RESTRICTED_MODIFIERS = {
     "v_interp_mov_f32_e64": (True, True),
 }
 
-# The v_interp_mov_f32_e64 parameter selector (src1 field): p10, p20 and p0.
+# The v_interp_mov_f32 parameter selector (VINTRP vsrc field, VOP3A src1 field): p10, p20 and p0.
+# LLVM prints any other value as invalid_param_<n> and its assembler accepts none of them.
 VINTRP_MOV_PARAMS = ("p10", "p20", "p0")
 
 
@@ -2545,6 +2546,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_name, comment = op_info
         length = 4
         literal = None
+        if src0 in (233, 234, 250):
+            return _vop_extension(data, offset, "vopc", op_name, src0)
         if src0 in (249, 255):
             extension = "SDWA" if src0 == 249 else "literal"
             if offset + 8 > len(data):
@@ -2623,8 +2626,14 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         vsrc = w0 & 0xff
         op_names = {0: "v_interp_p1_f32_e32", 1: "v_interp_p2_f32_e32", 2: "v_interp_mov_f32_e32"}
         op_name = op_names.get(op, f"v_interp_{op}")
-        asm = f"{op_name} v{vdst}, v{vsrc}, attr{attr}.{chan}"
         comment = f"Parameter interpolation stage {op+1} for attribute {attr}.{chan}"
+        if op == 2:
+            # The mov form's vsrc field is the parameter selector, not a VGPR.
+            if vsrc >= len(VINTRP_MOV_PARAMS):
+                return (4, f"{op_name}_unsupported", f"{op_name} <unsupported VINTRP encoding>",
+                        f"v_interp_mov_f32 parameter selector {vsrc} is not p10, p20 or p0")
+            return (4, op_name, f"{op_name} v{vdst}, {VINTRP_MOV_PARAMS[vsrc]}, attr{attr}.{chan}", comment)
+        asm = f"{op_name} v{vdst}, v{vsrc}, attr{attr}.{chan}"
         return (4, op_name, asm, comment)
 
     # 9. EXP: 64-bit [31:26] == 0b111110 (0xf8000000)
@@ -2727,6 +2736,10 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         elif op not in MIMG_DERIV_OPS:
             deriv_addrs = 0
         addr_count = base_addrs + extra_addrs + deriv_addrs
+        a16 = (w1 >> 30) & 1
+        packed_load_2d = a16 and op_name == "image_load" and dim_name == "SQ_RSRC_IMG_2D"
+        if packed_load_2d:
+            addr_count = 1  # The two unsigned coordinates share a VGPR.
         d16 = (w1 >> 31) & 1
         # A gather returns the four texels of the selected component whatever the one-hot mask is.
         n_data = 4 if op_name.startswith("image_gather4") else max(1, bin(dmask).count("1"))
@@ -2765,10 +2778,12 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             mods.append("tfe")
         if (w0 >> 17) & 1:
             mods.append("lwe")
-        if (w1 >> 30) & 1:
+        if a16:
             mods.append("a16")
         if d16:
             mods.append("d16")
+        if packed_load_2d and nsize:
+            mods.append("invalid_nsa")  # A single address VGPR requires no NSA extension.
         # Word 0 bits 6 and 14 and word 1 bits 29:26 are reserved on gfx10: LLVM assembles none of them and
         # ignores them when disassembling, so a set bit is surfaced instead of vanishing from the listing.
         if (w0 & 0x4040) or (w1 >> 26) & 0xf:
@@ -3192,17 +3207,22 @@ def main():
 
     args = parser.parse_args()
 
+    all_listings = []
+    missing = False
+
     # Hex decode mode
     if args.hex:
-        raw_bytes = bytes.fromhex(args.hex.replace(" ", ""))
+        try:
+            raw_bytes = bytes.fromhex(args.hex.replace(" ", ""))
+        except ValueError as exc:
+            parser.error(f"--hex: {exc}")
         insns = disassemble_binary(raw_bytes, "hex_input")
         print_disassembly("hex_input", insns)
-        return 0
-
-    if not args.targets:
+        all_listings.append(("hex_input", insns))
+        args.targets = []
+    elif not args.targets:
         parser.error("Specify targets or provide hex via --hex")
 
-    all_listings = []
     for target in args.targets:
         if target.is_file():
             data = target.read_bytes()
@@ -3217,6 +3237,9 @@ def main():
                 insns = disassemble_binary(data, f.name)
                 print_disassembly(f.name, insns)
                 all_listings.append((f.name, insns))
+        else:
+            print(f"error: {target}: not found", file=sys.stderr)
+            missing = True
 
     if args.output and all_listings:
         with args.output.open("w", encoding="utf-8") as out_f:
@@ -3227,7 +3250,7 @@ def main():
                 out_f.write("\n")
         print(f"[+] Disassembly saved to: {args.output}")
 
-    return 0
+    return 1 if missing else 0
 
 
 if __name__ == "__main__":

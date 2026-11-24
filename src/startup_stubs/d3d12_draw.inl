@@ -194,24 +194,62 @@ void load_translation(Translation& tr, const std::string& rtv_request = {})
 
 // draw_lock held. Both pipeline forms use the same request writer and shader cache.
 Translation* cached_translation(const void* a, std::size_t a_bytes, const void* b, std::size_t b_bytes,
-                                const std::vector<unsigned char>& root_blob)
+                                const std::vector<unsigned char>& root_blob, const std::string& layout = {})
 {
     // Keep pre-fix desktop bytecode and manifests out of this ABI's cache.
     // tools/startup/gfx2hlsl.py hashes the same bytes, without a trailing NUL.
-    constexpr char revision[] = "x2w-startup-shader-3";
+    constexpr char revision[] = "x2w-startup-shader-5";
     const u64 seed = fnv_bytes(revision, sizeof(revision) - 1);
-    const u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
+    u64 key = fnv_bytes(root_blob.data(), root_blob.size(), fnv_bytes(b, b_bytes, fnv_bytes(a, a_bytes, seed)));
+    // A stream's input layout (stream_input_layout) feeds the vertex fetch, so it is part of the key.
+    if (!layout.empty()) key = fnv_bytes(layout.data(), layout.size(), key);
     auto& entry = translation_by_key()[key];
     if (!entry) {
         entry = new Translation;
         entry->key = key;
         // A legacy cache hit still needs source blobs for late RTV specialization.
         if (publish_shader_request(key, L".b", b, b_bytes) &&
-            publish_shader_request(key, L".root", root_blob.data(), root_blob.size()))
+            publish_shader_request(key, L".root", root_blob.data(), root_blob.size()) &&
+            (layout.empty() || publish_shader_request(key, L".ia", layout.data(), layout.size())))
             publish_shader_request(key, L".a", a, a_bytes);
         load_translation(*entry);
     }
     return entry;
+}
+
+// The INPUT_LAYOUT subobject as the request text tools/startup/gfx2hlsl.py reads: "ia1 <count>", then one
+// "<semantic> <index> <format> <slot> <offset> <class> <step>" line per element. False when it cannot be read.
+bool stream_input_layout(const unsigned char* subobject, std::string& text)
+{
+    D3D12_INPUT_LAYOUT_DESC layout;
+    std::memcpy(&layout, subobject + 8, sizeof(layout));
+    if (!layout.NumElements) return true;
+    if (layout.NumElements > D3D12_IA_VERTEX_INPUT_STRUCTURE_ELEMENT_COUNT ||
+        !x2w_local::readable(layout.pInputElementDescs, sizeof(D3D12_INPUT_ELEMENT_DESC) * layout.NumElements)) return false;
+    text = "ia1 " + std::to_string(layout.NumElements) + "\n";
+    std::string shown;
+    for (UINT i = 0; i < layout.NumElements; ++i) {
+        const D3D12_INPUT_ELEMENT_DESC& e = layout.pInputElementDescs[i];
+        std::size_t length = 0;
+        while (length < 64 && x2w_local::readable(e.SemanticName + length, 1) && e.SemanticName[length]) {
+            const char c = e.SemanticName[length];
+            if (!(std::isalpha(static_cast<unsigned char>(c)) || c == '_' || (length && std::isdigit(static_cast<unsigned char>(c))))) return false;
+            ++length;
+        }
+        if (!length || length == 64) return false;
+        char line[160];
+        std::snprintf(line, sizeof(line), "%.*s %u %u %u %u %u %u\n", static_cast<int>(length), e.SemanticName, e.SemanticIndex,
+                      static_cast<unsigned>(e.Format), e.InputSlot, e.AlignedByteOffset, static_cast<unsigned>(e.InputSlotClass),
+                      e.InstanceDataStepRate);
+        text += line;
+        std::snprintf(line, sizeof(line), "%s%u/%u/%u/%u", i ? " " : "", static_cast<unsigned>(e.Format), e.InputSlot,
+                      e.AlignedByteOffset, static_cast<unsigned>(e.InputSlotClass));
+        shown += line;
+    }
+    static LONG logged;
+    if (first_calls(logged, 24))
+        log("x2w-draw stream input layout: %u elements (format/slot/offset/class) %s", layout.NumElements, shown.c_str());
+    return true;
 }
 
 // Resolve the shader pointers and wrapped root while the caller still owns the stream.
@@ -224,6 +262,7 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
 
     const Wrapper* root = nullptr;
     D3D12_SHADER_BYTECODE stages[2]{};
+    std::string layout;
     unsigned seen = 0;
     for (std::size_t at = 0; at < desc.SizeInBytes;) {
         unsigned type;
@@ -253,6 +292,12 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
                 std::memcpy(&bounds, stream + at + sizeof(type) + sizeof(depth_stencil), sizeof(bounds));
                 if (bounds) return nullptr;
             }
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
+            // Unreadable: translate without it; gfx2hlsl refuses a vertex shader that needs it.
+            if (!stream_input_layout(stream + at, layout)) {
+                layout.clear();
+                log("x2w-draw stream input layout unreadable; requesting the translation without it");
+            }
         } else if (type == 16) {  // DEPTH_STENCIL_FORMAT (8B)
             DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
             std::memcpy(&fmt, stream + at + sizeof(type), sizeof(fmt));
@@ -269,7 +314,7 @@ Translation* stream_translation(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, D3
     if (root_blob.empty()) return nullptr;
     AcquireSRWLockExclusive(&draw_lock);
     auto* result = cached_translation(stages[0].pShaderBytecode, stages[0].BytecodeLength,
-                                      stages[1].pShaderBytecode, stages[1].BytecodeLength, root_blob);
+                                      stages[1].pShaderBytecode, stages[1].BytecodeLength, root_blob, layout);
     ReleaseSRWLockExclusive(&draw_lock);
     return result;
 }
@@ -479,10 +524,10 @@ struct SubmittedDrawSamplerHeaps {
 };
 std::vector<SubmittedDrawSamplerHeaps> submitted_draw_sampler_heaps;
 
-void discard_draw_sampler_heaps(Wrapper* self)
+void discard_draw_sampler_heaps(ID3D12CommandList* list)
 {
     AcquireSRWLockExclusive(&draw_lock);
-    recorded_draw_sampler_heaps.erase(static_cast<ID3D12GraphicsCommandList*>(self->own().real));
+    recorded_draw_sampler_heaps.erase(list);
     ReleaseSRWLockExclusive(&draw_lock);
 }
 
@@ -1191,6 +1236,10 @@ void __stdcall list_table(Wrapper* self, UINT parameter, u64 gpu_handle)
 // List slot 40 (desktop 36 + 4), SetGraphicsRoot32BitConstants(parameter, count, data, offset).
 void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, const std::uint32_t* data, UINT offset)
 {
+    static LONG dropped;
+    if (count && (parameter >= 16 || offset >= 8 || count > 8 - offset) && first_calls(dropped, 4))
+        log("x2w-render root constants %s: parameter %u, offset %u, count %u (16 parameters of 8 words are kept)",
+            parameter >= 16 || offset >= 8 ? "dropped" : "truncated", parameter, offset, count);
     if (parameter >= 16 || offset >= 8 || !count || !x2w_local::readable(data, std::size_t{count} * 4)) return;
     for (UINT i = 0; i < count && offset + i < 8; ++i) pass_of(self).constants[parameter][offset + i] = data[i];
 }
