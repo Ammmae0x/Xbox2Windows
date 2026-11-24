@@ -198,6 +198,7 @@ op_popf_lahf_setcc PROC FRAME
     .endprolog
     mov rax, QWORD PTR [rcx]
     mov r11, QWORD PTR [rdx]
+    and r11, -040101h
     mov r9, QWORD PTR [rdx+8]
     add r9, 0
     pushf
@@ -224,6 +225,7 @@ op_popfq_df_movsb PROC FRAME
     mov rdi, r8
     add rdi, 16
     mov r9, QWORD PTR [rcx]
+    and r9, -040101h
     mov rax, QWORD PTR [rcx+8]
     add rax, 0
     pushfq
@@ -318,6 +320,7 @@ op_popfq_normalize PROC FRAME
     mov r11, QWORD PTR [rdx]
     pushfq
     mov QWORD PTR [rsp], r11
+    and QWORD PTR [rsp], -040101h
     popfq
     pushfq
     mov rax, QWORD PTR [rsp]
@@ -345,10 +348,12 @@ op_popf_normalize PROC FRAME
     mov r11, QWORD PTR [rdx+8]
     pushfq
     mov QWORD PTR [rsp], r11
+    and QWORD PTR [rsp], -040101h
     popfq
     mov r11, QWORD PTR [rdx]
     pushf
     mov WORD PTR [rsp], r11w
+    and WORD PTR [rsp], 0FEFFh
     popf
     pushfq
     mov rax, QWORD PTR [rsp]

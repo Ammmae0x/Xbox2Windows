@@ -9552,14 +9552,15 @@ frame-stack tracking (`flag_stack_depths`) and path-sensitive definedness analys
   bytes, mismatched depths at control-flow joins, disallowed instruction prefixes, explicit
   `rsp` register writes/reads or `lea` aliases, and `[rsp + disp]` accesses outside the
   pushed region.
-- Flag definedness and `DF=0` exit discipline (`flag_definedness`): under the default
-  `entry_state="defined"`, status flags start undefined while `DF` starts clear (`false`)
-  per the Windows x64 ABI (with opt-in `entry_state="canonical"` assuming defined entry
-  status flags); `pushf`/`pushfq` require all six status flags (`CF`, `PF`, `AF`, `ZF`,
-  `SF`, `OF`) to be defined by `add`, `sub`, `cmp`, `popf`, or `popfq` on every incoming
-  path; `popf`/`popfq` restore all six status flags and track per-byte `DF` taint across
-  stack pushes and `[rsp]` writes, refusing any `ret`, call, indirect branch, or exit where
-  `DF` may be `1`.
+- Flag definedness, `DF=0` exit discipline, and unmodeled control-bit rejection (`flag_definedness`):
+  under the default `entry_state="defined"`, status flags start undefined while `DF` starts clear
+  (`false`) per the Windows x64 ABI (with opt-in `entry_state="canonical"` assuming defined entry
+  status flags); `pushf`/`pushfq` require all six status flags (`CF`, `PF`, `AF`, `ZF`, `SF`, `OF`)
+  to be defined by `add`, `sub`, `cmp`, `popf`, or `popfq` on every incoming path; `popf`/`popfq`
+  restore all six status flags and track per-byte may-be-1 bitmasks across GP registers and stack
+  pushes/`[rsp]` edits, rejecting `popf` unless `TF` (`0x0100`) is proven clear and `popfq` unless
+  both `TF` and `AC` (`0x040100`) are proven clear, and refusing any `ret`, call, indirect branch, or
+  exit where `DF` may be `1`.
 - Ring-3 RFLAGS normalization: `popf` updates bits `0..15` (`CF`, `PF`, `AF`, `ZF`, `SF`,
   `DF`, `OF`, `NT`) while keeping bit `1` and `IF` (`0x0202`) set, clearing `IOPL` and
   reserved bits, and preserving upper bits (`ID`); `popfq` additionally updates `ID`
@@ -9586,8 +9587,8 @@ controls (`op_add8_al_pushf`: `21`, `op_add32_imm_pushfq`: `23`, `op_sub32_imm_p
 `op_cmp64_imm_pushfq`: `26`), 8 mutated-C++ controls (`ctrl_bit1_cleared`: `30`,
 `ctrl_if_cleared`: `30`, `ctrl_af_bit5`: `6`, `ctrl_pf_full_width`: `8`, `ctrl_df_ignored`:
 `3`, `ctrl_of_dropped`: `3`, `ctrl_id_dropped`: `4`, `ctrl_rsp_step_wrong`: `4`), an
-output-mutation control, 5 alternate-encoding and `entry_state` checks, 36 unit rejection
-controls, one rejected host binding replacing the flag producer, and 11 end-to-end
+output-mutation control, 9 alternate-encoding/stack-edit and `entry_state` checks, 42 unit rejection
+controls, one rejected host binding replacing the flag producer, and 13 end-to-end
 PE-patched DLL rejection controls.
 
 Not covered by this experiment: `sahf` outside the x87 profile, `TF`/`AC` trap semantics,

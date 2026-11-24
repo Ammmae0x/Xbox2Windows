@@ -448,10 +448,157 @@ FLAG_STACK_DELTAS = {C.PUSHFW: 2, C.PUSHFQ: 8, C.POPFW: -2, C.POPFQ: -8}
 FLAG_STACK_LIMIT = 8 * FRAME_WORDS
 FLAG_STATUS_BITS = F.CF | F.PF | F.AF | F.ZF | F.SF | F.OF
 FLAG_STATUS_NAMES = (("CF", F.CF), ("PF", F.PF), ("AF", F.AF), ("ZF", F.ZF), ("SF", F.SF), ("OF", F.OF))
+FLAG_UNMODELED_16 = 0x0100   # TF
+FLAG_UNMODELED_64 = 0x40100  # TF | AC
+_GP_REGS = tuple(REGS)
+_GP_REG_INDEX = {r: idx for idx, r in enumerate(_GP_REGS)}
+_FULL_MASK64 = (1 << 64) - 1
+_IMM_OP_KINDS = frozenset({
+    K.IMMEDIATE8, K.IMMEDIATE16, K.IMMEDIATE32, K.IMMEDIATE64,
+    K.IMMEDIATE8_2ND, K.IMMEDIATE8TO16, K.IMMEDIATE8TO32, K.IMMEDIATE8TO64, K.IMMEDIATE32TO64,
+})
 
 
 def _format_flag_names(mask):
     return ", ".join(name for name, bit in FLAG_STATUS_NAMES if mask & bit)
+
+
+def _format_unmodeled_flags(mask):
+    names = []
+    if mask & 0x0100:
+        names.append("TF")
+    if mask & 0x40000:
+        names.append("AC")
+    return ", ".join(names)
+
+
+def _read_reg_may_one(regs, reg):
+    if reg in HIGH_BYTE:
+        return (regs[_GP_REG_INDEX[RegisterExt.full_register(reg)]] >> 8) & 0xFF
+    full = RegisterExt.full_register(reg)
+    if full in _GP_REG_INDEX:
+        sz = RegisterExt.size(reg)
+        return regs[_GP_REG_INDEX[full]] & ((1 << (8 * sz)) - 1)
+    return (1 << (8 * RegisterExt.size(reg))) - 1
+
+
+def _write_reg_may_one(regs_list, reg, val):
+    if reg in HIGH_BYTE:
+        idx = _GP_REG_INDEX[RegisterExt.full_register(reg)]
+        regs_list[idx] = (regs_list[idx] & ~0xFF00) | ((val & 0xFF) << 8)
+        return
+    full = RegisterExt.full_register(reg)
+    if full not in _GP_REG_INDEX:
+        return
+    idx = _GP_REG_INDEX[full]
+    sz = RegisterExt.size(reg)
+    mask = (1 << (8 * sz)) - 1
+    if sz in (4, 8):
+        regs_list[idx] = val & mask
+    else:
+        regs_list[idx] = (regs_list[idx] & ~mask) | (val & mask)
+
+
+def _read_op_may_one(i, n, dst_size, regs, stack):
+    kind = i.op_kind(n)
+    if kind == K.REGISTER:
+        return _read_reg_may_one(regs, i.op_register(n))
+    if kind == K.MEMORY:
+        sz = MemorySizeExt.size(i.memory_size)
+        if (i.memory_base == R.RSP and i.memory_index == R.NONE and i.segment_prefix == R.NONE
+                and 0 <= i.memory_displacement and i.memory_displacement + sz <= len(stack)):
+            return sum(stack[i.memory_displacement + k] << (8 * k) for k in range(sz))
+        return (1 << (8 * sz)) - 1
+    return i.immediate(n) & ((1 << (8 * dst_size)) - 1)
+
+
+def _taint_written_regs(i, regs_list):
+    for ur in x87_lower._INFO.info(i).used_registers():
+        if ur.access in (OpAccess.WRITE, OpAccess.READ_WRITE, OpAccess.COND_WRITE, OpAccess.READ_COND_WRITE):
+            sz = RegisterExt.size(ur.register)
+            _write_reg_may_one(regs_list, ur.register, (1 << (8 * sz)) - 1)
+
+
+def _update_may_one_state(i, before_regs, before_stack):
+    """Propagate conservative may-be-1 bitmasks across GP registers and pushed flag-stack bytes."""
+    stack_list = None
+    regs_list = list(before_regs)
+    op = i.mnemonic
+    mem_writes = [
+        m for m in x87_lower._INFO.info(i).used_memory()
+        if m.base == R.RSP and m.access in (OpAccess.WRITE, OpAccess.READ_WRITE,
+                                            OpAccess.COND_WRITE, OpAccess.READ_COND_WRITE)
+    ]
+    if i.op0_kind == K.MEMORY and i.memory_base == R.RSP and mem_writes:
+        dst_size = MemorySizeExt.size(i.memory_size)
+        dst_mask = (1 << (8 * dst_size)) - 1
+        disp = i.memory_displacement
+        cur_val = sum(before_stack[disp + k] << (8 * k) for k in range(dst_size))
+        if op == M.MOV:
+            new_val = _read_op_may_one(i, 1, dst_size, before_regs, before_stack) & dst_mask
+        elif op == M.AND:
+            new_val = cur_val & _read_op_may_one(i, 1, dst_size, before_regs, before_stack) & dst_mask
+        elif op in (M.OR, M.XOR):
+            new_val = (cur_val | _read_op_may_one(i, 1, dst_size, before_regs, before_stack)) & dst_mask
+        elif op == M.BTR and i.op1_kind in _IMM_OP_KINDS:
+            bit = i.immediate(1) & (8 * dst_size - 1)
+            new_val = cur_val & ~(1 << bit) & dst_mask
+        else:
+            new_val = dst_mask
+        stack_list = list(before_stack)
+        for k in range(dst_size):
+            stack_list[disp + k] = (new_val >> (8 * k)) & 0xFF
+        for m in mem_writes:
+            msz = MemorySizeExt.size(m.memory_size)
+            if not (m.displacement == disp and msz == dst_size):
+                for idx in range(m.displacement, m.displacement + msz):
+                    stack_list[idx] = 0xFF
+    elif mem_writes:
+        stack_list = list(before_stack)
+        for m in mem_writes:
+            msz = MemorySizeExt.size(m.memory_size)
+            for idx in range(m.displacement, m.displacement + msz):
+                stack_list[idx] = 0xFF
+
+    if i.op0_kind == K.REGISTER:
+        dst = i.op0_register
+        dst_size = RegisterExt.size(dst)
+        dst_mask = (1 << (8 * dst_size)) - 1
+        if op in (M.MOV, M.MOVZX):
+            _write_reg_may_one(regs_list, dst, _read_op_may_one(i, 1, dst_size, before_regs, before_stack) & dst_mask)
+        elif op == M.AND:
+            val = (_read_op_may_one(i, 0, dst_size, before_regs, before_stack)
+                   & _read_op_may_one(i, 1, dst_size, before_regs, before_stack))
+            _write_reg_may_one(regs_list, dst, val & dst_mask)
+        elif op == M.OR:
+            val = (_read_op_may_one(i, 0, dst_size, before_regs, before_stack)
+                   | _read_op_may_one(i, 1, dst_size, before_regs, before_stack))
+            _write_reg_may_one(regs_list, dst, val & dst_mask)
+        elif op == M.XOR:
+            if i.op1_kind == K.REGISTER and i.op0_register == i.op1_register:
+                val = 0
+            else:
+                val = (_read_op_may_one(i, 0, dst_size, before_regs, before_stack)
+                       | _read_op_may_one(i, 1, dst_size, before_regs, before_stack))
+            _write_reg_may_one(regs_list, dst, val & dst_mask)
+        elif op == M.SUB and i.op1_kind == K.REGISTER and i.op0_register == i.op1_register:
+            _write_reg_may_one(regs_list, dst, 0)
+        elif op == M.BTR and i.op1_kind in _IMM_OP_KINDS:
+            bit = i.immediate(1) & (8 * dst_size - 1)
+            val = _read_op_may_one(i, 0, dst_size, before_regs, before_stack) & ~(1 << bit)
+            _write_reg_may_one(regs_list, dst, val & dst_mask)
+        elif op in (M.SHL, M.SHR) and i.op1_kind == K.IMMEDIATE8 and dst_size in (4, 8):
+            count = i.immediate(1) & (63 if dst_size == 8 else 31)
+            cur = _read_op_may_one(i, 0, dst_size, before_regs, before_stack)
+            val = ((cur << count) & dst_mask) if op == M.SHL else (cur >> count)
+            _write_reg_may_one(regs_list, dst, val)
+        else:
+            _taint_written_regs(i, regs_list)
+    else:
+        _taint_written_regs(i, regs_list)
+
+    after_stack = tuple(stack_list) if stack_list is not None else before_stack
+    return tuple(regs_list), after_stack
 
 
 def flag_stack_depths(body, exits, host_ops=None):
@@ -521,10 +668,11 @@ def flag_stack_depths(body, exits, host_ops=None):
 
 
 def flag_definedness(body, exits, host_ops=None, flag_depths=None, entry_state="defined"):
-    """Verify status-flag definedness and DF=0 exit discipline across all reachable paths.
+    """Verify status-flag definedness, DF=0 exit discipline, and clear unmodeled control bits across all paths.
 
-    Tracks the defined subset of {CF, PF, AF, ZF, SF, OF}, whether DF may be set, and the per-byte DF taint
-    on the flag stack (top-first). Returns the ips of ADD/SUB/CMP instructions that must assign AF and PF."""
+    Tracks the defined subset of {CF, PF, AF, ZF, SF, OF}, whether DF may be set, and per-byte may-be-1 bitmasks
+    for GP registers and the pushed flag stack (top-first), rejecting POPF/POPFQ if TF (or AC for POPFQ) may be
+    1. Returns the ips of ADD/SUB/CMP instructions that must assign AF and PF."""
     if entry_state not in ("defined", "canonical"):
         raise ValueError(f"unsupported entry-state profile {entry_state!r}")
     if not body:
@@ -534,64 +682,61 @@ def flag_definedness(body, exits, host_ops=None, flag_depths=None, entry_state="
         flag_depths = flag_stack_depths(body, exits, host_ops)
     index = {i.ip: i for i in body}
     init_flags = FLAG_STATUS_BITS if entry_state == "canonical" else 0
-    state = {body[0].ip: (init_flags, False, ())}
+    init_regs = (_FULL_MASK64,) * len(_GP_REGS)
+    state = {body[0].ip: (init_flags, False, (), init_regs)}
     work = [body[0].ip]
     while work:
         i = index[work.pop()]
-        before_flags, before_df, before_stack = state[i.ip]
+        before_flags, before_df, before_stack, before_regs = state[i.ip]
         after_stack = before_stack
+        after_regs = before_regs
         if i.ip in host_ops or i.flow_control in (FlowControl.CALL, FlowControl.INDIRECT_CALL):
             after_flags = 0
             after_df = False
+            after_regs = init_regs
         elif i.mnemonic in (M.PUSHF, M.PUSHFQ):
             width = 2 if i.mnemonic == M.PUSHF else 8
             after_flags = before_flags
             after_df = before_df
-            after_stack = (before_df,) * width + before_stack
+            pushed_mask = _FULL_MASK64 & ~FLAG_UNMODELED_64 & (~0x0400 if not before_df else _FULL_MASK64)
+            after_stack = tuple((pushed_mask >> (8 * k)) & 0xFF for k in range(width)) + before_stack
         elif i.mnemonic in (M.POPF, M.POPFQ):
             width = 2 if i.mnemonic == M.POPF else 8
+            popped_may_one = sum(before_stack[k] << (8 * k) for k in range(width))
             after_flags = FLAG_STATUS_BITS
-            after_df = before_stack[1]
+            after_df = bool(popped_may_one & 0x0400)
             after_stack = before_stack[width:]
-        elif i.mnemonic == M.CLD:
-            after_flags = before_flags
-            after_df = False
-        elif i.mnemonic == M.STD:
-            after_flags = before_flags
-            after_df = True
-        elif i.mnemonic in LAHF_WRITERS:
-            after_flags = FLAG_STATUS_BITS
-            after_df = before_df
         else:
-            after_df = before_df
-            stack_list = None
-            for m in x87_lower._INFO.info(i).used_memory():
-                if m.base == R.RSP and m.access in (OpAccess.WRITE, OpAccess.READ_WRITE,
-                                                    OpAccess.COND_WRITE, OpAccess.READ_COND_WRITE):
-                    if stack_list is None:
-                        stack_list = list(before_stack)
-                    size = MemorySizeExt.size(m.memory_size)
-                    for idx in range(m.displacement, m.displacement + size):
-                        stack_list[idx] = True
-            if stack_list is not None:
-                after_stack = tuple(stack_list)
-            raw_after = x87_lower._flags_after(i, before_flags)
-            keep_af = (before_flags & F.AF) if not (i.rflags_modified & F.AF) else 0
-            keep_pf = F.PF if (i.mnemonic in PF_DEFINERS and not (i.rflags_undefined & F.PF)) else 0
-            if not (i.rflags_modified & F.PF):
-                keep_pf = before_flags & F.PF
-            after_flags = (raw_after & ~(F.AF | F.PF)) | keep_af | keep_pf
+            after_regs, after_stack = _update_may_one_state(i, before_regs, before_stack)
+            if i.mnemonic == M.CLD:
+                after_flags = before_flags
+                after_df = False
+            elif i.mnemonic == M.STD:
+                after_flags = before_flags
+                after_df = True
+            elif i.mnemonic in LAHF_WRITERS:
+                after_flags = FLAG_STATUS_BITS
+                after_df = before_df
+            else:
+                after_df = before_df
+                raw_after = x87_lower._flags_after(i, before_flags)
+                keep_af = (before_flags & F.AF) if not (i.rflags_modified & F.AF) else 0
+                keep_pf = F.PF if (i.mnemonic in PF_DEFINERS and not (i.rflags_undefined & F.PF)) else 0
+                if not (i.rflags_modified & F.PF):
+                    keep_pf = before_flags & F.PF
+                after_flags = (raw_after & ~(F.AF | F.PF)) | keep_af | keep_pf
         for target in x87_lower._successors(i):
             if target in index:
                 if target not in state:
-                    state[target] = (after_flags, after_df, after_stack)
+                    state[target] = (after_flags, after_df, after_stack, after_regs)
                     work.append(target)
                 else:
-                    old_flags, old_df, old_stack = state[target]
+                    old_flags, old_df, old_stack, old_regs = state[target]
                     joined = (
                         old_flags & after_flags,
                         old_df or after_df,
-                        tuple(a or b for a, b in zip(old_stack, after_stack)),
+                        tuple(a | b for a, b in zip(old_stack, after_stack)),
+                        tuple(a | b for a, b in zip(old_regs, after_regs)),
                     )
                     if joined != state[target]:
                         state[target] = joined
@@ -605,11 +750,21 @@ def flag_definedness(body, exits, host_ops=None, flag_depths=None, entry_state="
             if i.mnemonic in FLAG_STACK_OPS or (i.rflags_read & (FLAG_STATUS_BITS | F.DF)):
                 raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} is unreachable")
             continue
-        before_flags, before_df, _ = state[i.ip]
+        before_flags, before_df, before_stack, _ = state[i.ip]
         if i.mnemonic in (M.PUSHF, M.PUSHFQ):
             missing = FLAG_STATUS_BITS & ~before_flags
             if missing:
                 raise ValueError(f"unsupported query operation at {i.ip:#x}: {i} reads undefined flag(s) {_format_flag_names(missing)}")
+        elif i.mnemonic in (M.POPF, M.POPFQ):
+            width = 2 if i.mnemonic == M.POPF else 8
+            popped_may_one = sum(before_stack[k] << (8 * k) for k in range(width))
+            unmodeled = FLAG_UNMODELED_16 if i.mnemonic == M.POPF else FLAG_UNMODELED_64
+            bad_bits = popped_may_one & unmodeled
+            if bad_bits:
+                raise ValueError(
+                    f"unsupported query operation at {i.ip:#x}: {i} may set unmodeled control flag(s) "
+                    f"{_format_unmodeled_flags(bad_bits)}"
+                )
         elif i.mnemonic == M.LAHF:
             missing = LAHF_FLAGS & ~before_flags
             if missing:
