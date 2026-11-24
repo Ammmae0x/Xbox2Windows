@@ -27,6 +27,19 @@ It covers what the draw cannot observe: the logged descriptor offset (4 bytes in
 a byte-for-byte copy of the descriptor, and refusal of a null list or one that is not whole
 records. The control expects the first blend patch to win and must fail.
 
+## Default viewport and scissor
+
+A desktop command list that never sets a viewport or scissor rectangle draws no pixel. A translated
+draw therefore covers the whole first render target (its width and height, depth 0 to 1) when the title
+set no viewport, and the same rectangle as scissor when it set no scissor. Each default applies on its own,
+and a viewport or scissor the title did set is never replaced. A list reset starts without either. A call
+with no viewports or no rectangles changes nothing. A draw with no render target bound, for example
+depth only, gets no default. The default uses the size of mip 0 of the resource; the render target view's mip slice is not tracked.
+
+Run `ctest --preset dev --no-tests=error -R "^startup_stream_viewport_(hardware|warp)$" -V` after building
+`startup_stream_consumer`. On an 8×4 target the cases draw with neither call, inside a 4×2 rectangle (the
+rest keeps the clear color), and on a reset list that follows the rectangle (all pixels drawn again).
+
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
@@ -48,8 +61,8 @@ selected.
 When the adapter lacks typed UAV support for B5G5R5A1_UNORM or render-target support for
 B4G4R4A4_UNORM, the wrapper uses an R8G8B8A8_UNORM null descriptor if that format supports the
 requested view. This applies only to Texture2D views with no resource or counter. Run
-`ctest --test-dir out/bin --no-tests=error -R "^startup_null_views_" -V` against your build
-directory to exercise both slots on hardware and WARP. On Windows 11 build 26300.9974 the fallback is live on the physical adapter and idle on WARP: an RTX 5080 Laptop (32.0.15.8142) reports `slot 19 format 86 -> 28; slot 20 format 115 -> 28`, while in-box WARP 10.0.26100.9818 reports `slot 19 format 86 -> 86; slot 20 format 115 -> 115`. This adapter therefore lacks the typed UAV and render-target support the rule keys on, and WARP does not.
+`ctest --preset dev --no-tests=error -R '^startup_null_views_' -V` against your build
+directory to exercise both slots on hardware and WARP. On Windows 11 build 26300.9974 two adapters on one machine split. An RTX 5080 Laptop (32.0.15.8142) lacks the typed UAV and render-target support the rule keys on and reports `slot 19 format 86 -> 28; slot 20 format 115 -> 28`; an Intel Arc 140T (32.0.101.8132) has it, like in-box WARP 10.0.26100.9818, and both report `slot 19 format 86 -> 86; slot 20 format 115 -> 115`. Physical versus WARP is therefore not the discriminator; select the adapter with `XBOX2WINDOWS_ADAPTER=intel` or `XBOX2WINDOWS_ADAPTER=nvidia` and read the two lines.
 
 ## 16-bit packed targets
 
@@ -128,6 +141,16 @@ adapter whose handles are addresses.
 How the executable arrives at the damaged handle is not known; only the handle and the fault were
 observed.
 
+## Copies of title memory within a frame
+
+A translated draw that reads title memory by address (a constant buffer, a vertex or index range, a root pointer)
+gets a copy in the upload ring. Within one frame the copy is found again by address and size, but only while the
+title's memory still holds the bytes it was made from: each entry keeps them, and a draw that finds different bytes
+makes a new copy and logs one `frame copy of ... refreshed` line (the first four). Without that, a title that rewrites
+one address between two draws of a frame, such as a dynamic constant buffer, gave the second draw the first draw's
+data. The comparison uses the kept bytes because the ring is write-combined memory that is slow to read.
+`startup_frame_copy_{warp,hardware}` rewrites a constant buffer between two draws and checks both halves.
+
 ## Null bindings in translated draws
 
 The `x2w-render totals` line reports `null bindings N`, then the same count split by cause as
@@ -158,6 +181,30 @@ desktop list and does not set the vertex-fetch bit of `srv_bound`. The slot numb
 the console shift, not yet seen in a title log; `startup_root_cbv_{warp,hardware}` checks the handler with a bound, an
 unbound, a null-overwrite and a wrong-type call. Rebinding the same root signature keeps
 the address. Switching to a different signature invalidates the stored root addresses.
+
+## Heap-indexed root signatures
+
+Device slot 16 records whether a title root signature was created with
+`D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` (`0x400`), `SAMPLER_HEAP_DIRECTLY_INDEXED` (`0x800`)
+or both. Command-list slot 32 only tracks the heaps a title sets and never forwards them, so setting such a root
+signature on the desktop list made the debug layer report message ID 1419 for each flag. Slot 34 now keeps
+tracking the title's parameters, root addresses and constants for every root signature, but sets only an unflagged
+one on the desktop list, as before; a flagged one is deferred (`root signature ... with heap flags 0x... not set on
+the desktop list`, first three). Root SRVs (slot 44) are not forwarded under a deferred root. Translated draws use
+their own root signature (no flags) and are unaffected.
+
+A real draw under a deferred root is decided by `src/startup_stubs/heap_indexed_root.h`: it may bind only when the
+list holds a mirror of every heap the root indexes, covering the indices the draw reads, and every root constant,
+descriptor table and root descriptor can be set again. A one-entry sampler heap covers only index 0 and never stands
+in for the view heap. The stand-in has no mirrored heap and cannot restore that state, so it refuses every real draw
+under a flagged root, counts it by reason and logs `real draw refused: root signature heap flags 0x..., <reason>`
+(first three per reason, then every 1000th). The `x2w-render totals` line reports `heap-indexed roots deferred N
+(real draws refused: view heap, sampler heap, both heaps, state)`. On current main no source-built path reaches a
+real draw (`compile_translation` returns no shader), so the refusal itself is checked only by the device-free
+`startup_heap_indexed_root` matrix. `startup_root_heap_{warp,hardware}` runs the root CBV draw with the debug layer
+on, for each flag alone, both and neither: a plain desktop list with the same root signature and no heaps must
+produce one ID 1419 per flag first (otherwise the run skips with 77), and through the stand-in no such message may
+appear while the translated draw keeps its colour.
 
 ## Composite provenance fixture
 
@@ -269,6 +316,10 @@ hex HRESULT/format/flag codes, slot numbers and known shader-failure categories 
 refusals, unhandled `x2w-d3d12` / trap slots, `x2w-d3d12-debug` severity/ID counts, `x2w-dstorage`
 failures and status HRESULTs, `x2w-runtime` failing slots, and `.fail` shader categories). Any other
 text is grouped as `other (text omitted)` and never copied; raw snippets stay in the local logs.
+`Device::slot133` (the console placed-resource call) logs each handled placement with a trailing
+`aliased` or `not aliased` field. Those lines are not counted as unhandled; they are counted by
+outcome (`aliased`, `not_aliased`, `failed`) in a separate table, and a line with an HRESULT other than 0
+(or an uncommitted address) still counts as `failed` and as an unhandled `Device::slot133` event.
 Check with `python3 -B tests/startup_triage_run_check.py` (ctest
 `startup_triage_run`).
 
@@ -305,6 +356,16 @@ starts a byte earlier is rejected before it copies anything. No GPU and no game 
 ctest --preset release --no-tests=error -R '^startup_inflate$' -V
 ```
 
+## DirectStorage destinations that are not writable
+
+A request whose destination (a plain pointer, not 64 KiB page tokens) is not writable up to its declared capacity fails before any byte is written: the stand-in walks the destination with `VirtualQuery`, and a page that is uncommitted, read-only, `PAGE_GUARD` or `PAGE_NOACCESS` refuses the whole request. The log line ends `destination not writable`, `requests_failed` counts it, the next status entry reports `E_FAIL` and the queue goes on with later requests. Before this check, a destination shorter in memory than its declared capacity faulted inside the stand-in's copy (#870). The check covers the whole declared capacity, not only the bytes the request would write. Cost: one `VirtualQuery` per region the destination spans, per request that reaches the copy.
+
+`tests/startup_dstorage_destination_check.cpp` (ctest `startup_dstorage_destination`) sends memory-source requests through the real queue: a read-only, a guard and a no-access middle page, and a capacity one page past the committed pages. Each must fail with the process alive and the bytes of the pages before the bad one still `0xAA`. Afterwards, requests into a fully writable (`PAGE_READWRITE`) buffer and a copy-on-write (`PAGE_WRITECOPY`) mapped view on the same queue must write every byte:
+
+```powershell
+ctest --preset release --no-tests=error -R '^startup_dstorage_destination$' -V
+```
+
 ## Local switches, logging, and memory probing
 
 `tests/startup_local_log_check.cpp` (device-free ctest `startup_local_log`, with negative
@@ -330,7 +391,7 @@ ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` |
-| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running. Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. |
+| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running. Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` and no manifest; `X2W_FXC=` (empty) skips compilation and publishes the manifest alone. |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
@@ -662,7 +723,12 @@ These are measured on one executable; treat them as hypotheses for others.
   decodes `CB_BLENDn_CONTROL` and a `CB_TARGET_MASK` nibble into `D3D12_RENDER_TARGET_BLEND_DESC`. It
   refuses forms D3D12 can't express (`BOTH_SRC_ALPHA`, constant alpha without alpha blend factor
   support, MIN/MAX with factors other than ONE). Its draws match a CPU model of the register fields
-  (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`).
+  (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`). A device-free check decodes
+  each 5-bit factor value in each of the four factor slots, each pair of colour and alpha combine
+  functions, the MIN/MAX rule on each slot, the write mask and `control_word`, and checks the
+  reason of each refusal. Its `_dest_alpha_control` run, which expects a destination alpha factor
+  in its colour form, is the negative control
+  (`ctest --preset dev --no-tests=error -R "^startup_cb_blend_decode" -V`).
 - Audio produces no output from the console audio path. A separate desktop render sink exists
   (see "Audio output"); nothing connects the console path to it yet.
 
@@ -876,7 +942,10 @@ B8G8R8A8/B8G8R8X8 (87-93) families. Both allocation-info entries (slots 25 and 1
 answer for them.
 
 Verification status: the device-independent reference sizes in `tests/startup_plane_size_check.cpp`
-(`startup_plane_size`) cover R24G8 and the added colour families. `startup_plane_size_device_`
+(`startup_plane_size`) cover R24G8 and the added colour families. They include the first and last
+format of each multisampled colour family, B8G8R8A8 at 1920 x 1080, format 118 with four samples,
+format 120, a description at 64 KiB alignment, a desktop answer of the same size at 4 MiB alignment,
+and the zero-width, too-tall and too-many-slices shapes the rule refuses. `startup_plane_size_device_`
 checks that the wrapper answers the helper's result for the adapter's own desktop answer; it passed
 on Windows Server 2025 (WARP and the hardware case) in Debug and Release. It does not show that the
 console layout fits the answered size for these formats; no console reference sizes are listed for
@@ -979,8 +1048,12 @@ cube-array view, and widths, first elements, addresses and destinations above 4 
 Checks:
 
 `startup_memory_srv_buffer` is device-free and owns every rejection (bounds, alignment, format,
-stride). `startup_address_buffer_srv_*` exercises only the resolve path with valid addresses on a
-device, so it does not cover the rejections.
+stride). It changes each buffer description and view field alone, checks the element bytes of every
+typed format, views that end exactly at the end of the buffer, raw alignment of the adjusted first
+element, and widths, addresses and first elements above 4 GiB. Its `_control` runs (`height`,
+`exact-fit`, `first-32`) expect wrong answers and must fail. `startup_address_buffer_srv_*` exercises
+only the resolve path with valid addresses on a device, so it does not cover the rejections.
 
 - `ctest --preset release --no-tests=error -R '^startup_memory_srv_(report|buffer)$' -V`
+- `ctest --preset release --no-tests=error -R '^startup_memory_srv_buffer_.*_control$' -V`
 - `ctest --preset release --no-tests=error -R '^startup_address_(srv|buffer_srv)_' -V`

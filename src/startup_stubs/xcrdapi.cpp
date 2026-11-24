@@ -24,6 +24,7 @@
 #include <vector>
 
 #include <cstdarg>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -132,6 +133,31 @@ static bool has_zlib_header(const unsigned char* bytes, std::size_t size)
     if ((cmf & 0x0F) != 8) return false;
     if ((cmf >> 4) > 7) return false;
     if ((static_cast<unsigned>(cmf) * 256 + flg) % 31 != 0) return false;
+    return true;
+}
+
+// True when every byte of [destination, destination + bytes) is committed and writable, with no guard or
+// no-access page in between. Walks the regions one VirtualQuery at a time, so a destination that spans
+// regions of different protection is judged page by page. Nothing is written or touched.
+static bool destination_writable(const void* destination, std::size_t bytes)
+{
+    if (bytes == 0) return true;
+    std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(destination);
+    if (!destination || bytes > UINTPTR_MAX - cursor) return false;
+    const std::uintptr_t end = cursor + bytes;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT)
+            return false;
+        if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+        const DWORD protect = info.Protect & 0xFF;
+        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
+            protect != PAGE_EXECUTE_WRITECOPY)
+            return false;
+        const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (region_end <= cursor) return false;
+        cursor = region_end;
+    }
     return true;
 }
 
@@ -592,7 +618,16 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                     data = nullptr;
                 }
             } else if (data != destination) {
-                std::memcpy(destination, data, decode_length);
+                // The title's destination can be smaller in memory than its declared capacity (#870:
+                // a write fault inside this copy). Judge the whole declared capacity before the first
+                // byte is written, so a refusal leaves every page untouched.
+                if (destination_writable(destination, destination_capacity)) {
+                    std::memcpy(destination, data, decode_length);
+                } else {
+                    outcome = "destination not writable";
+                    data = nullptr;
+                    written = false;
+                }
             }
             if (written) {
                 if (bcpack && !bcpack_decoded) {
