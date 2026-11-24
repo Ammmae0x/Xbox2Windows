@@ -305,6 +305,72 @@ bool dstorage_page_array_checks() {
     return true;
 }
 
+// #1843: a new status array's slots start complete with S_OK; EnqueueStatus makes one pending until
+// its turn, and the others are untouched.
+bool dstorage_status_initial_checks() {
+    _putenv("X2W_XMEM_PERMISSIVE=1");
+    HMODULE xcrdapi = LoadLibraryA("XCRDAPI.dll");
+    if (!xcrdapi) return false;
+    auto get_factory = reinterpret_cast<DStorageGetFactoryFn>(GetProcAddress(xcrdapi, "DStorageGetFactory"));
+    void* factory_ptr = nullptr;
+    if (!get_factory || get_factory(nullptr, &factory_ptr) != 0 || !factory_ptr) return false;
+    auto* factory = static_cast<Object*>(factory_ptr);
+
+    const unsigned capacity = 4;
+    void* status_ptr = nullptr;
+    if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, capacity, "InitialStatus", nullptr, &status_ptr) != 0 ||
+        !status_ptr)
+        return false;
+    auto* status = static_cast<Object*>(status_ptr);
+    auto complete = [&](unsigned i) { return reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, i); };
+    auto result = [&](unsigned i) { return reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i); };
+    const long e_pending = static_cast<long>(0x8000000A), e_invalidarg = static_cast<long>(0x80070057);
+
+    // A fresh array: every slot complete with S_OK. An index past the end stays refused.
+    for (unsigned i = 0; i < capacity; ++i) {
+        if (!complete(i) || result(i) != S_OK) {
+            std::printf("dstorage-status-initial: fresh slot %u complete=%d hr=0x%08lx\n", i, complete(i),
+                        static_cast<unsigned long>(result(i)));
+            return false;
+        }
+    }
+    if (complete(capacity) || result(capacity) != e_invalidarg) return false;
+
+    // Hold the queue's worker in a fence signal, then enqueue a status into slot 2 behind it.
+    void* queue_ptr = nullptr;
+    alignas(void*) unsigned char desc[40] = {};
+    *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+    if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr)
+        return false;
+    auto* queue = static_cast<Object*>(queue_ptr);
+    static SubmitGate gate;
+    static void* fence_vtable[11] = {};
+    fence_vtable[10] = reinterpret_cast<void*>(&hold_worker);
+    gate.vtable = fence_vtable;
+    gate.entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    gate.resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!gate.entered || !gate.resume) return false;
+    reinterpret_cast<EnqueueSignalFn>(queue->vtable[5])(queue, &gate, 1);
+    reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 2);
+    reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+    if (WaitForSingleObject(gate.entered, 3000) != WAIT_OBJECT_0) {
+        SetEvent(gate.resume);
+        return false;
+    }
+    // Before its turn, slot 2 is pending and the other slots keep their S_OK.
+    bool held = !complete(2) && result(2) == e_pending;
+    for (unsigned i : {0u, 1u, 3u}) held = held && complete(i) && result(i) == S_OK;
+    SetEvent(gate.resume);
+    for (int i = 0; i < 200 && !complete(2); ++i) Sleep(10);
+    const bool done = complete(2) && result(2) == S_OK && InterlockedCompareExchange(&gate.resumed, 0, 0);
+    if (!held || !done) {
+        std::printf("dstorage-status-initial: held=%d done=%d slot2 hr=0x%08lx\n", held, done,
+                    static_cast<unsigned long>(result(2)));
+        return false;
+    }
+    return true;
+}
+
 bool dstorage_checks() {
     _putenv("X2W_XMEM_PERMISSIVE=1");
 
@@ -1402,7 +1468,7 @@ bool dstorage_checks() {
         };
 
         void* status_ptr = nullptr;
-        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 6, "BcpackStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 7, "BcpackStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
             return false;
         }
         auto* status = static_cast<Object*>(status_ptr);
@@ -1421,6 +1487,7 @@ bool dstorage_checks() {
         std::vector<unsigned char> dest_truncated(32, 0xCC);
         std::vector<unsigned char> dest_bc1_valid(512, 0xEE);
         std::vector<unsigned char> dest_bc1_trailing(512, 0xDD);
+        std::vector<unsigned char> dest_bc6h_blank(64, 0xAA);
 
         // Request 0: valid BC7 Mode 6 memory request (32 bytes destination, 2 blocks)
         unsigned char req0[0x48] = {};
@@ -1488,6 +1555,18 @@ bool dstorage_checks() {
         *reinterpret_cast<unsigned*>(req5 + 0x30) = sizeof(bc1_packed_trailing);
         *reinterpret_cast<unsigned*>(req5 + 0x38) = 512;
 
+        // Request 6: BCPack format 6 (BC6H) is not decoded yet; it must be zero-filled and counted.
+        static const unsigned char bc6h_packed[] = {0x00, 0x01, 0x02, 0x03};
+        unsigned char req6[0x48] = {};
+        *reinterpret_cast<u64*>(req6 + 0x00) = (6ull << 1) | 0x400000;
+        *reinterpret_cast<void**>(req6 + 0x08) = dest_bc6h_blank.data();
+        *reinterpret_cast<u64*>(req6 + 0x10) = 0;
+        *reinterpret_cast<unsigned*>(req6 + 0x18) = 64;
+        *reinterpret_cast<const unsigned char**>(req6 + 0x20) = bc6h_packed;
+        *reinterpret_cast<u64*>(req6 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req6 + 0x30) = sizeof(bc6h_packed);
+        *reinterpret_cast<unsigned*>(req6 + 0x38) = 64;
+
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1);
@@ -1500,10 +1579,12 @@ bool dstorage_checks() {
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 4);
         reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req5);
         reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 5);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req6);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 6);
         reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
 
         for (int i = 0; i < 200; ++i) {
-            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 5)) break;
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 6)) break;
             Sleep(10);
         }
         if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
@@ -1511,7 +1592,8 @@ bool dstorage_checks() {
             !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2) ||
             !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 3) ||
             !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 4) ||
-            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 5)) {
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 5) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 6)) {
             return false;
         }
 
@@ -1521,6 +1603,7 @@ bool dstorage_checks() {
         long hr3 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 3);
         long hr4 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 4);
         long hr5 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 5);
+        long hr6 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 6);
 
         if (hr0 != 0 || std::memcmp(dest_bc7_mode6.data(), bc7_mode6_expected, 32) != 0) return false;
         if (hr1 == 0) return false;
@@ -1536,6 +1619,10 @@ bool dstorage_checks() {
         if (hr5 == 0) return false;
         for (unsigned char b : dest_bc1_trailing) {
             if (b != 0xDD) return false;
+        }
+        if (hr6 != 0) return false;
+        for (unsigned char b : dest_bc6h_blank) {
+            if (b != 0) return false;
         }
     }
 
@@ -1625,6 +1712,11 @@ int main(int argc, char** argv)
     if (!std::strcmp(which, "dstorage-pages")) {
         if (!dstorage_page_array_checks()) return 9;
         std::puts("dstorage-pages ok");
+        return 0;
+    }
+    if (!std::strcmp(which, "dstorage-status-initial")) {
+        if (!dstorage_status_initial_checks()) return 10;
+        std::puts("dstorage-status-initial ok");
         return 0;
     }
     if (!std::strcmp(which, "dstorage")) {
