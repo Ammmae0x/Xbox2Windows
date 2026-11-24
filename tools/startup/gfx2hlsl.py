@@ -742,6 +742,72 @@ class Stage:
                 self.set_v(n, 'U(t.%s)' % comp)
                 n += 1
 
+    def image_compare(self, ops, mods, how):
+        """image_sample_c and image_sample_c_lz: a 2D depth comparison returning one float.
+
+        The address dwords are the reference, then u and v, which is what SampleCmp* takes as its third
+        argument and its location. The comparison function and the filter live in the sampler descriptor,
+        so they are read from its constant words by the decoder the pixel AOT path already checks against
+        D3D12 (pixel_aot.comparison_sampler_state) and bound as a SamplerComparisonState. HLSL has no
+        SampleCmpLevel before shader model 6.7 (the stages here compile as 5.1 and 6.0), so
+        image_sample_c_l is refused instead of being sampled at level zero.
+        """
+        base = 'image_sample_' + how
+        if how == 'c_l':
+            raise Unsupported('image_sample_c_l: SampleCmpLevel needs shader model 6.7; only c and c_lz are lowered')
+        for m in mods:
+            if not (m.startswith(('dim:', 'dmask:')) or m in ('dlc', 'glc', 'slc')):
+                raise Unsupported('%s modifier %s' % (base, m))
+        dims = [m[4:] for m in mods if m.startswith('dim:')]
+        masks = [m[6:] for m in mods if m.startswith('dmask:')]
+        if len(dims) != 1 or len(masks) != 1:
+            raise Unsupported('%s without exactly one dim and dmask' % base)
+        dim, dmask = dims[0], int(masks[0], 0)
+        if dim != 'SQ_RSRC_IMG_2D':
+            raise Unsupported('%s on %s' % (base, dim))
+        if dmask != 1:
+            raise Unsupported('%s with dmask %#x: a comparison returns one channel' % (base, dmask))
+        if len(ops) != 4:
+            raise Unsupported('%s with %d operands' % (base, len(ops)))
+        coords = ops[1]
+        if coords.startswith('['):
+            cs = [c.strip() for c in coords[1:-1].split(',')]
+        else:
+            r = reg_range(coords)
+            cs = ['v%d' % n for n in range(r[1], r[2] + 1)]
+        if len(cs) != 3:
+            raise Unsupported('%s with %d address registers' % (base, len(cs)))
+        if self.heap_sampler(ops[3]):
+            raise Unsupported('%s through a sampler heap' % base)
+        words = self.const_words(ops[3])
+        if words is None:
+            raise Unsupported('%s with a sampler that is not constant' % base)
+        import pixel_aot
+        try:
+            pixel_aot.comparison_sampler_state(tuple(words))
+        except ValueError as error:
+            raise Unsupported('%s sampler: %s' % (base, error))
+        tex = self.pipe.resource(self.descriptor(ops[2]), 'tex2d')
+        smp = self.pipe.sampler(tuple(words), comparison=True)
+        args = '%s, float2(%s, %s), %s' % (smp, self.f(cs[1]), self.f(cs[2]), self.f(cs[0]))
+        # MAX_LOD (word 1 bits 23:12) is not carried into the static sampler, and the comparison-state mapping ignores
+        # the mip filter and uses level zero. Only a source limited to level zero is therefore exact for the implicit
+        # form; any other limit would need mip selection and blending that is not lowered in this slice, so it is refused.
+        max_lod = (words[1] >> 12) & 0xfff
+        if how == 'c' and max_lod:
+            raise Unsupported('%s with implicit mip selection (sampler MAX_LOD %#x)' % (base, max_lod))
+        call = '%s.SampleCmpLevelZero(%s)' % (tex, args)
+        self.set_v(reg_range(ops[0])[1], 'U(%s)' % call)
+
+    def op_image_sample_c(self, ops, mods):
+        self.image_compare(ops, mods, 'c')
+
+    def op_image_sample_c_lz(self, ops, mods):
+        self.image_compare(ops, mods, 'c_lz')
+
+    def op_image_sample_c_l(self, ops, mods):
+        self.image_compare(ops, mods, 'c_l')
+
     def op_image_sample(self, ops, mods):
         self.image(ops, mods, 'sample')
 
@@ -1102,9 +1168,11 @@ class Pipeline:
             raise Unsupported('resource %s used as %s and %s' % (key, r['kind'], kind))
         return 'r%d' % r['index']
 
-    def sampler(self, key):
+    def sampler(self, key, comparison=False):
         if not isinstance(key[0], int):
             raise Unsupported('sampler from a descriptor')
+        # A comparison sampler is its own binding even when its words equal an ordinary sampler's.
+        key = ('cmp',) + tuple(key) if comparison else key
         return 'q%d' % self.samplers.setdefault(key, len(self.samplers))
 
     def common(self):
@@ -1117,7 +1185,7 @@ class Pipeline:
         for key, r in sorted(self.resources.items(), key=lambda kv: kv[1]['index']):
             out.append('%s r%d : register(t%d);' % ({'buf': 'ByteAddressBuffer', 'tex2d': 'Texture2D<float4>', 'tex2da': 'Texture2DArray<float4>', 'tex3d': 'Texture3D<float4>'}[r['kind']], r['index'], r['index']))
         for key, i in self.samplers.items():
-            out.append('SamplerState q%d : register(s%d);' % (i, i))
+            out.append('%s q%d : register(s%d);' % ('SamplerComparisonState' if key[0] == 'cmp' else 'SamplerState', i, i))
         if self.uses_sampler_heap:
             out.append('SamplerState qh[%d] : register(s0, space%d);' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE))
             out.append('uint x2w_sampler_entry(uint offset) { return (offset & 15u) != 0 || offset >= %du ? %du : offset >> 4; }'
@@ -1182,7 +1250,8 @@ class Pipeline:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
         for key, i in self.samplers.items():
-            lines.append('smp %d %s' % (i, ' '.join('0x%x' % w for w in key)))
+            comparison = key[0] == 'cmp'
+            lines.append('%s %d %s' % ('smpc' if comparison else 'smp', i, ' '.join('0x%x' % w for w in key[comparison:])))
         if self.uses_sampler_heap:
             lines.append('smpheap %d %d fallback %d' % (SAMPLER_HEAP_SIZE, SAMPLER_HEAP_SPACE, SAMPLER_HEAP_FALLBACK))
         lines.append('params %d' % (max(self.params) + 1 if self.params else 0))

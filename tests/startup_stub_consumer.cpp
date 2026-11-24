@@ -7,6 +7,7 @@
 //   physical -> XMemAllocatePhysicalPages/XMemFreePhysicalPages round trip (no trap expected)
 //   dstorage -> DirectStorage multi-page RFC 1950 zlib request, BCPack decode and failure controls (Refs #1139, #1144)
 //   dstorage-pages -> page-array entries replaced, or made unreadable, between EnqueueRequest and Submit
+//   store    -> XStoreCreateContext for the local user, a mutated provider, and a non-local user (Refs #1147)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -31,6 +32,7 @@ extern "C" __declspec(dllimport) void* WINAPI XMemVirtualAlloc(void* address, SI
                                                               ULONGLONG attributes, DWORD protection);
 extern "C" __declspec(dllimport) void* WINAPI XMemMapPhysicalPages(void* base, ULONG_PTR count,
                                                                    const ULONG_PTR* tokens);
+int x2w_store_method3_check();
 
 namespace {
 
@@ -1630,5 +1632,6 @@ int main(int argc, char** argv)
         std::puts("dstorage ok");
         return 0;
     }
+    if (!std::strcmp(which, "store")) return x2w_store_method3_check();
     return 2;
 }

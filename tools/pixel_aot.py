@@ -1,4 +1,4 @@
-"""Offline lowering for a straight-line, texture-sampling gfx1013 pixel shader."""
+"""Offline lowering for selected gfx1013 and gfx1030 pixel shaders."""
 import argparse
 import ctypes as C
 from fractions import Fraction
@@ -220,6 +220,38 @@ def disassemble(code, library, *, cpu=b"gfx1013", offsets=False, features=b""):
 
 SAMPLED_RESOURCES = """Texture2D<float4> tex : register(t0);
 SamplerState samp : register(s0);"""
+
+GATHER_RESOURCES = """Texture2D<float4> tex : register(t0);
+float4 gather_2d(float2 uv, int2 offset, int mip, uint component) {
+    uint width, height, levels;
+    tex.GetDimensions(mip, width, height, levels);
+    int2 edge = int2(width, height) - 1;
+    precise float2 scaled = uv * float2(width, height) - 0.5f;
+    int2 origin = int2(floor(scaled)) + offset;
+    // In increasing (x, y) coordinates, the taps are (0,1), (1,1), (1,0), (0,0).
+    return float4(tex.Load(int3(clamp(origin + int2(0, 1), 0, edge), mip))[component],
+                  tex.Load(int3(clamp(origin + int2(1, 1), 0, edge), mip))[component],
+                  tex.Load(int3(clamp(origin + int2(1, 0), 0, edge), mip))[component],
+                  tex.Load(int3(clamp(origin,               0, edge), mip))[component]);
+}"""
+
+
+def check_gather_sampler(words, mips):
+    # SQ_IMG_SAMP_WORD0: clamp to last texel in X/Y, normalized coordinates, no truncation.
+    # WORD1: zero MIN_LOD, MAX_LOD at or above the last visible mip. WORD2: bilinear XY,
+    # point mip, zero biases. Keep the other fields zero in this profile.
+    w0, w1, w2, w3 = words
+    if (w0 != 0x12 or w1 & ~0x00fff000 or (w1 >> 12) < ((mips - 1) << 8)
+            or w2 != 0x04500000 or w3 != 0):
+        raise ValueError("Unsupported gather sampler: requires normalized clamp, bilinear XY, point mip and no LOD modifiers")
+
+
+def gather_offset(bits):
+    if bits is None or bits & ~0x3f3f:
+        raise ValueError("Gather requires a static packed XY offset")
+    x, y = bits & 63, (bits >> 8) & 63
+    return (x ^ 32) - 32, (y ^ 32) - 32
+
 
 # SQ_TEX_DEPTH_COMPARE values (sampler word 0, bits 14:12). D3D12_COMPARISON_FUNC is the same order plus one.
 # The hardware compares the reference against the texel: the result is (reference OP texel).
@@ -2857,10 +2889,12 @@ class TrackedScalar(dict):
 def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=None, *,
           texture_offset=0, second_texture_offset=None, integer_export=False, texcoord_components=2, extra_constants=(),
           title_ranges=None, flat_global_only=False, return_write_mask=False, wave_size=None, half_denorm=None,
-          pointer_constants=()):
+          pointer_constants=(), cpu="gfx1013", gather_mips=None):
     """Track descriptor provenance, interpolation and packed or uncompressed exports.
 
     texture_offset is the aligned byte offset of t0 in the texture descriptor table.
+    gather_mips declares the number of visible mips in matching gfx1030 and desktop float4 2D views.
+    Gather coordinates must map to the same half-texel lattice on both views (see experiments.md).
     constant_descriptor is the byte offset, on the texture table, of the descriptor mapped to b0.
     Each extra_constants entry is an (entry SGPR, byte offset) pair naming one further 16-byte
     descriptor; the entries map in order to b1 onward. The SGPR may be the texture table or another
@@ -2885,6 +2919,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     A read of a guest register that holds no tracked value raises UnboundOperand, a ValueError that names the
     register and the instruction, so a missing entry binding is not mistaken for an unsupported instruction.
     """
+    if cpu not in ("gfx1013", "gfx1030"):
+        raise ValueError("Unsupported pixel target")
+    if gather_mips is not None:
+        if (cpu != "gfx1030" or sampler is None or second_texture_offset is not None or integer_export
+                or type(gather_mips) is not int or not 1 <= gather_mips <= 16):
+            raise ValueError("Gather requires a gfx1030 float pixel profile with one texture and 1 to 16 visible mips")
+        if len(sampler) == 4:
+            check_gather_sampler(sampler, gather_mips)
     if title_ranges is not None and (isinstance(title_ranges, bool) or not isinstance(title_ranges, int)
                                      or not 1 <= title_ranges <= 0xffffffff):
         raise ValueError("Invalid title range count")
@@ -2983,7 +3025,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     mask = "entry"
     wqm_width = None
     samples = 0
-    sample_kind = None  # "plain" or "comparison": both would need s0
+    sample_kind = None  # "plain", "comparison" or "gather" resource interpretation
     vector_loads = 0  # image samples and title loads issued, in vmcnt order
     title_loads = False
     sample_dest = {}  # VGPR -> issue number of its outstanding image_sample or title load
@@ -4052,15 +4094,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     vector[dst] = f"uv.{component}" if mask == "quad" else ("entry_uv", component)
             else:
                 raise ValueError("Unpaired interpolation")
-        elif m := match(r"(image_sample(?:_lz|_l|_b)?(?:_o)?) (?:v\[(\d+):(\d+)\]|v(\d+)), "
+        elif m := match(r"(image_sample(?:(?:_lz|_l|_b)?(?:_o)?|_d(?:_o)?(?:_g16)?)) (?:v\[(\d+):(\d+)\]|v(\d+)), "
                         r"v\[(\d+):(\d+)\], s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([1-9a-f]) dim:SQ_RSRC_IMG_2D"):
             op, dst_first, dst_last, dst_single, *rest, dmask_hex = m.groups()
             dmask = int(dmask_hex, 16)
             if op != "image_sample" and dmask != 0xf:
                 raise ValueError(f"{op} requires dmask:0xf")
-            base_op = op.removesuffix("_o")
-            has_offset = base_op != op
-            coord_width = (3 if base_op in ("image_sample_l", "image_sample_b") else 2) + has_offset
+            g16 = op.endswith("_g16")
+            sample_op = op.removesuffix("_g16")
+            base_op = sample_op.removesuffix("_o")
+            has_offset = sample_op != base_op
+            if base_op == "image_sample_d":
+                # LLVM disassembly lists only the live address operands.
+                coord_width = (4 if g16 else 6) + has_offset
+            else:
+                coord_width = (3 if base_op in ("image_sample_l", "image_sample_b") else 2) + has_offset
             channels = ["xyzw"[bit] for bit in range(4) if (dmask >> bit) & 1]
             if len(channels) == 1:
                 if dst_single is None:
@@ -4104,7 +4152,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     return value
                 return fp_operand(reg, scalar, vector, pending, sample_dest)
 
-            if base_op in ("image_sample_lz", "image_sample_l"):
+            if base_op == "image_sample_d":
+                u, v = [sample_coord(reg) for reg in coord_regs[-2:]]
+                # Two coordinate slopes per screen axis, horizontal first. G16 packs
+                # U in the low half and V in the high half of each gradient word.
+                if g16:
+                    h, vert = [int_operand(reg, scalar, vector, pending, sample_dest, signed=False)
+                               for reg in coord_regs[:2]]
+                    ddx = f"float2(widen16({h}), widen16({h} >> 16))"
+                    ddy = f"float2(widen16({vert}), widen16({vert} >> 16))"
+                else:
+                    dudx, dvdx, dudy, dvdy = [sample_coord(reg) for reg in coord_regs[:4]]
+                    ddx = f"float2({dudx}, {dvdx})"
+                    ddy = f"float2({dudy}, {dvdy})"
+                call = f"SampleGrad(samp, float2({u}, {v}), {ddx}, {ddy}{offset_arg})"
+            elif base_op in ("image_sample_lz", "image_sample_l"):
                 u, v = [sample_coord(reg) for reg in coord_regs[:2]]
                 lod = sample_coord(coord_regs[2]) if base_op == "image_sample_l" else "0.0f"
                 call = f"SampleLevel(samp, float2({u}, {v}), {lod}{offset_arg})"
@@ -4219,6 +4281,53 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector_loads += 1
             vector[dst] = f"sample{i}"
             sample_dest[dst] = vector_loads
+        elif m := match(r"image_gather4(?P<lod>_lz|_l)?(?P<offset>_o)? v\[(\d+):(\d+)\], v\[(\d+):(\d+)\], "
+                        r"s\[(\d+):(\d+)\], s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D"):
+            lod_mode, offset_mode, dst_first, dst_last, addr_first, addr_last, image_first, image_last, \
+                sampler_first, sampler_last, dmask = m.groups()
+            if gather_mips is None or mask != "entry" or region is not None or sample_kind is not None:
+                raise ValueError("Gather requires one unguarded instruction and a declared gather view")
+            if lod_mode is None and gather_mips != 1:
+                raise ValueError("Implicit gather requires a single visible mip")
+            channels = {"1": 0, "2": 1, "4": 2, "8": 3}
+            if dmask not in channels:
+                raise ValueError("Gather requires a one-hot source DMASK")
+            dest = registers(dst_first, dst_last, 4)
+            address = registers(addr_first, addr_last, 2 + bool(offset_mode) + (lod_mode == "_l"))
+            image = registers(image_first, image_last, 8)
+            state = registers(sampler_first, sampler_last, 4)
+            if (max(dest.stop, address.stop) > 256 or max(image.stop, state.stop) > 106
+                    or image.start % 4 or state.start % 4):
+                raise ValueError("Invalid gather register range")
+            if (any(f"s{n}" in pending for n in (*image, *state))
+                    or [scalar.get(f"s{n}") for n in image] != [("tex", j) for j in range(8)]
+                    or [scalar.get(f"s{n}") for n in state] != list(sampler)):
+                raise ValueError("Unsupported gather image or sampler binding")
+            if any(f"v{n}" in sample_dest for n in (*dest, *address)):
+                raise ValueError("Gather overlaps an outstanding vector load")
+            addr = [vector[f"v{n}"] for n in address]
+            xoff, yoff = gather_offset(known_ssa_bits.get(addr.pop(0))) if offset_mode else (0, 0)
+            mip = 0
+            if lod_mode == "_l":
+                raw = known_ssa_bits.get(addr.pop())
+                level = struct.unpack("<f", struct.pack("<I", raw))[0] if raw is not None else None
+                if level is None or not level.is_integer() or not 0 <= level < gather_mips:
+                    raise ValueError("Gather requires a known integer LOD inside the view")
+                mip = int(level)
+            coords = [f"uv.{value[1]}" if isinstance(value, tuple) and value[0] == "entry_uv" else value
+                      for value in addr]
+            if any(not isinstance(value, str) or not (value in ("uv.x", "uv.y")
+                   or value.startswith(("sample", "alu", "params"))) for value in coords):
+                raise ValueError("Unsupported gather coordinate")
+            u, v = coords
+            lines[lines.index(SAMPLED_RESOURCES)] = GATHER_RESOURCES
+            lines.append(f"    float4 sample{i} = gather_2d(float2({u}, {v}), int2({xoff}, {yoff}), {mip}, {channels[dmask]});")
+            sample_kind = "gather"
+            samples += 1
+            vector_loads += 1
+            for lane, reg in zip("xyzw", dest):
+                vector[f"v{reg}"] = f"sample{i}.{lane}"
+                sample_dest[f"v{reg}"] = vector_loads
         elif m := match(r"v_(fmaak|fmamk|madak|madmk)_f32 (v\d+), ([^,]+), ([^,]+), ([^,]+)"):
             # The mad forms use the unfused, denormal-flushing helper; the fma forms are fused.
             op, dst, *tokens = m.groups()
@@ -5837,6 +5946,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     scalar.site = vector.site = None
     if region is not None:
         raise ValueError("Program ends inside a masked region")
+    if gather_mips is not None and sample_kind != "gather":
+        raise ValueError("Expected one gather for the declared view")
     if not ended or samples != len(bindings):
         raise ValueError("Unexpected sample count or missing color export")
     if helpers:
@@ -5861,6 +5972,7 @@ def main():
     parser.add_argument("--llvm", required=True, help="LLVM C library with AMDGPU support")
     parser.add_argument("--cpu", choices=("gfx1013", "gfx1030"), default="gfx1013",
                         help="Source instruction set (gfx1030 uses the wave64 pixel profile)")
+    parser.add_argument("--gather-mips", type=int, help="Declare the matching native and desktop 2D gather view mip count")
     parser.add_argument("--texture-sgpr", type=int, required=True, help="Entry register for the low descriptor-table address")
     parser.add_argument("--interp-sgpr", type=int, required=True, help="Entry register for the interpolation base")
     profile = parser.add_mutually_exclusive_group(required=True)
@@ -5902,7 +6014,8 @@ def main():
                        second_texture_offset=args.second_texture_offset,
                        extra_constants=[tuple(entry) for entry in args.extra_constant],
                        pointer_constants=[tuple(entry) for entry in args.pointer_constant],
-                       half_denorm=args.half_denorm, return_write_mask=args.rt0_write_mask)
+                       half_denorm=args.half_denorm, return_write_mask=args.rt0_write_mask,
+                       cpu=args.cpu, gather_mips=args.gather_mips)
         source, write_mask = result if args.rt0_write_mask else (result, None)
     except (ValueError, KeyError, struct.error, OSError, AttributeError, zlib.error) as exc:
         parser.exit(1, f"Translation failed: {exc}\n")

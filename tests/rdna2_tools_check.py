@@ -5000,6 +5000,27 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(detect_shader_stage("shaders/vertex/vs_main.s"), "vertex")
         self.assertEqual(detect_shader_stage("unknown_kernel.bin"), "other")
 
+    def test_detect_shader_stage_whole_tokens_only(self):
+        """A stage tag must be a whole path component or a `_`/`.`/`-` delimited token."""
+        # Tags that sit inside another word used to match as substrings.
+        self.assertEqual(detect_shader_stage("loops_cs.s"), "compute")
+        self.assertEqual(detect_shader_stage("shaders/bumps_vs.txt"), "vertex")
+        self.assertEqual(detect_shader_stage("tex_cs_ps5.s"), "compute")  # `ps5` is not the tag `ps`
+        self.assertEqual(detect_shader_stage("cs/copy.s"), "compute")  # relative directory, no leading slash
+        self.assertEqual(detect_shader_stage("maps_a.s"), "other")
+        self.assertEqual(detect_shader_stage("blur_cs.s"), "compute")
+        # Controls for each stage and name shape.
+        self.assertEqual(detect_shader_stage("blur_ps.s"), "pixel")
+        self.assertEqual(detect_shader_stage("blur-vs.s"), "vertex")
+        self.assertEqual(detect_shader_stage("blur.ps.s"), "pixel")
+        self.assertEqual(detect_shader_stage("PS_Upper.bin"), "pixel")
+        self.assertEqual(detect_shader_stage("shaders\\vertex\\main.s"), "vertex")
+        self.assertEqual(detect_shader_stage("compute/main.s"), "compute")
+        self.assertEqual(detect_shader_stage("pixel/main.s"), "pixel")
+        # Two different whole tags: pixel, then compute, then vertex wins.
+        self.assertEqual(detect_shader_stage("ps_cs_x.s"), "pixel")
+        self.assertEqual(detect_shader_stage("cs_vs_x.s"), "compute")
+
     def test_binary_scan_recognizes_decoded_interp_f16(self):
         """Issue #938 step 2: a scanned binary's binary16 interpolation forms reach the scanner by name.
 

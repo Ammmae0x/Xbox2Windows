@@ -14,6 +14,7 @@
 #define X2W_TRAP_MODULE_ID 8
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/qpc_microseconds.h"
 
 #include <cmath>
 #include <cstdio>
@@ -58,7 +59,7 @@ u64 now_microseconds()
     LARGE_INTEGER frequency, counter;
     QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&counter);
-    return static_cast<u64>(counter.QuadPart) * 1000000 / static_cast<u64>(frequency.QuadPart);
+    return x2w_startup::qpc_microseconds(static_cast<u64>(counter.QuadPart), static_cast<u64>(frequency.QuadPart));
 }
 
 bool process_has_focus()
