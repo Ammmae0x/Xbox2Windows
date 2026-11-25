@@ -8746,6 +8746,9 @@ if(EXISTS "${INTAKE_PYTHON}")
             add_test(NAME mesh_od_pipeline_check COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_SOURCE_DIR}/tests/mesh_od_pipeline_check.py")
             set_tests_properties(mesh_od_pipeline_check PROPERTIES TIMEOUT 30)
+            add_test(NAME mesh_od_pipeline_cli_check COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/mesh_od_pipeline_cli_check.py")
+            set_tests_properties(mesh_od_pipeline_cli_check PROPERTIES TIMEOUT 30)
         endif()
         add_test(NAME mesh_depth_pair_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/mesh_depth_pair_check.py" "${DXC_EXECUTABLE}"
