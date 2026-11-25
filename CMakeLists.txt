@@ -7833,6 +7833,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_crc_line>" "$<TARGET_FILE:cpu_crc_castagnoli>" "$<TARGET_FILE:cpu_exe_original>"
         "$<TARGET_FILE:cpu_exe_io>")
     set_tests_properties(cpu_exe_aot_convert PROPERTIES TIMEOUT 300)
+    add_test(NAME cpu_exe_aot_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu_exe_aot_cli_check.py")
+    set_tests_properties(cpu_exe_aot_cli_check PROPERTIES TIMEOUT 60)
     add_library(cpu_exe_second_provider SHARED tests/cpu/exe_second_provider.cpp)
     target_link_libraries(cpu_exe_second_provider PRIVATE cpu_exe_io)
     foreach(variant IN ITEMS original inverted pair swapped framed image two_providers nested nested_bypass)
