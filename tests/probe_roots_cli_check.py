@@ -291,6 +291,15 @@ class ProbeRootsCliTests(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
             self.assertTrue(proc.stderr.strip())
 
+            # Missing --build must report the unresolved path itself (strict resolve), not a misleading
+            # "not a directory" message from the later is_dir() guard.
+            missing_build = root / "missing-build"
+            err_missing = self._assert_main_fails(
+                [str(missing_build), "--probe", str(probe), "--inventory", str(inv_path), "--output", str(out_file)],
+                expected_code=1, fragment="missing-build",
+            )
+            self.assertNotIn("not a directory", err_missing)
+
             # Missing probe / missing inventory / wrong path types -> exit 1 without traceback.
             self._assert_main_fails([str(build), "--probe", str(root / "missing.exe"), "--inventory", str(inv_path), "--output", str(out_file)], expected_code=1)
             self._assert_main_fails([str(build), "--probe", str(probe), "--inventory", str(root / "missing.json"), "--output", str(out_file)], expected_code=1)
