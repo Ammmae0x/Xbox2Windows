@@ -204,12 +204,12 @@ The translation is refused when:
 - either header has another size;
 - the code reads an attribute the table does not list.
 
-The shader cache revision is `x2w-startup-shader-13`. Older translations evaluate `s_brev_b32` of a
+The shader cache revision is `x2w-startup-shader-14`. Older translations evaluate `s_brev_b32` of a
 constant at run time instead of folding it into a known word, which changes the emitted HLSL.
 Revisions before 12 can overwrite the source mask when a save-EXEC instruction uses the
 same source and destination register.
-Earlier revisions can also carry a stale scalar symbol across a join or read a stale SCC after
-an operation on a descriptor word.
+Earlier revisions can also carry a stale scalar symbol across a join, read a stale SCC after
+an operation on a descriptor word, or lack the vertex buffer-store lowering.
 
 The record layouts were checked offline against the signatures of one title's shader archive (local files only, not
 in the repository). The counts below apply the translator's own record checks.
@@ -885,6 +885,67 @@ goes end to end on the GPU:
 Its `wrong_group` control swaps the group size in the state block and must mismatch. This proves that the
 request, translation, bytecode and dispatch fit together. It does not prove the state-block reading, because
 the fixture builds the block at the offsets the translator reads.
+
+### Shader requests from the archive, before a run
+
+`tools/startup/archive_requests.py <archive> <shader cache> [--roots <dir or req_*.root> ...]` writes
+requests without starting the title, then `gfx2hlsl.py --pending <shader cache>` translates them:
+
+```powershell
+python -B tools/startup/archive_requests.py <shader archive> out/startup/shader_cache
+python -B tools/startup/gfx2hlsl.py --pending out/startup/shader_cache
+```
+
+A startup run that traced every DirectStorage read showed where the native programs come from:
+zlib streams in the shader archive that start on 64-byte boundaries and inflate to 64 KiB. Inflated
+offline, those streams hold the exact bytes the runtime later records. Each program has a 36-byte
+header followed by `s_inst_prefetch`, is padded in 64-byte blocks and starts on a 256-byte step,
+and in every measured pipeline the vertex program directly follows the pixel program. The tool
+carves every program that ends in `s_endpgm` (an all-zero block inside a program would cut it
+short), pairs each pixel program with a vertex program that starts on the next 256-byte step
+and writes `req_<key>.{a,b,root}` with the runtime's key.
+
+What it cannot take from the archive:
+
+- **Root signatures.** None of the recorded root signatures occurs in the archive or the
+  executable; the title appears to serialize them at run time. The tool reads `req_*.root` files
+  from earlier runs (by default those in the cache) and writes each pair once per distinct root.
+  A key is only used when the title binds that pair with that root, so the extra requests cost
+  translation time and nothing else.
+- **Pipelines the title builds from other sources.** Programs embedded in the executable as DXBC
+  containers are not in the archive.
+- **Other pairings.** A program shared by several pipelines, or a pair that is not adjacent, is
+  only found by a run (`run.ps1 -Translate`).
+- **Programs cut off at the end of a stream.** A zlib stream that starts on the 64-byte boundary
+  right after the previous one continues it, and the two are carved as one, so a program split
+  between them is kept. A program that reaches the end of such a joined run is skipped.
+
+A stream that would inflate past 1 MiB is counted as `oversized` and skipped without inflating it in
+full, and a joined run stops growing at 64 MiB. A request is written as `.b`, `.root`, then `.a`;
+if one part cannot be written, no `.a` and no temporary file are left and the run exits with an
+error, as it does when the archive yields no pair at all.
+
+In one local measurement the tool joined 1,079 zlib streams into 800 runs, carved 4,982 programs
+(2,730 pixel, 2,115 vertex, 137 other) and wrote 3,774 requests for 1,258 pairs and three recorded
+root signatures in 22 s. Eight of the eleven pipelines that a cold run recorded were among them with
+identical keys, and their translations (`<key>.txt`, both `.hlsl` files and both `.cso` files) were
+byte-identical to those from the run. The other three were two pipelines whose programs are DXBC
+containers in the executable and one pipeline whose programs were not carved.
+
+Check with `python3 -B tests/startup_archive_requests_check.py` (ctest `startup_archive_requests`).
+On a synthetic archive built from documented instruction words, each adjacent pixel/vertex pair
+becomes one request per root, and the test computes the expected keys with its own copy of the
+runtime's hash. Controls that write nothing:
+
+- a pixel program followed by a pixel program, or a vertex program without a pixel program before it;
+- a vertex program one empty step after its pixel program, or after a pixel program without `s_endpgm`;
+- a program without the header tag, or a pair at offsets that are not a multiple of 4;
+- a pair that reaches the end of its stream, or a pair in a stream off the 64-byte grid;
+- an empty or duplicate root file, an oversized stream, or a run without root signatures.
+
+A pair split between two consecutive zlib streams is carved whole. A blocked `.root` write leaves no
+`.a` and no temporary file and fails the run, as does an archive without pairs. A second run writes
+nothing new.
 
 `run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
 the process could not be created, 0 when the debugger finished its report, whatever the process

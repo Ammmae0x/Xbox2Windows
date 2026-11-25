@@ -3,9 +3,31 @@ project(Xbox2Windows LANGUAGES CXX)
 
 enable_testing()
 
+# Python never caches the bytecode of the script it is started with, so every start of a big
+# tests/<name>.py recompiled it. tests/pyc_main.py <name> runs that file through the import system,
+# which reuses a valid .pyc. The add_test calls below keep naming the script; this wrapper swaps in
+# the entry plus the module name in one place. Other add_test calls pass through unchanged.
+set(x2w_pyc_main_modules pixel_aot_check compute_store_check)
+function(add_test)
+  list(LENGTH ARGV x2w_test_argc)
+  if(NOT x2w_test_argc EQUAL ARGC)
+    message(FATAL_ERROR "add_test wrapper: an argument is empty or holds ';'; call _add_test directly")
+  endif()
+  set(x2w_test_args "${ARGV}")
+  foreach(x2w_module IN LISTS x2w_pyc_main_modules)
+    string(REPLACE "/tests/${x2w_module}.py" "/tests/pyc_main.py;${x2w_module}" x2w_test_args "${x2w_test_args}")
+  endforeach()
+  _add_test(${x2w_test_args})
+endfunction()
+
 # Defined before the first Python-driven test so a fresh configure registers all of them.
 set(INTAKE_PYTHON "${CMAKE_SOURCE_DIR}/out/pe-env/Scripts/python.exe" CACHE FILEPATH
     "Native x64 Python with pefile for static intake tests")
+if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME pyc_main_entry COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/pyc_main_check.py")
+    set_tests_properties(pyc_main_entry PROPERTIES TIMEOUT 60)
+endif()
 
 set(DSTORAGE_SDK_ROOT "" CACHE PATH "Extracted Microsoft.Direct3D.DirectStorage NuGet package")
 if(DSTORAGE_SDK_ROOT)
@@ -2907,6 +2929,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_capture COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_capture_check.py")
     set_tests_properties(startup_gfx2hlsl_capture PROPERTIES TIMEOUT 120)
+    # archive_requests.py writes runtime-keyed shader requests from a synthetic archive.
+    add_test(NAME startup_archive_requests COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_archive_requests_check.py")
+    set_tests_properties(startup_archive_requests PROPERTIES TIMEOUT 120)
     # Two integer operations whose refusal was never reached: v_cvt_i32_f32 with an output
     # modifier, and v_readfirstlane_b32 without a proven uniform source.
     add_test(NAME startup_gfx2hlsl_op_refusals COMMAND "${INTAKE_PYTHON}" -B
@@ -2997,6 +3023,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_neg_operand COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_neg_operand_check.py")
     set_tests_properties(startup_gfx2hlsl_neg_operand PROPERTIES TIMEOUT 60)
+    # Vertex-stage buffer stores lower to RWByteAddressBuffer Store* under manifest version 2 (#1723).
+    add_test(NAME startup_gfx2hlsl_buffer_store COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_buffer_store_check.py")
     # Output modifiers on float-result conversions (#1705).
     add_test(NAME startup_gfx2hlsl_vcvt_omod COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_vcvt_omod_check.py")
@@ -3662,6 +3691,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Device slot 67 compute requests offline: key vector, --pending and --refusals (pure Python).
     add_test(NAME startup_compute_request_offline COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_offline_check.py")
+    add_test(NAME compute_container_index COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/compute_container_index_check.py")
     # Partial colour exports carry their channel mask to the manifest; compressed exports of whole pairs lower (#1674).
     add_test(NAME startup_gfx2hlsl_export_mask COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_export_mask_check.py")
