@@ -6970,6 +6970,35 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_avx_horiz_fp>" "$<TARGET_FILE:cpu_avx_horiz_fp_lifted>")
     set_tests_properties(cpu_aot_avx_horiz_fp PROPERTIES SKIP_RETURN_CODE 77)
 
+    # cpu_aot_avx_horiz_fp_dedicated
+    set(cpu_avx_horiz_fp_aot_exports
+        "op_vhaddps_xmm_reg,op_vhaddpd_xmm_reg,op_vhsubps_xmm_reg,op_vhsubpd_xmm_reg,"
+        "op_vaddsubps_xmm_reg,op_vaddsubpd_xmm_reg,"
+        "op_vhaddps_xmm_mem,op_vhaddpd_xmm_mem,op_vhsubps_xmm_mem,op_vhsubpd_xmm_mem,"
+        "op_vaddsubps_xmm_mem,op_vaddsubpd_xmm_mem,"
+        "op_vhaddps_ymm_reg,op_vhaddpd_ymm_reg,op_vhsubps_ymm_reg,op_vhsubpd_ymm_reg,"
+        "op_vaddsubps_ymm_reg,op_vaddsubpd_ymm_reg,"
+        "op_vhaddps_ymm_mem,op_vhaddpd_ymm_mem,op_vhsubps_ymm_mem,op_vhsubpd_ymm_mem,"
+        "op_vaddsubps_ymm_mem,op_vaddsubpd_ymm_mem,"
+        "op_vhaddps_ymm_mem_rcx,op_vaddsubpd_ymm_mem_r8,"
+        "op_vhaddps_ymm_alias_dst_src1,op_vhaddpd_ymm_alias_dst_src2,"
+        "op_vhsubps_ymm_alias_src1_src2,op_vaddsubps_ymm_alias_all,op_vaddsubpd_xmm_alias_dst_src2")
+    string(CONCAT cpu_avx_horiz_fp_aot_exports ${cpu_avx_horiz_fp_aot_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_horiz_fp_aot_${variant} avx_horiz_fp_aot)
+        cpu_translation(cpu_avx_horiz_fp_aot_${variant} cpu_avx_horiz_fp_aot "${cpu_avx_horiz_fp_aot_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx_horiz_fp_aot_altered PRIVATE ALTER_AVX_HORIZ_FP)
+    add_test(NAME cpu_aot_avx_horiz_fp_dedicated COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_horiz_fp_aot_check.py"
+        "$<TARGET_FILE:cpu_avx_horiz_fp_aot_original>"
+        "$<TARGET_FILE:cpu_avx_horiz_fp_aot_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_horiz_fp_aot_altered>"
+        "$<TARGET_FILE:cpu_avx_horiz_fp_aot_altered_lifted>")
+    set_tests_properties(cpu_aot_avx_horiz_fp_dedicated PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx_horiz_fp_dedicated.txt")
+
     cpu_asm_fixture(cpu_avx_addsub_fp avx_addsub_fp)
     set(avx_addsub_fp_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_addsub_fp_lifted.cpp")
     add_custom_command(OUTPUT "${avx_addsub_fp_fixture}"
