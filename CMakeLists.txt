@@ -5415,6 +5415,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME xmem_attribute_scan COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_attribute_scan_check.py" "$<TARGET_FILE:cpu_xmem_attributes>"
         "$<TARGET_FILE:cpu_xmem_delay>")
+    add_test(NAME xmem_attribute_scan_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xmem_attribute_scan_cli_check.py")
 
     # VEX.128 16-bit packed-integer leaf functions, an arithmetic-shift control, and their C++.
     foreach(variant IN ITEMS original altered)
