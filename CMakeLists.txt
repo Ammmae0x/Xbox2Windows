@@ -6482,6 +6482,32 @@ if(EXISTS "${INTAKE_PYTHON}")
         SKIP_RETURN_CODE 77
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_bmi2_shift.txt")
 
+    # cpu_aot_bmi2_bit
+    set(cpu_bmi2_bit_exports
+        "op_bzhi32,op_bzhi64,op_mulx32,op_mulx64,op_mulx32_alias,op_mulx64_alias,"
+        "op_pdep32,op_pdep64,op_pext32,op_pext64,"
+        "op_bzhi32_mem,op_bzhi64_mem,op_mulx32_mem,op_mulx64_mem,"
+        "op_pdep32_mem,op_pdep64_mem,op_pext32_mem,op_pext64_mem,"
+        "op_mem_r8_source,op_bzhi32_flags,op_bzhi64_flags,"
+        "op_flags_preserve32,op_flags_preserve64,op_flags_preserve_pf,"
+        "op_flags_preserve_mem,op_bmi2_bit_discarded_read")
+    string(CONCAT cpu_bmi2_bit_exports ${cpu_bmi2_bit_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_bmi2_bit_${variant} bmi2_bit_aot)
+        cpu_translation(cpu_bmi2_bit_${variant} cpu_bmi2_bit_aot "${cpu_bmi2_bit_exports}")
+    endforeach()
+    target_compile_definitions(cpu_bmi2_bit_altered PRIVATE ALTER_BMI2_BIT)
+    add_test(NAME cpu_aot_bmi2_bit COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/bmi2_bit_aot_check.py"
+        "$<TARGET_FILE:cpu_bmi2_bit_original>"
+        "$<TARGET_FILE:cpu_bmi2_bit_original_lifted>"
+        "$<TARGET_FILE:cpu_bmi2_bit_altered>"
+        "$<TARGET_FILE:cpu_bmi2_bit_altered_lifted>"
+        "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(cpu_aot_bmi2_bit PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_bmi2_bit.txt")
+
     # cpu_aot_bmi1_bit
     set(cpu_bmi1_aot_exports
         "op_blsi32,op_blsi64,op_blsmsk32,op_blsmsk64,op_blsr32,op_blsr64,"
