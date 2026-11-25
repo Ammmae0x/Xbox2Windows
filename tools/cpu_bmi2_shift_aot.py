@@ -212,12 +212,14 @@ static inline word update_gpr_width(word cur, std::uint64_t val, unsigned width)
 
 static inline word op_rorx32(word val, std::uint8_t imm8) {
     const std::uint32_t v = static_cast<std::uint32_t>(val);
+    // Mask to 5 bits before (32u - c) to avoid C++ shift-count UB when imm8 >= 32.
     const unsigned c = static_cast<unsigned>(imm8 & 31u);
     const std::uint32_t r = (c == 0u) ? v : ((v >> c) | (v << (32u - c)));
     return static_cast<word>(r);
 }
 
 static inline word op_rorx64(word val, std::uint8_t imm8) {
+    // Mask to 6 bits before (64u - c) to avoid C++ shift-count UB when imm8 >= 64.
     const unsigned c = static_cast<unsigned>(imm8 & 63u);
     return (c == 0u) ? val : ((val >> c) | (val << (64u - c)));
 }
@@ -244,6 +246,7 @@ static inline word op_shrx64(word val, word cnt) {
     return val >> c;
 }
 
+// Build sign fill explicitly on unsigned types so arithmetic right shift does not rely on signed >>.
 static inline word op_sarx32(word val, word cnt) {
     const std::uint32_t v = static_cast<std::uint32_t>(val);
     const unsigned c = static_cast<unsigned>(cnt & 31ull);

@@ -587,9 +587,16 @@ def check_altered_and_mutants(lifted_fns, alt_native_fns, alt_lifted_fns):
         diverged[name] = diffs
 
     # Mutant models (wrong count mask, logical-for-arithmetic SARX, flag-clobbering BMI2) must fail!
-    # 1) 6-bit mask instead of 5-bit mask on 32-bit SHLX (count=32 yields 0 instead of val)
+    # 1) 6-bit mask instead of 5-bit mask on 32-bit SHLX/SHRX/SARX (count=32 yields 0/sign instead of val)
     if lifted_fns["op_shlx32"](0x12345678, 32, 0) == ref_shlx(0x12345678, 32, 32, bad_mask=True):
         raise AssertionError("mutant bad_mask on shlx32 survived")
+    if lifted_fns["op_shrx32"](0x12345678, 32, 0) == ref_shrx(0x12345678, 32, 32, bad_mask=True):
+        raise AssertionError("mutant bad_mask on shrx32 survived")
+    if lifted_fns["op_sarx32"](0x80000001, 32, 0) == ref_sarx(0x80000001, 32, 32, bad_mask=True):
+        raise AssertionError("mutant bad_mask on sarx32 survived")
+    # Unmasked RORX32 with imm8=37 (e.g. UB/non-wrapping shift >= 32 returning 0) must differ from lifted 37 & 31 = 5.
+    if lifted_fns["op_rorx32_imm37"](0x12345678, 0, 0) == 0:
+        raise AssertionError("mutant bad_mask on rorx32_imm37 survived")
     # 2) Logical right shift instead of arithmetic on negative SARX32 / SARX64
     if lifted_fns["op_sarx32"](0x80000000, 4, 0) == ref_sarx(0x80000000, 4, 32, logical=True):
         raise AssertionError("mutant logical_sarx32 survived")
