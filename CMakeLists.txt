@@ -9953,6 +9953,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     endforeach()
     set_tests_properties(rectlist_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME conditional_import_paths COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/intake/paths_check.py")
+    add_test(NAME build_verify_build_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/verify_build_cli_check.py")
     add_library(intake_provider SHARED tests/intake/provider.cpp tests/intake/provider.def)
     add_library(intake_delay SHARED tests/intake/provider.cpp tests/intake/delay.def)
     add_executable(intake_candidate tests/intake/candidate.cpp)
