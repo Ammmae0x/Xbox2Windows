@@ -2709,6 +2709,11 @@ else()
 endif()
 add_test(NAME xg_bc64_tiling_reference COMMAND xg_swizzle_select_check --bc64-tiling)
 set_tests_properties(xg_bc64_tiling_reference PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME tooling_fetch_addrlib_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/fetch_addrlib_cli_check.py")
+    set_tests_properties(tooling_fetch_addrlib_cli_check PROPERTIES TIMEOUT 60)
+endif()
 # 4 KiB allocation answers for small 2D textures (src/startup_stubs/small_texture_4k.h): literal sizes and
 # refused descriptions without a device; the mutated run is the negative control; the addrlib run compares
 # every accepted shape with addrlib's GFX10 4 KiB layout and skips (77) without addrlib.
