@@ -8464,6 +8464,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/script_state_check.py")
     add_test(NAME resource_relocated_root COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/resource_root_check.py")
+    add_test(NAME runtime_resource_root_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/resource_root_cli_check.py")
     add_test(NAME pe_authentihash COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/pe_authentihash_check.py")
     add_test(NAME pe_authentihash_oracle COMMAND "${INTAKE_PYTHON}" -B
