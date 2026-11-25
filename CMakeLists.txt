@@ -5994,6 +5994,30 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_crypto_aes_pclmul>" "$<TARGET_FILE:cpu_crypto_aes_pclmul_lifted>")
     set_tests_properties(cpu_aot_crypto_aes_pclmul PROPERTIES SKIP_RETURN_CODE 77)
 
+    # cpu_aot_sha256
+    set(cpu_sha256_aot_exports
+        "op_sha256rnds2_reg,op_sha256rnds2_mem,op_sha256rnds2_mem_r8,"
+        "op_sha256rnds2_self_src,op_sha256rnds2_dst_xmm0,op_sha256rnds2_src_xmm0,op_sha256rnds2_all_xmm0,"
+        "op_sha256msg1_reg,op_sha256msg1_mem,op_sha256msg1_self,"
+        "op_sha256msg2_reg,op_sha256msg2_mem,op_sha256msg2_self,"
+        "op_sha256_pipeline,op_sha256_discarded_read")
+    string(CONCAT cpu_sha256_aot_exports ${cpu_sha256_aot_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sha256_aot_${variant} sha256_aot)
+        cpu_translation(cpu_sha256_aot_${variant} cpu_sha256_aot "${cpu_sha256_aot_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sha256_aot_altered PRIVATE ALTER_SHA256)
+    add_test(NAME cpu_aot_sha256 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sha256_aot_check.py"
+        "$<TARGET_FILE:cpu_sha256_aot_original>"
+        "$<TARGET_FILE:cpu_sha256_aot_original_lifted>"
+        "$<TARGET_FILE:cpu_sha256_aot_altered>"
+        "$<TARGET_FILE:cpu_sha256_aot_altered_lifted>"
+        "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(cpu_aot_sha256 PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_sha256.txt")
+
     cpu_asm_fixture(cpu_fma_scalar fma_scalar)
     set(fma_scalar_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_fma_scalar_lifted.cpp")
     add_custom_command(OUTPUT "${fma_scalar_fixture}"
