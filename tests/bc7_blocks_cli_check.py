@@ -179,6 +179,44 @@ class Bc7BlocksCliNegativeAndMutationTests(unittest.TestCase):
             self.assertIn("collides with case", err)
             self.assertEqual(case_real.read_bytes(), b"keep-case")
 
+    def test_nested_destination_paths_refused_before_creating_anything(self):
+        for fields_inside_case in (True, False):
+            with self.subTest(fields_inside_case=fields_inside_case), tempfile.TemporaryDirectory() as tmp:
+                parent = Path(tmp) / "new"
+                child = parent / "child"
+                case, fields = (parent, child) if fields_inside_case else (child, parent)
+                code, _, err = _run_main([str(case), "--fields", str(fields)])
+                self.assertEqual(code, 1)
+                self.assertIn("cannot contain one another", err)
+                self.assertFalse(parent.exists())
+
+    def test_second_replace_failure_reports_partial_publish_and_retry_repairs_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            case = root / "case.bc7c"
+            fields = root / "fields.json"
+            case.write_bytes(b"old-case")
+            fields.write_text("old-json", encoding="ascii")
+            argv = [str(case), "--columns", "1", "--rows", "1", "--fields", str(fields)]
+            replace = os.replace
+
+            def fail_fields(src, dst):
+                if dst == fields:
+                    raise PermissionError("fields locked")
+                replace(src, dst)
+
+            with mock.patch.object(bc7_blocks.os, "replace", side_effect=fail_fields):
+                code, _, err = _run_main(argv)
+            self.assertEqual(code, 1)
+            self.assertIn("Retry with both output paths", err)
+            self.assertIn("fields locked", err)
+            self.assertTrue(case.read_bytes().startswith(b"BC7C"))
+            self.assertEqual(fields.read_text(encoding="ascii"), "old-json")
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["case.bc7c", "fields.json"])
+            code, _, err = _run_main(argv)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(json.loads(fields.read_text(encoding="ascii")), bc7_blocks.fixture(1, 1)[0])
+
     def test_existing_directory_outputs_rejected_upfront(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

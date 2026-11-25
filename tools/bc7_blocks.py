@@ -249,6 +249,7 @@ def _same_path(left: Path, right: Path) -> bool:
 
 
 def _atomic_write_outputs(outputs: list[tuple[Path, bytes | str]]) -> None:
+    """Stage all payloads, then publish each output with a separate atomic replace."""
     staged: list[tuple[Path, Path]] = []
     with contextlib.ExitStack() as stack:
         dirs_by_parent: dict[Path, Path] = {}
@@ -265,8 +266,14 @@ def _atomic_write_outputs(outputs: list[tuple[Path, bytes | str]]) -> None:
             else:
                 staged_path.write_text(payload, encoding="ascii")
             staged.append((staged_path, destination))
-        for staged_path, destination in staged:
-            os.replace(staged_path, destination)
+        for index, (staged_path, destination) in enumerate(staged):
+            try:
+                os.replace(staged_path, destination)
+            except OSError as error:
+                if index:
+                    raise OSError(f"Updated {staged[0][1]}, but could not replace {destination}: {error}. "
+                                  "Retry with both output paths to regenerate the pair.") from error
+                raise
 
 
 def main(argv=None) -> int:
@@ -282,11 +289,16 @@ def main(argv=None) -> int:
         for path in (args.case, args.fields):
             if path is not None and path.exists() and path.is_dir():
                 raise ValueError(f"Output path is an existing directory: {path}")
-        if args.fields is not None and _same_path(args.case, args.fields):
-            raise ValueError(f"Fields path collides with case output: {args.fields}")
+        if args.fields is not None:
+            if _same_path(args.case, args.fields):
+                raise ValueError(f"Fields path collides with case output: {args.fields}")
+            case_path, fields_path = args.case.resolve(), args.fields.resolve()
+            if case_path in fields_path.parents or fields_path in case_path.parents:
+                raise ValueError("Case and fields outputs cannot contain one another")
+        header = struct.pack("<4sII", b"BC7C", args.columns * 4, args.rows * 4)
         known, block_rows, rgba = fixture(args.columns, args.rows)
         outputs: list[tuple[Path, bytes | str]] = [
-            (args.case, struct.pack("<4sII", b"BC7C", args.columns * 4, args.rows * 4) + block_rows + rgba)
+            (args.case, header + block_rows + rgba)
         ]
         if args.fields is not None:
             outputs.append((args.fields, json.dumps(known, indent=1)))
