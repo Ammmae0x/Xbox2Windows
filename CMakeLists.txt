@@ -5625,6 +5625,30 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_crypto_sha>" "$<TARGET_FILE:cpu_crypto_sha_lifted>")
     set_tests_properties(cpu_aot_crypto_sha PROPERTIES SKIP_RETURN_CODE 77)
 
+    set(cpu_sha1_aot_exports
+        "op_sha1rnds4_0_reg,op_sha1rnds4_1_reg,op_sha1rnds4_2_reg,op_sha1rnds4_3_reg,"
+        "op_sha1rnds4_hi_imm,op_sha1rnds4_0_mem,op_sha1rnds4_1_mem,op_sha1rnds4_2_mem,"
+        "op_sha1rnds4_3_mem,op_sha1rnds4_self,"
+        "op_sha1nexte_reg,op_sha1nexte_mem,op_sha1nexte_self,"
+        "op_sha1msg1_reg,op_sha1msg1_mem,op_sha1msg1_self,"
+        "op_sha1msg2_reg,op_sha1msg2_mem,op_sha1msg2_self,"
+        "op_sha1_pipeline")
+    string(CONCAT cpu_sha1_aot_exports ${cpu_sha1_aot_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sha1_aot_${variant} sha1_aot)
+        cpu_translation(cpu_sha1_aot_${variant} cpu_sha1_aot "${cpu_sha1_aot_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sha1_aot_altered PRIVATE ALTER_SHA1)
+    add_test(NAME cpu_aot_sha1 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sha1_aot_check.py"
+        "$<TARGET_FILE:cpu_sha1_aot_original>"
+        "$<TARGET_FILE:cpu_sha1_aot_original_lifted>"
+        "$<TARGET_FILE:cpu_sha1_aot_altered>"
+        "$<TARGET_FILE:cpu_sha1_aot_altered_lifted>")
+    set_tests_properties(cpu_aot_sha1 PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_sha1.txt")
+
     cpu_asm_fixture(cpu_mul_div mul_div)
     set(mul_div_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_mul_div_lifted.cpp")
     add_custom_command(OUTPUT "${mul_div_fixture}"
