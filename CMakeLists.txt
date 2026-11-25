@@ -4945,6 +4945,29 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_fp_pd_logic_altered>"
         "$<TARGET_FILE:cpu_sse_fp_pd_logic_altered_lifted>"
         "${CMAKE_CXX_COMPILER}")
+    # cpu_aot_sse_fp_pd_moves_cmp
+    set(cpu_sse_fp_pd_moves_cmp_exports
+        "op_cmpsd_0,op_cmpsd_1,op_cmpsd_2,op_cmpsd_3,op_cmpsd_4,op_cmpsd_5,op_cmpsd_6,op_cmpsd_7,"
+        "op_cmpsd_mem,op_cmpsd_mem_plus1,op_cmpsd_self,"
+        "op_movlpd_load,op_movlpd_store,op_movhpd_load,op_movhpd_store,"
+        "op_movlpd_load_plus1,op_movhpd_load_plus1,op_movlpd_store_plus1,op_movhpd_store_plus1,"
+        "op_movntpd,op_movntpd_disp16,op_pd_moves_cmp_pipeline,op_pd_moves_cmp_discarded_read")
+    string(CONCAT cpu_sse_fp_pd_moves_cmp_exports ${cpu_sse_fp_pd_moves_cmp_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sse_fp_pd_moves_cmp_${variant} sse_fp_pd_moves_cmp)
+        cpu_translation(cpu_sse_fp_pd_moves_cmp_${variant} cpu_sse_fp_aot "${cpu_sse_fp_pd_moves_cmp_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sse_fp_pd_moves_cmp_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_sse_fp_pd_moves_cmp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sse_fp_pd_moves_cmp_check.py"
+        "$<TARGET_FILE:cpu_sse_fp_pd_moves_cmp_original>"
+        "$<TARGET_FILE:cpu_sse_fp_pd_moves_cmp_original_lifted>"
+        "$<TARGET_FILE:cpu_sse_fp_pd_moves_cmp_altered>"
+        "$<TARGET_FILE:cpu_sse_fp_pd_moves_cmp_altered_lifted>"
+        "$<TARGET_FILE:cpu_sse_fp_harness>"
+        "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(cpu_aot_sse_fp_pd_moves_cmp PROPERTIES
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_sse_fp_pd_moves_cmp.txt")
     set(cpu_avx_fp_move_exports
         "op_vmovq_xmm_xmm,op_vmovq_xmm_m64,op_vmovq_m64_xmm,op_vmovq_xmm_r64,op_vmovq_r64_xmm,"
         "op_vmaskmovdqu,op_pipeline,op_discarded_read,op_discarded_read64,"
