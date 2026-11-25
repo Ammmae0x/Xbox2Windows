@@ -184,6 +184,9 @@ struct Vec256 {
     std::uint64_t q[4];
 };
 
+// All callers share volatile + unaligned loads and signal-fenced helpers so /O2
+// preserves unaligned reads and fault ordering even when results are discarded;
+// stores only need fences around memcpy to order against preceding loads.
 static inline Vec256 load128(word address) {
     std::atomic_signal_fence(std::memory_order_seq_cst);
     const auto* p = reinterpret_cast<const volatile std::uint64_t X2W_UNALIGNED*>(address);
@@ -650,6 +653,7 @@ static Vec256 op_fma_pd(const Vec256& op0, const Vec256& op1, const Vec256& op2,
     }
     return out;
 }
+// Windows/MSVC builds export host_has_avx2; callers use hasattr() before falling back.
 #if defined(_MSC_VER)
 extern "C" __declspec(dllexport) std::uint32_t host_has_avx2() {
     int info[4]{};
@@ -680,6 +684,7 @@ def vec_index(register, ins):
 def flat_address(ins, *, store=False):
     """Lower a flat [base + disp] pointer operand rooted in an argument GPR64."""
     base = ins.memory_base
+    # Stores target only r8 because the 3-arg (rcx, rdx, r8) leaf ABI reserves r8 for output.
     allowed = {R.R8} if store else ARGUMENTS
     if (ins.is_ip_rel_memory_operand or base in (R.NONE, R.RIP, R.EIP, R.RSP, R.ESP)
             or ins.memory_index != R.NONE or not RegisterExt.is_gpr64(base)

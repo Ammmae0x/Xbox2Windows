@@ -163,6 +163,7 @@ def inputs_for(name):
 
 
 def host_has_avx2(lifted_lib):
+    # Non-MSVC builds do not emit host_has_avx2; fall back to /proc/cpuinfo cleanly.
     if hasattr(lifted_lib, "host_has_avx2"):
         lifted_lib.host_has_avx2.argtypes = []
         lifted_lib.host_has_avx2.restype = ctypes.c_uint32
@@ -269,6 +270,9 @@ def check_translator(original_path):
         ("undef_ymm3", (Instruction.create_reg_reg_mem(
             Code.VEX_VPERMD_YMM_YMM_YMMM256, R.YMM0, R.YMM3, MemoryOperand(R.RDX)), ret_ins),
          "undefined vector register ymm3"),
+        ("unsupported_mem_op", (Instruction.create_reg_mem(
+            Code.VEX_VBROADCASTSS_YMM_M32, R.YMM0, MemoryOperand(R.RCX)), ret_ins),
+         "unsupported instruction"),
         ("missing_ret", (Instruction.create_reg_mem(
             Code.VEX_VPBROADCASTB_YMM_XMMM8, R.YMM0, MemoryOperand(R.RCX)),),
          "missing terminal ret"),
