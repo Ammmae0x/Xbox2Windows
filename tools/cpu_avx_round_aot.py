@@ -15,7 +15,8 @@ Supported AVX rounding encodings (docs/coverage/x64_zen2.tsv group AVX):
 Rounding is implemented in pure portable C++ IEEE-754 bit arithmetic (no <immintrin.h>
 rounding intrinsics): imm8[1:0] selects nearest-even (0), floor (1), ceil (2), or trunc (3);
 imm8[2]=1 reads the live host rounding mode via <cfenv> std::fegetround(); imm8[3]=1
-suppresses FE_INEXACT; sNaN inputs are quieted preserving sign and payload; -0.0 and
+suppresses FE_INEXACT; DAZ (MXCSR[6]) flushes denormal inputs to signed zero before rounding;
+sNaN inputs raise FE_INVALID and are quieted preserving sign and payload; -0.0 and
 negative zero-results (-0.25 -> -0.0 on nearest/ceil/trunc) preserve sign.
 
 Transport glue:
@@ -100,6 +101,8 @@ PRELUDE = """#include <atomic>
 #include <cstring>
 #if defined(_MSC_VER)
 #include <intrin.h>
+#elif defined(__SSE__) || defined(__x86_64__)
+#include <xmmintrin.h>
 #endif
 
 #if defined(_MSC_VER)
@@ -171,6 +174,14 @@ static inline Vec256 copy128(const Vec256& v) {
     return {{v.q[0], v.q[1], 0ull, 0ull}};
 }
 
+static inline bool host_daz_enabled() {
+#if defined(_MSC_VER) || defined(__SSE__) || defined(__x86_64__)
+    return (_mm_getcsr() & 0x0040u) != 0u;
+#else
+    return false;
+#endif
+}
+
 static inline std::uint8_t resolve_round_mode(std::uint8_t imm8) {
     if ((imm8 & 0x04u) == 0u) {
         return imm8 & 0x03u;
@@ -187,9 +198,15 @@ static inline std::uint32_t round_f32_bits(std::uint32_t bits, std::uint8_t imm8
     const std::uint32_t sign = bits & 0x80000000u;
     const std::uint32_t abs_bits = bits & 0x7fffffffu;
     if (abs_bits > 0x7f800000u) {
+        if ((abs_bits & 0x00400000u) == 0u) {
+            std::feraiseexcept(FE_INVALID);
+        }
         return bits | 0x00400000u;
     }
-    if (abs_bits == 0u || abs_bits >= 0x4b000000u) {
+    if (abs_bits == 0u || (abs_bits < 0x00800000u && host_daz_enabled())) {
+        return sign;
+    }
+    if (abs_bits >= 0x4b000000u) {
         return bits;
     }
     const std::uint8_t mode = resolve_round_mode(imm8);
@@ -235,9 +252,15 @@ static inline std::uint64_t round_f64_bits(std::uint64_t bits, std::uint8_t imm8
     const std::uint64_t sign = bits & 0x8000000000000000ull;
     const std::uint64_t abs_bits = bits & 0x7fffffffffffffffull;
     if (abs_bits > 0x7ff0000000000000ull) {
+        if ((abs_bits & 0x0008000000000000ull) == 0ull) {
+            std::feraiseexcept(FE_INVALID);
+        }
         return bits | 0x0008000000000000ull;
     }
-    if (abs_bits == 0ull || abs_bits >= 0x4330000000000000ull) {
+    if (abs_bits == 0ull || (abs_bits < 0x0010000000000000ull && host_daz_enabled())) {
+        return sign;
+    }
+    if (abs_bits >= 0x4330000000000000ull) {
         return bits;
     }
     const std::uint8_t mode = resolve_round_mode(imm8);

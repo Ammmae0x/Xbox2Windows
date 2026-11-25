@@ -57,6 +57,15 @@ MXCSR_EXPORTS = (
     "op_vroundsd_mxcsr",
 )
 
+DIRECTED_EXPORTS = (
+    "op_vroundps_xmm_rd", "op_vroundps_xmm_ru", "op_vroundps_xmm_rz",
+    "op_vroundps_ymm_rd", "op_vroundps_ymm_ru", "op_vroundps_ymm_rz",
+    "op_vroundpd_xmm_rd", "op_vroundpd_xmm_ru", "op_vroundpd_xmm_rz",
+    "op_vroundpd_ymm_rd", "op_vroundpd_ymm_ru", "op_vroundpd_ymm_rz",
+    "op_vroundss_rd", "op_vroundss_ru", "op_vroundss_rz",
+    "op_vroundsd_rd", "op_vroundsd_ru", "op_vroundsd_rz",
+)
+
 ALTERED_IMM = {
     "op_vroundps_xmm_rn": 3, "op_vroundps_xmm_rd": 2, "op_vroundps_xmm_ru": 1, "op_vroundps_xmm_rz": 0,
     "op_vroundps_xmm_mxcsr": 3, "op_vroundps_xmm_suppress": 11, "op_vroundps_xmm_mem": 1,
@@ -104,7 +113,7 @@ def _encode_int_exact(n, sign, exp_bits, frac_bits):
     return (sign << (total_bits - 1)) | (biased << frac_bits) | frac
 
 
-def ref_round_bits(bits, imm8, *, exp_bits, frac_bits, mxcsr_rc=0, quirk=None):
+def ref_round_bits(bits, imm8, *, exp_bits, frac_bits, mxcsr_rc=0, daz=False, quirk=None):
     """Exact rational IEEE-754 rounding to integer value, returning exact bit pattern."""
     total_bits = 1 + exp_bits + frac_bits
     quiet_bit = 1 << (frac_bits - 1)
@@ -113,7 +122,8 @@ def ref_round_bits(bits, imm8, *, exp_bits, frac_bits, mxcsr_rc=0, quirk=None):
         return bits if quirk == "no_quieting" else (bits | quiet_bit)
     if kind == "inf":
         return bits
-    if mag == 0:
+    exp_field = (bits >> frac_bits) & ((1 << exp_bits) - 1)
+    if mag == 0 or (daz and exp_field == 0 and quirk != "ignore_daz"):
         return (0 if quirk == "drop_neg_zero" else (sign << (total_bits - 1)))
 
     if (imm8 & 0x04) != 0 and quirk != "ignore_mxcsr":
@@ -142,12 +152,12 @@ def ref_round_bits(bits, imm8, *, exp_bits, frac_bits, mxcsr_rc=0, quirk=None):
     return _encode_int_exact(res_int, out_sign, exp_bits, frac_bits)
 
 
-def ref_f32(bits, imm8, mxcsr_rc=0, quirk=None):
-    return ref_round_bits(bits, imm8, exp_bits=8, frac_bits=23, mxcsr_rc=mxcsr_rc, quirk=quirk)
+def ref_f32(bits, imm8, mxcsr_rc=0, daz=False, quirk=None):
+    return ref_round_bits(bits, imm8, exp_bits=8, frac_bits=23, mxcsr_rc=mxcsr_rc, daz=daz, quirk=quirk)
 
 
-def ref_f64(bits, imm8, mxcsr_rc=0, quirk=None):
-    return ref_round_bits(bits, imm8, exp_bits=11, frac_bits=52, mxcsr_rc=mxcsr_rc, quirk=quirk)
+def ref_f64(bits, imm8, mxcsr_rc=0, daz=False, quirk=None):
+    return ref_round_bits(bits, imm8, exp_bits=11, frac_bits=52, mxcsr_rc=mxcsr_rc, daz=daz, quirk=quirk)
 
 
 def pk_d(*vals):
@@ -166,7 +176,7 @@ def u64s(buf):
     return struct.unpack("<" + "Q" * (len(buf) // 8), buf)
 
 
-def reference(name, a, b, *, mxcsr_rc=0, altered=False, quirk=None):
+def reference(name, a, b, *, mxcsr_rc=0, daz=False, altered=False, quirk=None):
     """Expected 32-byte output buffer; unwritten bytes keep FILL."""
     out = bytearray(FILL)
 
@@ -177,28 +187,28 @@ def reference(name, a, b, *, mxcsr_rc=0, altered=False, quirk=None):
         default_imm = {"rn": 0, "rd": 1, "ru": 2, "rz": 3, "mxcsr": 4, "suppress": 8, "mem": 0x1A}[name.rsplit("_", 1)[1]]
         src = b[:16] if name.endswith("_mem") else a[:16]
         imm = imm_of(default_imm)
-        out[0:16] = pk_d(*(ref_f32(w, imm, mxcsr_rc, quirk) for w in u32s(src)))
+        out[0:16] = pk_d(*(ref_f32(w, imm, mxcsr_rc, daz, quirk) for w in u32s(src)))
     elif name.startswith("op_vroundps_ymm_"):
         default_imm = {"rn": 0, "rd": 1, "ru": 2, "rz": 3, "mxcsr": 4, "mem": 9}[name.rsplit("_", 1)[1]]
         src = b if name.endswith("_mem") else a
         imm = imm_of(default_imm)
-        out[0:32] = pk_d(*(ref_f32(w, imm, mxcsr_rc, quirk) for w in u32s(src)))
+        out[0:32] = pk_d(*(ref_f32(w, imm, mxcsr_rc, daz, quirk) for w in u32s(src)))
     elif name.startswith("op_vroundpd_xmm_") and name != "op_vroundpd_xmm_zero_upper":
         default_imm = {"rn": 0, "rd": 1, "ru": 2, "rz": 3, "mxcsr": 4, "mem": 10}[name.rsplit("_", 1)[1]]
         src = b[:16] if name.endswith("_mem") else a[:16]
         imm = imm_of(default_imm)
-        out[0:16] = pk_q(*(ref_f64(q, imm, mxcsr_rc, quirk) for q in u64s(src)))
+        out[0:16] = pk_q(*(ref_f64(q, imm, mxcsr_rc, daz, quirk) for q in u64s(src)))
     elif name.startswith("op_vroundpd_ymm_"):
         default_imm = {"rn": 0, "rd": 1, "ru": 2, "rz": 3, "mxcsr": 12, "mem": 11}[name.rsplit("_", 1)[1]]
         src = b if name.endswith("_mem") else a
         imm = imm_of(default_imm)
-        out[0:32] = pk_q(*(ref_f64(q, imm, mxcsr_rc, quirk) for q in u64s(src)))
+        out[0:32] = pk_q(*(ref_f64(q, imm, mxcsr_rc, daz, quirk) for q in u64s(src)))
     elif name.startswith("op_vroundss_") and name != "op_vroundss_zero_upper":
         default_imm = {"rn": 0, "rd": 1, "ru": 2, "rz": 3, "mxcsr": 4, "mem": 10}[name.rsplit("_", 1)[1]]
         imm = imm_of(default_imm)
         ad = list(u32s(a[:16]))
         bd0 = u32s(b[:4])[0]
-        ad[0] = ref_f32(bd0, imm, mxcsr_rc, quirk)
+        ad[0] = ref_f32(bd0, imm, mxcsr_rc, daz, quirk)
         if quirk == "clobber_scalar_upper":
             ad[1] = ad[2] = ad[3] = 0
         out[0:16] = pk_d(*ad)
@@ -208,24 +218,24 @@ def reference(name, a, b, *, mxcsr_rc=0, altered=False, quirk=None):
         aq0, aq1 = u64s(a[:16])
         bq0 = u64s(b[:8])[0]
         hi = 0 if quirk == "clobber_scalar_upper" else aq1
-        out[0:16] = pk_q(ref_f64(bq0, imm, mxcsr_rc, quirk), hi)
+        out[0:16] = pk_q(ref_f64(bq0, imm, mxcsr_rc, daz, quirk), hi)
     elif name == "op_vroundps_xmm_zero_upper":
-        out[0:16] = pk_d(*(ref_f32(w, 0, mxcsr_rc, quirk) for w in u32s(a[:16])))
+        out[0:16] = pk_d(*(ref_f32(w, 0, mxcsr_rc, daz, quirk) for w in u32s(a[:16])))
         out[16:32] = a[16:32] if quirk == "keep_ymm_upper" else bytes(16)
     elif name == "op_vroundpd_xmm_zero_upper":
-        out[0:16] = pk_q(*(ref_f64(q, 1, mxcsr_rc, quirk) for q in u64s(a[:16])))
+        out[0:16] = pk_q(*(ref_f64(q, 1, mxcsr_rc, daz, quirk) for q in u64s(a[:16])))
         out[16:32] = a[16:32] if quirk == "keep_ymm_upper" else bytes(16)
     elif name == "op_vroundss_zero_upper":
         ad = list(u32s(a[:16]))
-        ad[0] = ref_f32(u32s(b[:4])[0], 2, mxcsr_rc, quirk)
+        ad[0] = ref_f32(u32s(b[:4])[0], 2, mxcsr_rc, daz, quirk)
         out[0:16] = pk_d(*ad)
         out[16:32] = a[16:32] if quirk == "keep_ymm_upper" else bytes(16)
     elif name == "op_vroundsd_zero_upper":
         _, aq1 = u64s(a[:16])
-        out[0:16] = pk_q(ref_f64(u64s(b[:8])[0], 3, mxcsr_rc, quirk), aq1)
+        out[0:16] = pk_q(ref_f64(u64s(b[:8])[0], 3, mxcsr_rc, daz, quirk), aq1)
         out[16:32] = a[16:32] if quirk == "keep_ymm_upper" else bytes(16)
     elif name == "op_vround_r8_reload":
-        out[0:32] = pk_q(*(ref_f64(q, 0, mxcsr_rc, quirk) for q in u64s(a)))
+        out[0:32] = pk_q(*(ref_f64(q, 0, mxcsr_rc, daz, quirk) for q in u64s(a)))
     elif name == "op_vround_discarded_read":
         out[0:16] = a[0:16]
     else:
@@ -472,30 +482,64 @@ def check_discarded_read(fns, label):
 
 
 def check_inexact_suppress(fns, label):
-    """Verify imm8[3]=0 raises FE_INEXACT on 1.5 while imm8[3]=1 suppresses FE_INEXACT."""
+    """Verify FE_INEXACT (with imm8[3] suppress) and FE_INVALID on sNaN vs qNaN."""
     ucrt = ctypes.CDLL("ucrtbase")
     ucrt.feclearexcept.argtypes = [ctypes.c_int]
     ucrt.feclearexcept.restype = ctypes.c_int
     ucrt.fetestexcept.argtypes = [ctypes.c_int]
     ucrt.fetestexcept.restype = ctypes.c_int
     FE_INEXACT = 0x01  # MSVC UCRT FE_INEXACT (_SW_INEXACT)
+    FE_INVALID = 0x10  # MSVC UCRT FE_INVALID (_SW_INVALID)
+    FE_ALL = FE_INEXACT | FE_INVALID
     inexact_vec = pk_d(0x3FC00000, 0x3FC00000, 0x3FC00000, 0x3FC00000, 0, 0, 0, 0)  # 1.5f
     exact_vec = pk_d(0x40000000, 0x40000000, 0x40000000, 0x40000000, 0, 0, 0, 0)  # 2.0f
+    snan_f32 = pk_d(0x7F800001, 0x40000000, 0x40000000, 0x40000000, 0, 0, 0, 0)
+    qnan_f32 = pk_d(0x7FC01234, 0x40000000, 0x40000000, 0x40000000, 0, 0, 0, 0)
+    snan_f64 = pk_q(0xFFF0000000000001, 0x4000000000000000, 0, 0)
+    qnan_f64 = pk_q(0x7FF8123456789ABC, 0x4000000000000000, 0, 0)
 
-    ucrt.feclearexcept(FE_INEXACT)
+    ucrt.feclearexcept(FE_ALL)
     invoke(fns["op_vroundps_xmm_rn"], inexact_vec, exact_vec)
     if (ucrt.fetestexcept(FE_INEXACT) & FE_INEXACT) == 0:
         raise AssertionError(f"{label}: imm8[3]=0 failed to raise FE_INEXACT on 1.5f")
 
-    ucrt.feclearexcept(FE_INEXACT)
+    ucrt.feclearexcept(FE_ALL)
     invoke(fns["op_vroundps_xmm_suppress"], inexact_vec, exact_vec)
     if (ucrt.fetestexcept(FE_INEXACT) & FE_INEXACT) != 0:
         raise AssertionError(f"{label}: imm8[3]=1 failed to suppress FE_INEXACT on 1.5f")
 
-    ucrt.feclearexcept(FE_INEXACT)
+    ucrt.feclearexcept(FE_ALL)
     invoke(fns["op_vroundps_xmm_rn"], exact_vec, exact_vec)
-    if (ucrt.fetestexcept(FE_INEXACT) & FE_INEXACT) != 0:
-        raise AssertionError(f"{label}: exact integer 2.0f unexpectedly raised FE_INEXACT")
+    if (ucrt.fetestexcept(FE_ALL)) != 0:
+        raise AssertionError(f"{label}: exact integer 2.0f unexpectedly raised FP exceptions")
+
+    ucrt.feclearexcept(FE_ALL)
+    invoke(fns["op_vroundps_xmm_rn"], snan_f32, exact_vec)
+    got_flags = ucrt.fetestexcept(FE_ALL)
+    if (got_flags & FE_INVALID) == 0 or (got_flags & FE_INEXACT) != 0:
+        raise AssertionError(f"{label}: sNaN f32 unexpected flags {got_flags:#x}")
+
+    ucrt.feclearexcept(FE_ALL)
+    invoke(fns["op_vroundps_xmm_suppress"], snan_f32, exact_vec)
+    got_flags = ucrt.fetestexcept(FE_ALL)
+    if (got_flags & FE_INVALID) == 0 or (got_flags & FE_INEXACT) != 0:
+        raise AssertionError(f"{label}: sNaN f32 with suppress unexpected flags {got_flags:#x}")
+
+    ucrt.feclearexcept(FE_ALL)
+    invoke(fns["op_vroundps_xmm_rn"], qnan_f32, exact_vec)
+    if (ucrt.fetestexcept(FE_ALL)) != 0:
+        raise AssertionError(f"{label}: qNaN f32 unexpectedly raised FP exceptions")
+
+    ucrt.feclearexcept(FE_ALL)
+    invoke(fns["op_vroundpd_xmm_rn"], snan_f64, exact_vec)
+    got_flags = ucrt.fetestexcept(FE_ALL)
+    if (got_flags & FE_INVALID) == 0 or (got_flags & FE_INEXACT) != 0:
+        raise AssertionError(f"{label}: sNaN f64 unexpected flags {got_flags:#x}")
+
+    ucrt.feclearexcept(FE_ALL)
+    invoke(fns["op_vroundpd_xmm_rn"], qnan_f64, exact_vec)
+    if (ucrt.fetestexcept(FE_ALL)) != 0:
+        raise AssertionError(f"{label}: qNaN f64 unexpectedly raised FP exceptions")
 
 
 def verify_against_ref(target_fns, label, *, check_unaligned=True):
@@ -525,23 +569,70 @@ def verify_mxcsr_modes(target_fns, label, driver):
     runs = 0
     for name in MXCSR_EXPORTS:
         pairs = inputs_for(name)
-        by_rc = {}
-        for rc in range(4):
-            mxcsr = 0x1F80 | (rc << 13)
-            results = []
+        by_mode = {}
+        for daz in (False, True):
+            for rc in range(4):
+                mxcsr = 0x1F80 | (0x40 if daz else 0) | (rc << 13)
+                results = []
+                for idx, (a, b) in enumerate(pairs):
+                    want = reference(name, a, b, mxcsr_rc=rc, daz=daz)
+                    got = invoke_under(driver, target_fns[name], mxcsr, a, b)
+                    if got != want:
+                        raise AssertionError(
+                            f"{label} {name} [rc={rc},daz={int(daz)}] case {idx}: got {got.hex()} != exp {want.hex()}"
+                        )
+                    results.append(got)
+                    runs += 1
+                by_mode[(rc, daz)] = results
+        for daz in (False, True):
+            for r1 in range(4):
+                for r2 in range(r1 + 1, 4):
+                    if by_mode[(r1, daz)] == by_mode[(r2, daz)]:
+                        raise AssertionError(
+                            f"{label} {name}: MXCSR rc={r1} and rc={r2} (daz={int(daz)}) produced identical outputs"
+                        )
+        for rc in (1, 2):  # RD and RU must separate DAZ=0 from DAZ=1 on subnormals
+            if by_mode[(rc, False)] == by_mode[(rc, True)]:
+                raise AssertionError(f"{label} {name}: DAZ=0 and DAZ=1 produced identical outputs at rc={rc}")
+
+    # Directed-rounding explicit-imm8 exports under DAZ=0 (0x1F80) and DAZ=1 (0x1FC0), including +/- subnormals.
+    for name in DIRECTED_EXPORTS:
+        pairs = inputs_for(name)
+        for daz in (False, True):
+            mxcsr = 0x1FC0 if daz else 0x1F80
             for idx, (a, b) in enumerate(pairs):
-                want = reference(name, a, b, mxcsr_rc=rc)
+                want = reference(name, a, b, daz=daz)
                 got = invoke_under(driver, target_fns[name], mxcsr, a, b)
                 if got != want:
-                    raise AssertionError(f"{label} {name} [rc={rc}] case {idx}: got {got.hex()} != exp {want.hex()}")
-                results.append(got)
+                    raise AssertionError(
+                        f"{label} {name} [daz={int(daz)}] case {idx}: got {got.hex()} != exp {want.hex()}"
+                    )
                 runs += 1
-            by_rc[rc] = results
-        # Every rounding mode must differ from every other mode on at least one pair.
-        for r1 in range(4):
-            for r2 in range(r1 + 1, 4):
-                if by_rc[r1] == by_rc[r2]:
-                    raise AssertionError(f"{label} {name}: MXCSR rc={r1} and rc={r2} produced identical outputs")
+
+    # Explicit positive/negative subnormal checks (including the 0x00000001 / 0x1FC0 reproducer).
+    sub_f32_a = pk_d(0x00000001, 0x80000001, 0x007FFFFF, 0x807FFFFF, 0x00000001, 0x80000001, 0x007FFFFF, 0x807FFFFF)
+    sub_f64_a = pk_q(0x0000000000000001, 0x8000000000000001, 0x000FFFFFFFFFFFFF, 0x800FFFFFFFFFFFFF)
+    for name, src_a, src_b in (
+        ("op_vroundps_xmm_ru", sub_f32_a, sub_f32_a),
+        ("op_vroundps_xmm_rd", sub_f32_a, sub_f32_a),
+        ("op_vroundps_ymm_ru", sub_f32_a, sub_f32_a),
+        ("op_vroundps_ymm_rd", sub_f32_a, sub_f32_a),
+        ("op_vroundss_ru", pk_d(0x3F800000, 0x40000000, 0x40400000, 0x40800000, 0, 0, 0, 0), sub_f32_a),
+        ("op_vroundss_rd", pk_d(0x3F800000, 0x40000000, 0x40400000, 0x40800000, 0, 0, 0, 0), pk_d(0x80000001, 0, 0, 0, 0, 0, 0, 0)),
+        ("op_vroundpd_xmm_ru", sub_f64_a, sub_f64_a),
+        ("op_vroundpd_xmm_rd", sub_f64_a, sub_f64_a),
+        ("op_vroundpd_ymm_ru", sub_f64_a, sub_f64_a),
+        ("op_vroundpd_ymm_rd", sub_f64_a, sub_f64_a),
+        ("op_vroundsd_ru", pk_q(0x3FF0000000000000, 0x4000000000000000, 0, 0), sub_f64_a),
+        ("op_vroundsd_rd", pk_q(0x3FF0000000000000, 0x4000000000000000, 0, 0), pk_q(0x8000000000000001, 0, 0, 0)),
+    ):
+        for daz in (False, True):
+            mxcsr = 0x1FC0 if daz else 0x1F80
+            want = reference(name, src_a, src_b, daz=daz)
+            got = invoke_under(driver, target_fns[name], mxcsr, src_a, src_b)
+            if got != want:
+                raise AssertionError(f"{label} subnormal {name} [daz={int(daz)}]: got {got.hex()} != exp {want.hex()}")
+            runs += 1
     return runs
 
 
@@ -563,37 +654,45 @@ def check_altered_and_mutants(lifted_fns, altered_lifted_fns, driver):
 
     # Mutant models on the independent reference must disagree with lifted outputs.
     quirk_checks = (
-        ("ties_away", "op_vroundps_xmm_rn", 0),
-        ("ties_away", "op_vroundpd_ymm_rn", 0),
-        ("drop_neg_zero", "op_vroundps_xmm_rn", 0),
-        ("drop_neg_zero", "op_vroundps_xmm_ru", 0),
-        ("drop_neg_zero", "op_vroundpd_xmm_rz", 0),
-        ("drop_neg_zero", "op_vroundss_ru", 0),
-        ("drop_neg_zero", "op_vroundsd_rz", 0),
-        ("no_quieting", "op_vroundps_ymm_rn", 0),
-        ("no_quieting", "op_vroundpd_xmm_rd", 0),
-        ("no_quieting", "op_vroundss_rn", 0),
-        ("no_quieting", "op_vroundsd_rn", 0),
-        ("clobber_scalar_upper", "op_vroundss_rn", 0),
-        ("clobber_scalar_upper", "op_vroundsd_rn", 0),
-        ("keep_ymm_upper", "op_vroundps_xmm_zero_upper", 0),
-        ("keep_ymm_upper", "op_vroundpd_xmm_zero_upper", 0),
-        ("keep_ymm_upper", "op_vroundss_zero_upper", 0),
-        ("keep_ymm_upper", "op_vroundsd_zero_upper", 0),
-        ("ignore_mxcsr", "op_vroundps_xmm_mxcsr", 1),
-        ("ignore_mxcsr", "op_vroundpd_ymm_mxcsr", 2),
-        ("ignore_mxcsr", "op_vroundss_mxcsr", 3),
-        ("ignore_mxcsr", "op_vroundsd_mxcsr", 1),
+        ("ties_away", "op_vroundps_xmm_rn", 0, False),
+        ("ties_away", "op_vroundpd_ymm_rn", 0, False),
+        ("drop_neg_zero", "op_vroundps_xmm_rn", 0, False),
+        ("drop_neg_zero", "op_vroundps_xmm_ru", 0, False),
+        ("drop_neg_zero", "op_vroundpd_xmm_rz", 0, False),
+        ("drop_neg_zero", "op_vroundss_ru", 0, False),
+        ("drop_neg_zero", "op_vroundsd_rz", 0, False),
+        ("no_quieting", "op_vroundps_ymm_rn", 0, False),
+        ("no_quieting", "op_vroundpd_xmm_rd", 0, False),
+        ("no_quieting", "op_vroundss_rn", 0, False),
+        ("no_quieting", "op_vroundsd_rn", 0, False),
+        ("clobber_scalar_upper", "op_vroundss_rn", 0, False),
+        ("clobber_scalar_upper", "op_vroundsd_rn", 0, False),
+        ("keep_ymm_upper", "op_vroundps_xmm_zero_upper", 0, False),
+        ("keep_ymm_upper", "op_vroundpd_xmm_zero_upper", 0, False),
+        ("keep_ymm_upper", "op_vroundss_zero_upper", 0, False),
+        ("keep_ymm_upper", "op_vroundsd_zero_upper", 0, False),
+        ("ignore_mxcsr", "op_vroundps_xmm_mxcsr", 1, False),
+        ("ignore_mxcsr", "op_vroundpd_ymm_mxcsr", 2, False),
+        ("ignore_mxcsr", "op_vroundss_mxcsr", 3, False),
+        ("ignore_mxcsr", "op_vroundsd_mxcsr", 1, False),
+        ("ignore_daz", "op_vroundps_xmm_ru", 0, True),
+        ("ignore_daz", "op_vroundps_ymm_rd", 0, True),
+        ("ignore_daz", "op_vroundpd_xmm_ru", 0, True),
+        ("ignore_daz", "op_vroundpd_ymm_rd", 0, True),
+        ("ignore_daz", "op_vroundss_ru", 0, True),
+        ("ignore_daz", "op_vroundsd_rd", 0, True),
+        ("ignore_daz", "op_vroundps_xmm_mxcsr", 2, True),
+        ("ignore_daz", "op_vroundpd_ymm_mxcsr", 1, True),
     )
-    for quirk, name, rc in quirk_checks:
-        mxcsr = 0x1F80 | (rc << 13)
+    for quirk, name, rc, daz in quirk_checks:
+        mxcsr = 0x1F80 | (0x40 if daz else 0) | (rc << 13)
         pairs = inputs_for(name)
         caught = sum(
-            invoke_under(driver, lifted_fns[name], mxcsr, a, b) != reference(name, a, b, mxcsr_rc=rc, quirk=quirk)
+            invoke_under(driver, lifted_fns[name], mxcsr, a, b) != reference(name, a, b, mxcsr_rc=rc, daz=daz, quirk=quirk)
             for a, b in pairs
         )
         if not caught:
-            raise AssertionError(f"mutant quirk {quirk} on {name} (rc={rc}) survived")
+            raise AssertionError(f"mutant quirk {quirk} on {name} (rc={rc}, daz={int(daz)}) survived")
     return diverged, len(quirk_checks)
 
 
