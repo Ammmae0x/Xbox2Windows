@@ -4387,6 +4387,25 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(cpu_aot_avx_int_ymm_mul_sad PROPERTIES
         SKIP_RETURN_CODE 77
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx_int_ymm_mul_sad.txt")
+    set(cpu_avx_int_ymm_horizontal_exports
+        "op_vphaddw_ymm,op_vphaddd_ymm,op_vphaddsw_ymm,op_vphsubw_ymm,op_vphsubd_ymm,op_vphsubsw_ymm,"
+        "op_vphaddw_ymm_dst_src1,op_vphaddd_ymm_dst_src2,op_vphaddsw_ymm_all,op_vphsubw_ymm_dst_src2,"
+        "op_vphaddsw_ymm_then_xmm_vphsubsw,op_chain_ymm_horizontal")
+    string(CONCAT cpu_avx_int_ymm_horizontal_exports ${cpu_avx_int_ymm_horizontal_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_int_ymm_horizontal_${variant} avx_int_ymm_horizontal)
+        cpu_translation(cpu_avx_int_ymm_horizontal_${variant} cpu_avx_int_aot "${cpu_avx_int_ymm_horizontal_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx_int_ymm_horizontal_altered PRIVATE ALTER_YMM)
+    add_test(NAME cpu_aot_avx_int_ymm_horizontal COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_int_ymm_horizontal_check.py"
+        "$<TARGET_FILE:cpu_avx_int_ymm_horizontal_original>"
+        "$<TARGET_FILE:cpu_avx_int_ymm_horizontal_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_int_ymm_horizontal_altered>"
+        "$<TARGET_FILE:cpu_avx_int_ymm_horizontal_altered_lifted>")
+    set_tests_properties(cpu_aot_avx_int_ymm_horizontal PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx_int_ymm_horizontal.txt")
     set(cpu_avx_move_exports
         "op_andpd_xmm,op_andpd_ymm,op_andps_xmm,op_andps_ymm,op_andnpd_xmm,op_andnpd_ymm,"
         "op_andnps_xmm,op_andnps_ymm,op_orpd_xmm,op_orpd_ymm,op_orps_xmm,op_orps_ymm,"
