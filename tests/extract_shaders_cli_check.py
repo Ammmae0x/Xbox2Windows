@@ -251,6 +251,21 @@ def check_cli_negative():
         _expect_exit([str(archive), "--output-dir", str(alias)], fragment="must not match")
         assert archive.read_bytes() == orig_archive_bytes
 
+        # An archive may have the same name as a generated output.
+        manifest_archive = work / "manifest.json"
+        manifest_archive.write_bytes(archive_bytes)
+        _expect_exit([str(manifest_archive), "--output-dir", str(work)], fragment="overwrite the input archive")
+        assert manifest_archive.read_bytes() == archive_bytes
+        assert not (work / "pixel").exists()
+
+        shader_archive = work / "pixel" / "PS_One.dxbc"
+        shader_archive.parent.mkdir()
+        shader_archive.write_bytes(archive_bytes)
+        with redirect_stdout(io.StringIO()):
+            _expect_exit([str(shader_archive), "--output-dir", str(work), "--format", "dxbc"],
+                         fragment="overwrite the input archive")
+        assert shader_archive.read_bytes() == archive_bytes
+
         # Regular file as --output-dir -> SystemExit(1), preserves regular file contents.
         regular_out = work / "existing_file.txt"
         regular_out.write_text("keep_me", encoding="utf-8")

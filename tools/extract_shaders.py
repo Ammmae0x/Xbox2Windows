@@ -144,6 +144,16 @@ def extract_shaders(
         print(f"[!] Warning: Cannot write to '{output_dir}'. Falling back to '{fallback}'.", file=sys.stderr)
         output_dir = fallback
 
+    def ensure_separate_output(path: Path) -> None:
+        try:
+            collision = path.samefile(archive_path)
+        except FileNotFoundError:
+            return
+        if collision:
+            raise ValueError(f"Output file would overwrite the input archive: {path}")
+
+    manifest_path = output_dir / "manifest.json"
+    ensure_separate_output(manifest_path)
     archive_size = archive_path.stat().st_size
     print(f"[*] Opening archive: {archive_path.name} ({archive_size / (1024*1024):.1f} MB)...")
     start_time = time.time()
@@ -237,6 +247,7 @@ def extract_shaders(
                 # Save formats
                 if extract_format in ("dxbc", "both"):
                     dxbc_path = stage_dir / f"{file_stem}.dxbc"
+                    ensure_separate_output(dxbc_path)
                     with dxbc_path.open("wb") as out_f:
                         out_f.write(blob)
                     record_info["dxbc_file"] = f"{stage}/{file_stem}.dxbc"
@@ -244,6 +255,7 @@ def extract_shaders(
                 if extract_format in ("native", "both"):
                     if native_code:
                         bin_path = stage_dir / f"{file_stem}.bin"
+                        ensure_separate_output(bin_path)
                         with bin_path.open("wb") as out_f:
                             out_f.write(native_code)
                         record_info["native_file"] = f"{stage}/{file_stem}.bin"
@@ -251,6 +263,7 @@ def extract_shaders(
                     elif extract_format == "native":
                         # Fallback to dxbc if native code not unpackable
                         dxbc_path = stage_dir / f"{file_stem}.dxbc"
+                        ensure_separate_output(dxbc_path)
                         with dxbc_path.open("wb") as out_f:
                             out_f.write(blob)
                         record_info["dxbc_file"] = f"{stage}/{file_stem}.dxbc"
@@ -267,7 +280,6 @@ def extract_shaders(
                     break
 
     # Save manifest.json
-    manifest_path = output_dir / "manifest.json"
     manifest_data = {
         "archive": archive_path.name,
         "total_extracted": extracted_count,
