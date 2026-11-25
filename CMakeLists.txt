@@ -4240,6 +4240,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/emit_variants_cli_check.py")
     add_test(NAME coverage_svg COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/coverage_svg_check.py")
+    add_test(NAME ci_coverage_svg_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/coverage_svg_cli_check.py")
+    set_tests_properties(ci_coverage_svg_cli_check PROPERTIES TIMEOUT 60)
     # Compile-only: outcome classification and GVN pass shares, no wall-time threshold (#775).
     add_test(NAME dxc_compile_time_gvn COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dxc_compile_time_check.py" "${DXC_EXECUTABLE}")
