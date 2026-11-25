@@ -348,6 +348,12 @@ def _replay_archive_fixture(*, root_tag="root", container_count=1, extra_records
 
 
 def _mock_cdll_factory(*, override_return=None, skip_active_update=False):
+    """Return a fake CDLL modeling the native resolve_script_path contract.
+
+    This pure-Python mock models tools/script_path_host.cpp so script_state_check
+    stays platform-independent; tests/script_path_check.py exercises replay()
+    against the real compiled script_path_host library on Windows.
+    """
     STATE_HASH = joaat("state")
     ID_HASH = joaat("id")
     NO_NODE = 0xFFFF
@@ -572,6 +578,14 @@ class ScriptPathReplayNegativeTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "Linked traversal returned 2"):
                     replay(tree, states, children, ["alpha"], host)
+
+            # Relative '..' escaping past current depth must report missing even when
+            # negative slicing (active_keys[:len - up]) would wrap to a valid prefix.
+            with mock.patch.object(replay_mod.ctypes, "CDLL", side_effect=_mock_cdll_factory()):
+                over_up = replay(tree, states, children, ["../alpha", "alpha", "../../gamma"], host)
+            self.assertEqual([r["status"] for r in over_up], ["missing", "matched", "missing"])
+            self.assertEqual((over_up[0]["before"], over_up[0]["after"]), (1, 1))
+            self.assertEqual((over_up[2]["before"], over_up[2]["after"]), (2, 2))
 
     def test_main_cli_rejects_missing_and_invalid_inputs_without_traceback(self):
         with tempfile.TemporaryDirectory() as directory:
