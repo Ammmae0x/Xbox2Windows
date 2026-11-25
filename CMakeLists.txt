@@ -2114,6 +2114,12 @@ add_executable(startup_logical_view_table_check tests/startup_logical_view_table
 target_include_directories(startup_logical_view_table_check PRIVATE src)
 target_compile_features(startup_logical_view_table_check PRIVATE cxx_std_17)
 add_test(NAME startup_logical_view_table COMMAND startup_logical_view_table_check)
+# Compute descriptor tables (command-list slot 35, src/startup_stubs/list_compute_root.h): a table at a nonzero
+# descriptor offset, a wrong handle, clear on a different signature or a view heap change, range limit.
+add_executable(startup_compute_root tests/startup_compute_root.cpp)
+target_include_directories(startup_compute_root PRIVATE src)
+target_compile_features(startup_compute_root PRIVATE cxx_std_17)
+add_test(NAME startup_compute_root COMMAND startup_compute_root)
 # Local switch, logging, and page-probe helpers (src/startup_stubs/local_log.h, #1149).
 add_executable(startup_local_log_check tests/startup_local_log_check.cpp)
 target_include_directories(startup_local_log_check PRIVATE src)
@@ -3801,10 +3807,19 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_stage_package COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stage_package_check.py" "${STARTUP_POWERSHELL}")
     set_tests_properties(startup_stage_package PROPERTIES TIMEOUT 120)
-    add_test(NAME startup_debug COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_check.py" "$<TARGET_FILE:startup_debug_probe>"
-        "$<TARGET_FILE:startup_debug_calls>")
-    set_tests_properties(startup_debug PROPERTIES TIMEOUT 300)
+    # One script, three groups of cases that ctest can run in parallel. startup_debug keeps the old
+    # name; select all three with -R '^startup_debug' (the anchored -R '^startup_debug$' runs only the core group).
+    foreach(group IN ITEMS core log hooks)
+        if(group STREQUAL "core")
+            set(startup_debug_test startup_debug)
+        else()
+            set(startup_debug_test startup_debug_${group})
+        endif()
+        add_test(NAME ${startup_debug_test} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_check.py" "$<TARGET_FILE:startup_debug_probe>"
+            "$<TARGET_FILE:startup_debug_calls>" ${group})
+        set_tests_properties(${startup_debug_test} PROPERTIES TIMEOUT 300)
+    endforeach()
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
         "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_check.py" "$<TARGET_FILE:startup_stream_consumer>")
@@ -4073,6 +4088,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Offline re-key of saved shader requests under the current cache revision (pure Python).
     add_test(NAME startup_shader_cache_rekey COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_shader_cache_rekey_check.py")
+    add_test(NAME runtime_shader_cache_rekey_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_shader_cache_rekey_cli_check.py")
     # Partial colour exports carry their channel mask to the manifest; compressed exports of whole pairs lower (#1674).
     add_test(NAME startup_gfx2hlsl_export_mask COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_export_mask_check.py")
@@ -8702,6 +8719,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME pe_authentihash_oracle COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/pe_authentihash_oracle_check.py" "$<TARGET_FILE:xmem_shim>")
     set_tests_properties(pe_authentihash_oracle PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME pe_authentihash_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/pe_authentihash_cli_check.py")
     add_test(NAME script_dispatch_pairs COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/script_dispatch_check.py" "$<TARGET_FILE:script_path_host>")
     add_test(NAME script_state_probe_checks COMMAND "${INTAKE_PYTHON}" -B
@@ -9993,6 +10012,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     endforeach()
     set_tests_properties(rectlist_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME conditional_import_paths COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/intake/paths_check.py")
+    add_test(NAME build_verify_build_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/verify_build_cli_check.py")
     add_library(intake_provider SHARED tests/intake/provider.cpp tests/intake/provider.def)
     add_library(intake_delay SHARED tests/intake/provider.cpp tests/intake/delay.def)
     add_executable(intake_candidate tests/intake/candidate.cpp)
