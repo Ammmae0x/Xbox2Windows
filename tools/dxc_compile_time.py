@@ -326,7 +326,10 @@ def run_once(dxc, hlsl, cso, flags, timeout_s, sample_interval=0.005):
     except subprocess.TimeoutExpired:
         timed_out = True
         proc.kill()
-        stdout, stderr = proc.communicate()
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = b"", b""
     elapsed = time.perf_counter() - start
     stop.set()
     if thread:

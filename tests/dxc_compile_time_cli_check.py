@@ -76,7 +76,7 @@ def _run_subprocess(*args):
         [sys.executable, "-B", str(TOOL), *args],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=15,
     )
 
 
@@ -386,17 +386,34 @@ class DxcCompileTimeCliNegativeAndMutationTests(unittest.TestCase):
             out_file.parent.mkdir()
             out_file.write_text("prior-report\n", encoding="utf-8")
 
-            # Real subprocess failure when Popen tries to run invalid executable (OSError).
-            self._assert_clean_failure(
-                [
-                    "--dxc", str(fake_dxc),
-                    "--variants", "control",
-                    "--timeout", "10",
-                    "--out", str(out_file),
-                ],
-                expected_fragment="dxc_compile_time:",
-            )
+            # Simulated Popen launch OSError through real run_once -> measure_variant -> main exits 1 cleanly.
+            with mock.patch.object(tool.subprocess, "Popen", side_effect=OSError("simulated exec format error")):
+                self._assert_clean_failure(
+                    [
+                        "--dxc", str(fake_dxc),
+                        "--variants", "control",
+                        "--timeout", "10",
+                        "--out", str(out_file),
+                    ],
+                    expected_fragment="simulated exec format error",
+                    check_subprocess=False,
+                )
             self.assertEqual(out_file.read_text(encoding="utf-8"), "prior-report\n")
+
+            # Bounded real subprocess control with a deterministic failing child (sys.executable rejects -T).
+            real_out = root / "reports" / "real_child.json"
+            proc_real = _run_subprocess(
+                "--dxc", sys.executable,
+                "--variants", "control",
+                "--timeout", "5",
+                "--work-dir", str(root / "real_work"),
+                "--out", str(real_out),
+            )
+            self.assertEqual(proc_real.returncode, 0, proc_real.stderr)
+            self.assertEqual(proc_real.stderr, "")
+            real_doc = json.loads(real_out.read_text(encoding="utf-8"))
+            self.assertEqual(real_doc["variants"][0]["outcome"], "diagnostic")
+            self.assertEqual(real_doc["variants"][0]["exit_codes"], [2])
 
             # work_dir.mkdir OSError (ancestor is a regular file) exits 1 cleanly.
             blocker = root / "blocker_file"
