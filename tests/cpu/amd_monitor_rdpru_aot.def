@@ -1,0 +1,8 @@
+EXPORTS
+    op_rdpru_mperf
+    op_rdpru_aperf
+    op_rdpru_twice
+    op_rdpru_unused
+    op_monitorx_mwaitx_r8
+    op_monitorx_mwaitx_intbrk
+    op_monitorx_rcx_rdx
