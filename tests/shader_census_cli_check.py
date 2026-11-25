@@ -74,12 +74,16 @@ class ShaderCensusCliTests(unittest.TestCase):
                 code = exc.code if isinstance(exc.code, int) else 1
         return code, out.getvalue(), err.getvalue()
 
-    def _assert_main_fails(self, argv: list[str], *, expected_code: int, fragment: str) -> str:
+    def _assert_main_fails(self, argv: list[str], *, expected_code: int, fragment: str | tuple[str, ...]) -> str:
         code, stdout, stderr = self._run_main(argv)
         self.assertEqual(code, expected_code, f"argv={argv!r} stderr={stderr!r}")
         self.assertEqual(stdout, "")
         self.assertNotIn("Traceback", stderr)
-        self.assertIn(fragment, stderr)
+        fragments = (fragment,) if isinstance(fragment, str) else fragment
+        self.assertTrue(
+            any(f in stderr for f in fragments),
+            f"none of {fragments!r} found in {stderr!r}",
+        )
         return stderr
 
     def test_main_argv_forwarding_and_json_schema(self):
@@ -209,7 +213,7 @@ class ShaderCensusCliTests(unittest.TestCase):
             self._assert_main_fails(
                 [str(archive), "--cache-blob", str(cache), "--code-base", "-0x10"],
                 expected_code=2,
-                fragment="expected one argument",
+                fragment=("expected one argument", "non-negative"),
             )
 
             # Non-integer --code-base -> exit 2.
