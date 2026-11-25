@@ -536,9 +536,17 @@ class ScriptPathReplayNegativeTests(unittest.TestCase):
                     archive = root / f"{desc.replace(' ', '_')}.rpf"
                     archive.write_bytes(_replay_archive_fixture(**opts))
                     with mock.patch.object(replay_mod.ctypes, "CDLL", side_effect=_mock_cdll_factory()):
-                        tree, states, children = select_tree(archive, joaat("alpha")) if opts.get("container_count", 1) else (
-                            [(joaat("root"), 65535, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 1)], [], b""
-                        ), {}, {65535: [0]}
+                        if opts.get("container_count", 1):
+                            tree, states, children = select_tree(archive, joaat("alpha"))
+                        else:
+                            tree = ([(joaat("root"), 65535, 0xFFFF, 0xFFFF, 0xFFFF, 0, 0, 1)], [], b"")
+                            states = {}
+                            children = {65535: [0]}
+                        if opts.get("container_count") == 2:
+                            self.assertEqual(len(children[0]), 2)
+                        if opts.get("root_tag") == "not_root":
+                            self.assertEqual(len(children[0]), 1)
+                            self.assertNotEqual(tree[0][0][0], joaat("root"))
                         with self.assertRaisesRegex(ValueError, "Expected one root states container"):
                             replay(tree, states, children, ["alpha"], host)
 
@@ -579,6 +587,8 @@ class ScriptPathReplayNegativeTests(unittest.TestCase):
                 ([str(missing), "--host", str(host), "--record-with", "alpha", "alpha"], "missing.rpf", None),
                 ([str(invalid), "--host", str(host), "--record-with", "alpha", "alpha"], "Expected an RPF9 archive", None),
                 ([str(valid), "--host", str(host), "--record-with", "absent", "alpha"], "No record contains this anchor", None),
+                ([str(valid), "--host", str(root / "missing_host.dll"), "--record-with", "alpha", "alpha"], "valid.rpf", None),
+                ([str(valid), "--host", str(host), "--record-with", "alpha", "alpha"], "cannot load host DLL", OSError("cannot load host DLL")),
                 ([str(valid), "--host", str(host), "--record-with", "alpha", "a//b"], "Expected state labels", _mock_cdll_factory()),
                 ([str(valid), "--host", str(host), "--record-with", "alpha", "alpha"], "Linked traversal returned -1", _mock_cdll_factory(override_return=-1)),
             )
