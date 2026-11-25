@@ -27,6 +27,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME pyc_main_entry COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/pyc_main_check.py")
     set_tests_properties(pyc_main_entry PROPERTIES TIMEOUT 60)
+    add_test(NAME ci_run_checks_parallel_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/run_checks_parallel_cli_check.py")
 endif()
 
 set(DSTORAGE_SDK_ROOT "" CACHE PATH "Extracted Microsoft.Direct3D.DirectStorage NuGet package")
@@ -2709,6 +2711,11 @@ else()
 endif()
 add_test(NAME xg_bc64_tiling_reference COMMAND xg_swizzle_select_check --bc64-tiling)
 set_tests_properties(xg_bc64_tiling_reference PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+if(EXISTS "${INTAKE_PYTHON}")
+    add_test(NAME tooling_fetch_addrlib_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/fetch_addrlib_cli_check.py")
+    set_tests_properties(tooling_fetch_addrlib_cli_check PROPERTIES TIMEOUT 60)
+endif()
 # 4 KiB allocation answers for small 2D textures (src/startup_stubs/small_texture_4k.h): literal sizes and
 # refused descriptions without a device; the mutated run is the negative control; the addrlib run compares
 # every accepted shape with addrlib's GFX10 4 KiB layout and skips (77) without addrlib.
@@ -4139,6 +4146,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME dxc_compile_time_gvn COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dxc_compile_time_check.py" "${DXC_EXECUTABLE}")
     set_tests_properties(dxc_compile_time_gvn PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    add_test(NAME dxc_compile_time_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/dxc_compile_time_cli_check.py")
+    set_tests_properties(dxc_compile_time_cli_check PROPERTIES TIMEOUT 60)
     # Dispatch condstore_256 built with and without GVN; compare the whole raw UAV bit for bit (#775).
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME dxc_gvn_output_${adapter} COMMAND "${INTAKE_PYTHON}" -B
