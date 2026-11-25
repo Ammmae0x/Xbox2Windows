@@ -8166,6 +8166,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME mesh_amplification_refusal COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/mesh_amplification_refusal_check.py")
     set_tests_properties(mesh_amplification_refusal PROPERTIES TIMEOUT 30)
+    add_test(NAME mesh_entry_aot_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/mesh_entry_aot_cli_check.py")
     foreach(adapter IN ITEMS hardware warp)
         add_test(NAME mesh_dynamic_aot_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/mesh_dynamic_aot_draw_check.py" "${DXC_EXECUTABLE}"
