@@ -3396,6 +3396,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The pixel input mask scan finds where a pipeline stores the two masks, from shader register use (#1629).
     add_test(NAME startup_ps_input_scan COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_ps_input_scan_check.py")
+    add_test(NAME startup_ps_input_scan_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_ps_input_scan_cli_check.py")
     foreach(adapter IN ITEMS warp hardware)
         add_test(NAME startup_packed_screen_position_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_packed_position_check.py" "${DXC_EXECUTABLE}"
