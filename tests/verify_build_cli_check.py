@@ -167,28 +167,41 @@ class VerifyBuildCliPositiveTests(unittest.TestCase):
             root = Path(tmp)
             pkg = root / "pkg"
             _create_package(pkg)
+            (pkg / "m").mkdir()
+            for rel in ("z_extra.bin", "m/z.bin", "a_extra.bin", "m/a.bin"):
+                (pkg / rel).write_bytes(b"extra")
+
+            expected_extra = ["a_extra.bin", "layout.xml", "m/a.bin", "m/z.bin", "pkg.torrent", "z_extra.bin"]
+            keys = list(verify_build.inventory(pkg).keys())
+            self.assertEqual(keys, sorted(keys))
+            self.assertEqual(
+                keys,
+                ["a_extra.bin", "b.bin", "layout.xml", "m/a.bin", "m/z.bin", "pkg.torrent", "sub/a.bin", "z_extra.bin"],
+            )
 
             real_rglob = Path.rglob
 
-            def reversed_rglob(path_obj, pattern):
-                return reversed(list(real_rglob(path_obj, pattern)))
+            def reversed_rglob(path_obj, *args, **kwargs):
+                return reversed(list(real_rglob(path_obj, *args, **kwargs)))
 
             with mock.patch.object(Path, "rglob", reversed_rglob):
-                keys = list(verify_build.inventory(pkg).keys())
-            self.assertEqual(keys, sorted(keys))
+                reversed_keys = list(verify_build.inventory(pkg).keys())
+            self.assertEqual(reversed_keys, keys)
 
             real_glob = Path.glob
-            seen_glob_patterns = []
 
-            def reversed_glob(path_obj, pattern):
-                seen_glob_patterns.append(pattern)
-                return reversed(list(real_glob(path_obj, pattern)))
+            def reversed_glob(path_obj, *args, **kwargs):
+                return reversed(list(real_glob(path_obj, *args, **kwargs)))
 
             out_file = root / "out.json"
-            with mock.patch.object(Path, "glob", reversed_glob):
+            with (
+                mock.patch.object(Path, "rglob", reversed_rglob),
+                mock.patch.object(Path, "glob", reversed_glob),
+            ):
                 code, _, err = _run_main([str(pkg), "--output", str(out_file)])
             self.assertEqual(code, 0, err)
-            self.assertEqual(seen_glob_patterns, ["*.torrent", "layout*.xml"])
+            doc = json.loads(out_file.read_text(encoding="utf-8"))
+            self.assertEqual(doc["extra_disk_files"], expected_extra)
 
     def test_main_sys_argv_forwarding_and_script_entrypoint(self):
         with TemporaryDirectory() as tmp:
