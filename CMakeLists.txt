@@ -958,6 +958,39 @@ target_compile_features(startup_dstorage_destination_check PRIVATE cxx_std_17)
 add_dependencies(startup_dstorage_destination_check startup_stub_xcrdapi)
 add_test(NAME startup_dstorage_destination COMMAND startup_dstorage_destination_check "$<TARGET_FILE:startup_stub_xcrdapi>")
 set_tests_properties(startup_dstorage_destination PROPERTIES TIMEOUT 60)
+# A request whose destination page an XMem run break holds unmapped (the xmem test-controls build's
+# X2W_XMEM_TEST_HOLD_WINDOW) must not complete within the 1000 ms hold, then land after the release.
+# Control: XCRDAPI without the x2w_xmem_copy_to_destination lookup judges the destination with its own VirtualQuery
+# inside the window and refuses it.
+add_executable(startup_dstorage_break_window_check tests/startup_dstorage_break_window_check.cpp)
+target_compile_features(startup_dstorage_break_window_check PRIVATE cxx_std_17)
+add_dependencies(startup_dstorage_break_window_check startup_stub_xcrdapi xmem_shim_test_controls)
+add_test(NAME startup_dstorage_break_window COMMAND startup_dstorage_break_window_check
+         "$<TARGET_FILE:xmem_shim_test_controls>" "$<TARGET_FILE:startup_stub_xcrdapi>")
+set_tests_properties(startup_dstorage_break_window PROPERTIES TIMEOUT 60)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/startup_stubs/xcrdapi.cpp)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/startup_stubs/xcrdapi.cpp" xcrdapi_text)
+string(REPLACE "\"x2w_xmem_copy_to_destination\"" "\"x2w_xmem_copy_to_destination_control\"" xcrdapi_control_text
+       "${xcrdapi_text}")
+if(xcrdapi_control_text STREQUAL xcrdapi_text)
+    message(FATAL_ERROR "xcrdapi.cpp lost the anchor used by startup_dstorage_break_window_control")
+endif()
+set(xcrdapi_control "${CMAKE_CURRENT_BINARY_DIR}/xcrdapi_break_window_control/xcrdapi.cpp")
+file(WRITE "${xcrdapi_control}" "${xcrdapi_control_text}")
+add_library(startup_stub_xcrdapi_break_window_control SHARED "${xcrdapi_control}" src/startup_stubs/xcrdapi.def)
+set_target_properties(startup_stub_xcrdapi_break_window_control PROPERTIES OUTPUT_NAME XCRDAPI
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/xcrdapi-break-window-control"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/xcrdapi-break-window-control"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/xcrdapi-break-window-control"
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+target_include_directories(startup_stub_xcrdapi_break_window_control PRIVATE src)
+target_compile_features(startup_stub_xcrdapi_break_window_control PRIVATE cxx_std_17)
+target_link_libraries(startup_stub_xcrdapi_break_window_control PRIVATE psapi)
+add_dependencies(startup_dstorage_break_window_check startup_stub_xcrdapi_break_window_control)
+add_test(NAME startup_dstorage_break_window_control COMMAND startup_dstorage_break_window_check
+         "$<TARGET_FILE:xmem_shim_test_controls>" "$<TARGET_FILE:startup_stub_xcrdapi_break_window_control>")
+set_tests_properties(startup_dstorage_break_window_control PROPERTIES TIMEOUT 60
+    PASS_REGULAR_EXPRESSION "FAIL break window: refused while the run was broken")
 add_executable(startup_storage_worker_start tests/startup_storage_worker_start.cpp)
 target_compile_features(startup_storage_worker_start PRIVATE cxx_std_17)
 target_include_directories(startup_storage_worker_start PRIVATE src)
