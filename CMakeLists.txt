@@ -8553,6 +8553,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/resource_ranges_check.py")
     add_test(NAME ttpf_batch_export COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/ttpf_batch_export_check.py")
+    add_test(NAME ttpf_batch_export_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/ttpf_batch_export_cli_check.py")
     add_test(NAME audio_awc_metadata COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/awc_metadata_check.py")
     add_test(NAME audio_awc_metadata_cli_check COMMAND "${INTAKE_PYTHON}" -B
