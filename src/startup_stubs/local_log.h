@@ -129,4 +129,30 @@ inline bool accessible(const void* pointer, std::size_t bytes, bool write) noexc
 inline bool readable(const void* pointer, std::size_t bytes) noexcept { return accessible(pointer, bytes, false); }
 inline bool writable(const void* pointer, std::size_t bytes) noexcept { return accessible(pointer, bytes, true); }
 
+// True when every byte of [pointer, pointer + bytes) is committed and writable, with no guard or no-access page
+// in between. Walks the regions one VirtualQuery at a time, so a range that spans regions of different
+// protection is judged page by page. Nothing is written, touched or committed (see commit_lazy), so it is safe
+// under xmem's mapping lock. An empty range is writable; a null or wrapping one is not.
+inline bool committed_writable(const void* pointer, std::size_t bytes) noexcept
+{
+    if (bytes == 0) return true;
+    std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(pointer);
+    if (!pointer || bytes > ~std::uintptr_t{0} - cursor) return false;
+    const std::uintptr_t end = cursor + bytes;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT)
+            return false;
+        if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+        const DWORD protect = info.Protect & 0xFF;
+        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
+            protect != PAGE_EXECUTE_WRITECOPY)
+            return false;
+        const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (region_end <= cursor) return false;
+        cursor = region_end;
+    }
+    return true;
+}
+
 }  // namespace x2w_local

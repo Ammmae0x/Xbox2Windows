@@ -262,6 +262,10 @@ const Backing* lease_backing(UINT version, ULONG_PTR page)
     return backing && backing->committed ? backing : nullptr;
 }
 
+// Set while this thread holds memory.mutex to change mappings or to copy into mapped pages (MappingThread). The
+// fault handlers pass such a thread's faults on: waiting for memory.mutex there would never return.
+thread_local bool mapping_thread = false;
+
 LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
 {
     const EXCEPTION_RECORD* record = e->ExceptionRecord;
@@ -296,6 +300,7 @@ LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* e)
     // A thread that raced another one to the same slot finds it committed: retry once, then pass the fault on.
     thread_local ULONG_PTR retried = 0;
     const ULONG_PTR page = address & ~(ULONG_PTR{page_bytes} - 1);
+    if (mapping_thread) return EXCEPTION_CONTINUE_SEARCH;
     const std::lock_guard guard(memory.mutex);
     Backing* backing = backing_at(address);
     if (!backing) return EXCEPTION_CONTINUE_SEARCH;
@@ -476,7 +481,6 @@ struct EndBreak { ~EndBreak() { end_break(); } };
 // mutex) the page is recorded and covered by a view; and this thread has not already retried this
 // page for this break. Everything else is passed on, so a fault that is not the transient one is
 // reported after at most one retry.
-thread_local bool mapping_thread = false;
 LONG CALLBACK retry_remapped_page(EXCEPTION_POINTERS* e)
 {
     const EXCEPTION_RECORD* record = e->ExceptionRecord;
@@ -1589,6 +1593,76 @@ extern "C" BOOL WINAPI x2w_xmem_commit_range(const void* address, SIZE_T bytes)
         if (page > ~ULONG_PTR{0} - page_bytes) break;
     }
     return TRUE;
+}
+
+namespace {
+// Keep the guarded copy out of functions that need unwinding (as read_alias_record).
+bool copy_guarded(void* destination, const void* data, SIZE_T bytes) noexcept
+{
+    __try {
+        std::memcpy(destination, data, bytes);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
+                GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
+// The longest hold of memory.mutex by a destination copy, and the largest copy, so far (under memory.mutex).
+double copy_hold_max_ms = 0;
+SIZE_T copy_bytes_max = 0;
+}  // namespace
+
+// The DirectStorage stand-in's copy into a plain-memory destination (XCRDAPI). The check that all of
+// [destination, destination + capacity) is committed and writable and the copy of bytes from data both run under
+// memory.mutex. Unmapping a page of a shared run takes the whole run away until its other pages are mapped again
+// (map_pages_locked, remap_alias_pages), all under that mutex, so neither the check nor the copy can fall into that
+// window, and no such window can open while the copy runs. Lazily mapped pages of both ranges are committed first,
+// before the mutex is taken: a fault under it is passed on (mapping_thread), not served.
+// TRUE when the bytes were copied. FALSE with ERROR_NOACCESS when the destination is not writable (nothing is
+// written), ERROR_INVALID_ADDRESS when the copy faulted (a source page not readable; part of the destination may be
+// written), or ERROR_INVALID_PARAMETER for more bytes than capacity or null data.
+extern "C" BOOL WINAPI x2w_xmem_copy_to_destination(void* destination, SIZE_T capacity, const void* data, SIZE_T bytes)
+{
+    if (bytes > capacity || (bytes && !data)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    const auto start = reinterpret_cast<ULONG_PTR>(destination);
+    if (capacity && destination && capacity <= ~ULONG_PTR{0} - start) x2w_xmem_commit_range(destination, capacity);
+    if (bytes) x2w_xmem_commit_range(data, bytes);
+    DWORD error = ERROR_SUCCESS;
+    double held_ms = 0;
+    bool longest = false, largest = false;
+    {
+        const MappingThread marker;
+        const std::lock_guard guard(memory.mutex);
+        LARGE_INTEGER frequency{}, begin{}, end{};
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&begin);
+        if (!x2w_local::committed_writable(destination, capacity))
+            error = ERROR_NOACCESS;
+        else if (bytes && !copy_guarded(destination, data, bytes))
+            error = ERROR_INVALID_ADDRESS;
+        QueryPerformanceCounter(&end);
+        held_ms = frequency.QuadPart ? 1000.0 * static_cast<double>(end.QuadPart - begin.QuadPart) / frequency.QuadPart : 0;
+        if (held_ms > copy_hold_max_ms) {
+            copy_hold_max_ms = held_ms;
+            longest = true;
+        }
+        if (!error && bytes > copy_bytes_max) {
+            copy_bytes_max = bytes;
+            largest = true;
+        }
+    }
+    // A line per new maximum (about the logarithm of the number of copies), logged after the mutex is released.
+    static volatile LONG lines;
+    if ((longest || largest) && x2w_local::first_calls(lines, 64))
+        x2w_local::logf("x2w-xmem destination copy: %s%s%.3f ms under the mapping mutex for 0x%llx bytes (capacity 0x%llx)",
+                        longest ? "longest hold so far, " : "", largest ? "largest copy so far, " : "", held_ms,
+                        static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(capacity));
+    SetLastError(error);
+    return error == ERROR_SUCCESS;
 }
 
 // Experimental export (X2W_XMEM_LAZY_STARTUP): commits the whole lazy startup block holding address and stops

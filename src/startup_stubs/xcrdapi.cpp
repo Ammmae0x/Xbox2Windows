@@ -200,30 +200,17 @@ static bool resident_read_write(std::uintptr_t start, std::uintptr_t end)
 // True when every byte of [destination, destination + bytes) is committed and writable, with no guard or
 // no-access page in between. Nothing is written or touched. Resident read-write pages are accepted from
 // their working-set attributes; any other page (not resident, copy-on-write, guard, no access) sends the
-// destination to the VirtualQuery walk, which judges it region by region. That walk is slow on the title's
-// large regions: each query scans to the end of the region (#2684).
+// destination to the region walk (x2w_local::committed_writable), which judges it region by region. That walk
+// is slow on the title's large regions: each query scans to the end of the region (#2684). Lazily mapped
+// physical pages (X2W_XMEM_LAZY_COMMIT) are committed first.
 static bool destination_writable(const void* destination, std::size_t bytes)
 {
     if (bytes == 0) return true;
-    std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(destination);
-    if (!destination || bytes > UINTPTR_MAX - cursor) return false;
-    x2w_local::commit_lazy(destination, bytes);  // lazily mapped physical pages (X2W_XMEM_LAZY_COMMIT)
-    const std::uintptr_t end = cursor + bytes;
-    if (resident_read_write(cursor, end)) return true;
-    while (cursor < end) {
-        MEMORY_BASIC_INFORMATION info{};
-        if (!VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) || info.State != MEM_COMMIT)
-            return false;
-        if (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
-        const DWORD protect = info.Protect & 0xFF;
-        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY && protect != PAGE_EXECUTE_READWRITE &&
-            protect != PAGE_EXECUTE_WRITECOPY)
-            return false;
-        const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
-        if (region_end <= cursor) return false;
-        cursor = region_end;
-    }
-    return true;
+    const auto start = reinterpret_cast<std::uintptr_t>(destination);
+    if (!destination || bytes > UINTPTR_MAX - start) return false;
+    x2w_local::commit_lazy(destination, bytes);
+    if (resident_read_write(start, start + bytes)) return true;
+    return x2w_local::committed_writable(destination, bytes);
 }
 
 // Return the exact queued requests that continue this stream in this submission, in queue order.
