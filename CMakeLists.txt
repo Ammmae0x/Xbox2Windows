@@ -1176,6 +1176,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_audio_timeline COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_audio_timeline_check.py")
     set_tests_properties(startup_audio_timeline PROPERTIES TIMEOUT 60)
+    add_test(NAME startup_audio_timeline_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_audio_timeline_cli_check.py")
 endif()
 target_compile_features(startup_dump_fence_check PRIVATE cxx_std_17)
 target_include_directories(startup_dump_fence_check PRIVATE src)
