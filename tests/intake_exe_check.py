@@ -245,11 +245,23 @@ class IntakeExeUnitTests(unittest.TestCase):
     def test_inside_rejects_traversal_root_and_absolute_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "pkg"
-            root.mkdir()
+            (root / "sub").mkdir(parents=True)
             sub = root / "bin" / "main.exe"
             self.assertEqual(intake_exe.inside(root, "bin/main.exe"), sub.resolve())
-            for bad in ("../outside", ".", "", "/abs/path", "\\win\\root", "bin/../../escape"):
-                with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "Invalid package path"):
+            # Unnormalized root containing '..' must still accept valid relative package paths.
+            self.assertEqual(intake_exe.inside(root / "sub" / "..", "bin/main.exe"), sub.resolve())
+            # Pin each refusal reason explicitly (POSIX/drive/UNC absolute, traversal, root itself, empty).
+            cases = (
+                ("absolute_posix", "/etc/passwd"),
+                ("absolute_drive", "C:/Windows/win.ini"),
+                ("absolute_unc", "\\\\server\\share\\x"),
+                ("escape_parent", "../escape.txt"),
+                ("escape_nested", "bin/../../escape"),
+                ("root_dot", "."),
+                ("empty", ""),
+            )
+            for reason, bad in cases:
+                with self.subTest(reason=reason, bad=bad), self.assertRaisesRegex(ValueError, "Invalid package path"):
                     intake_exe.inside(root, bad)
 
     def test_import_routes_and_routing_failures(self):

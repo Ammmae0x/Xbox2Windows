@@ -40,6 +40,7 @@ def routing_failures(rows):
 
 
 def inside(root, name):
+    """Resolve a package-relative path, normalizing root so unnormalized '..' in root does not reject valid names."""
     base = root.resolve()
     path = (base / name).resolve()
     if (not path.is_relative_to(base) or path == base or
