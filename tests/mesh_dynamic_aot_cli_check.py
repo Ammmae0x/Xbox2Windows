@@ -437,6 +437,40 @@ class MeshDynamicAotCliNegativeAndMutationTests(unittest.TestCase):
             self.assertIn("OSError: simulated disk full", err)
             self.assertEqual(list(out_dir.iterdir()), [])
 
+    def test_non_ascii_hlsl_rejected_before_replace_and_preserves_existing_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            container = root / "shader.dxbc"
+            container.write_bytes(b"dxbc")
+            out_dir = root / "ascii_guard"
+            out_dir.mkdir()
+            out_path = out_dir / "mesh.hlsl"
+            out_path.write_text("// preserve-existing\n", encoding="ascii")
+
+            with (
+                mock.patch.object(mesh_dynamic_aot, "translate", return_value="// sym_\u00e9\n"),
+                mock.patch.object(mesh_dynamic_aot.os, "replace") as replace_mock,
+            ):
+                code, out, err = _run_main(
+                    [
+                        str(container),
+                        "--geometry-word-count",
+                        "2",
+                        "--llvm",
+                        "mock-llvm.dll",
+                        "--output",
+                        str(out_path),
+                    ]
+                )
+
+            replace_mock.assert_not_called()
+            self.assertEqual(code, 1)
+            self.assertEqual(out, "")
+            self.assertNotIn("Traceback", err)
+            self.assertIn("UnicodeEncodeError:", err)
+            self.assertEqual(out_path.read_text(encoding="ascii"), "// preserve-existing\n")
+            self.assertEqual([p.name for p in out_dir.iterdir()], ["mesh.hlsl"])
+
 
 if __name__ == "__main__":
     unittest.main()

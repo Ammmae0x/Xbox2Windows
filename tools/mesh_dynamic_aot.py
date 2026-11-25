@@ -457,6 +457,7 @@ def translate(blob, geometry_word_count, library, sampler_heap_sgpr=None, vs_out
 
 
 def _same_path(left: Path, right: Path) -> bool:
+    # resolve() handles a not-yet-existing output path; samefile() handles case/link aliases on Windows.
     if left.resolve() == right.resolve():
         return True
     return left.exists() and right.exists() and left.samefile(right)
