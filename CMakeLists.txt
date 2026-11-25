@@ -3513,6 +3513,39 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_avx_move_mem_original_lifted>"
         "$<TARGET_FILE:cpu_avx_move_mem_altered_lifted>")
     set_tests_properties(cpu_aot_avx_move_mem PROPERTIES SKIP_RETURN_CODE 77)
+    set(cpu_avx_move_ext_mem_exports
+        "op_vblendpd_xmm_mem,op_vblendpd_ymm_mem,op_vblendps_xmm_mem,op_vblendps_ymm_mem,"
+        "op_vblendvpd_xmm_mem,op_vblendvpd_ymm_mem,op_vblendvps_xmm_mem,op_vblendvps_ymm_mem,"
+        "op_vextractf128_mem_lo,op_vextractf128_mem_hi,op_vextractf128_mem_disp,"
+        "op_vinsertf128_mem_lo,op_vinsertf128_mem_hi,op_vextractps_mem,op_vinsertps_mem,"
+        "op_vperm2f128_mem,op_vpermilpd_imm_xmm_mem,op_vpermilpd_imm_ymm_mem,op_vpermilpd_var_ymm_mem,"
+        "op_vpermilps_imm_xmm_mem,op_vpermilps_imm_ymm_mem,op_vpermilps_var_ymm_mem,"
+        "op_vshufpd_xmm_mem,op_vshufpd_ymm_mem,op_vshufps_xmm_mem,op_vshufps_ymm_mem,"
+        "op_vunpcklpd_xmm_mem,op_vunpcklpd_ymm_mem,op_vunpckhpd_xmm_mem,op_vunpckhpd_ymm_mem,"
+        "op_vunpcklps_xmm_mem,op_vunpcklps_ymm_mem,op_vunpckhps_xmm_mem,op_vunpckhps_ymm_mem,"
+        "op_vmovddup_xmm_mem,op_vmovddup_ymm_mem,op_vmovshdup_xmm_mem,op_vmovshdup_ymm_mem,"
+        "op_vmovsldup_xmm_mem,op_vmovsldup_ymm_mem,op_discarded_mem_read")
+    string(CONCAT cpu_avx_move_ext_mem_exports ${cpu_avx_move_ext_mem_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_move_ext_mem_${variant} avx_move_ext_mem)
+        set(avx_move_ext_mem_lifted "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_move_ext_mem_${variant}_lifted.cpp")
+        add_custom_command(OUTPUT "${avx_move_ext_mem_lifted}"
+            COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tools/cpu_avx_move_aot.py"
+                "$<TARGET_FILE:cpu_avx_move_ext_mem_${variant}>" "${cpu_avx_move_ext_mem_exports}"
+                "${avx_move_ext_mem_lifted}" --mem-ops
+            DEPENDS cpu_avx_move_ext_mem_${variant} tools/cpu_avx_move_aot.py tools/cpu_leaf_aot.py tools/cpu_ranges.py
+            VERBATIM)
+        add_library(cpu_avx_move_ext_mem_${variant}_lifted SHARED "${avx_move_ext_mem_lifted}")
+    endforeach()
+    target_compile_definitions(cpu_avx_move_ext_mem_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_avx_move_ext_mem COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_move_ext_mem_check.py"
+        "$<TARGET_FILE:cpu_avx_move_ext_mem_original>"
+        "$<TARGET_FILE:cpu_avx_move_ext_mem_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_move_ext_mem_altered_lifted>")
+    set_tests_properties(cpu_aot_avx_move_ext_mem PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx_move_ext_mem.txt")
     set(cpu_avx_pcmpstr_exports
         "vpcmpestri_ub_eqany_pos_lsb,vpcmpestri_sw_ranges_neg_msb,vpcmpestri_sb_eqeach_mpos_msb,"
         "vpcmpestri_uw_eqord_mneg_lsb,vpcmpestri_mem_ub_eqany_pos_lsb,vpcmpestri_alias_xmm0,"
