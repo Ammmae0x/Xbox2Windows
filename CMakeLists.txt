@@ -10113,6 +10113,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_BINARY_DIR}/triangle_vs.cso" "${DXC_BIN_DIR}/dxil.dll")
     set_tests_properties(shader_metadata_probe PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME shader_metadata_controls COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/shader_probe_check.py")
+    add_test(NAME shader_rdna_cvt_pk_u8_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/rdna_cvt_pk_u8_cli_check.py")
+    set_tests_properties(shader_rdna_cvt_pk_u8_cli_check PROPERTIES TIMEOUT 60)
     add_test(NAME shader_metadata_census COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/shader_census_check.py")
     add_test(NAME shader_profile_audit_check COMMAND "${INTAKE_PYTHON}" -B
