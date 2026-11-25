@@ -208,6 +208,18 @@ class FfxDispatchProfileCliNegativeAndMutationTests(unittest.TestCase):
             self.assertIn("unpack requires a buffer of 4 bytes", err)
             self.assertFalse(out_dir.exists())
 
+    def test_output_file_collision_preserves_image_and_other_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image, original, _, digest = _write_synthetic_image(root, "initializer.bin")
+            with mock.patch.object(ffx_dispatch_profile, "UPSCALER", digest):
+                code, _, err = _run_main([str(image), str(root)])
+
+            self.assertEqual(code, 1)
+            self.assertIn("Output file collides with image", err)
+            self.assertEqual(image.read_bytes(), original)
+            self.assertEqual(list(root.iterdir()), [image])
+
     def test_output_directory_collision_with_image_resolve_and_samefile(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

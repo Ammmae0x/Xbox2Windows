@@ -148,14 +148,18 @@ def main(argv=None) -> int:
             raise ValueError(f"Output directory is not a directory: {args.output_directory}")
         with checked_image(args.image, UPSCALER) as pe:
             programs = list(inspect(pe))
+        outputs = [(args.output_directory / f"{name}.bin", code) for name, code in programs]
+        for destination, _ in outputs:
+            if _same_path(destination, args.image):
+                raise ValueError(f"Output file collides with image: {destination}")
         args.output_directory.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=args.output_directory) as staging_dir:
             staging_root = Path(staging_dir)
             staged = []
-            for name, code in programs:
-                staging_path = staging_root / f"{name}.bin"
+            for destination, code in outputs:
+                staging_path = staging_root / destination.name
                 staging_path.write_bytes(code)
-                staged.append((staging_path, args.output_directory / f"{name}.bin"))
+                staged.append((staging_path, destination))
             for staging_path, destination in staged:
                 os.replace(staging_path, destination)
     except (OSError, ValueError, struct.error, pefile.PEFormatError) as exc:
