@@ -27,6 +27,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME pyc_main_entry COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/pyc_main_check.py")
     set_tests_properties(pyc_main_entry PROPERTIES TIMEOUT 60)
+    add_test(NAME ci_run_checks_parallel_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/run_checks_parallel_cli_check.py")
 endif()
 
 set(DSTORAGE_SDK_ROOT "" CACHE PATH "Extracted Microsoft.Direct3D.DirectStorage NuGet package")
