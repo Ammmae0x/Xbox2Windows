@@ -5281,6 +5281,29 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(cpu_aot_avx_int_ymm_pack PROPERTIES
         SKIP_RETURN_CODE 77
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx_int_ymm_pack.txt")
+    # cpu_avx_int_ymm_widen_unpack_checks
+    set(cpu_avx_int_ymm_widen_unpack_exports
+        "op_vpmovsxbw_ymm,op_vpmovsxbd_ymm,op_vpmovsxbq_ymm,op_vpmovsxwd_ymm,op_vpmovsxwq_ymm,op_vpmovsxdq_ymm,"
+        "op_vpmovzxbw_ymm,op_vpmovzxbd_ymm,op_vpmovzxbq_ymm,op_vpmovzxwd_ymm,op_vpmovzxwq_ymm,op_vpmovzxdq_ymm,"
+        "op_vpunpckldq_ymm,op_vpunpckhdq_ymm,op_vpunpcklqdq_ymm,op_vpunpckhqdq_ymm,"
+        "op_vpmovsxbd_ymm_stale_dst,op_vpmovsxbw_ymm_alias,op_vpmovzxdq_ymm_alias,"
+        "op_vpunpckldq_ymm_dst_src1,op_vpunpckhqdq_ymm_dst_src2,op_vpunpckhdq_ymm_all,"
+        "op_vpmovsxwd_ymm_then_xmm_vpunpcklqdq,op_chain_ymm_widen_unpack")
+    string(CONCAT cpu_avx_int_ymm_widen_unpack_exports ${cpu_avx_int_ymm_widen_unpack_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_int_ymm_widen_unpack_${variant} avx_int_ymm_widen_unpack)
+        cpu_translation(cpu_avx_int_ymm_widen_unpack_${variant} cpu_avx_int_aot "${cpu_avx_int_ymm_widen_unpack_exports}")
+    endforeach()
+    target_compile_definitions(cpu_avx_int_ymm_widen_unpack_altered PRIVATE ALTER_YMM)
+    add_test(NAME cpu_aot_avx_int_ymm_widen_unpack COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_int_ymm_widen_unpack_check.py"
+        "$<TARGET_FILE:cpu_avx_int_ymm_widen_unpack_original>"
+        "$<TARGET_FILE:cpu_avx_int_ymm_widen_unpack_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_int_ymm_widen_unpack_altered>"
+        "$<TARGET_FILE:cpu_avx_int_ymm_widen_unpack_altered_lifted>")
+    set_tests_properties(cpu_aot_avx_int_ymm_widen_unpack PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx_int_ymm_widen_unpack.txt")
     set(cpu_avx_move_exports
         "op_andpd_xmm,op_andpd_ymm,op_andps_xmm,op_andps_ymm,op_andnpd_xmm,op_andnpd_ymm,"
         "op_andnps_xmm,op_andnps_ymm,op_orpd_xmm,op_orpd_ymm,op_orps_xmm,op_orps_ymm,"
