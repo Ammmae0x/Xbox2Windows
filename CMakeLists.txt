@@ -7952,6 +7952,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         --host $<TARGET_FILE:ffx_pass26_lds> --backend warp)
     add_test(NAME ffx_dispatch_profile_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/ffx_dispatch_profile_check.py")
+    add_test(NAME ffx_dispatch_profile_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/ffx_dispatch_profile_cli_check.py")
     add_test(NAME ffx_dispatch_aot_cli_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/ffx_dispatch_aot_cli_check.py")
     add_test(NAME sampled_coverage_aot_cli_check COMMAND "${INTAKE_PYTHON}" -B
