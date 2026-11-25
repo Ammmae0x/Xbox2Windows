@@ -111,7 +111,7 @@ class ShaderProfileAuditCliPositiveTests(unittest.TestCase):
             self.assertEqual({dst.resolve() for _, dst in seen_replaces}, {p.resolve() for p in expected_files})
             for path in expected_files:
                 self.assertTrue(path.is_file(), f"missing emitted file: {path}")
-                self.assertEqual([p.name for p in path.parent.iterdir()], [path.name] if path.parent != source_dir else sorted(["general", "store", "point-mesh", "s9-slot0-read-probe.hlsl"]))
+                self.assertEqual(sorted(p.name for p in path.parent.iterdir()), [path.name] if path.parent != source_dir else sorted(["general", "store", "point-mesh", "s9-slot0-read-probe.hlsl"]))
 
             # Second run atomically overwrites stale contents with zero leftover temp dirs.
             for path in expected_files:
