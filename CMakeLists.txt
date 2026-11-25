@@ -3702,7 +3702,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "op_cvtpd2pi_reg,op_cvtpd2pi_mem,op_cvtpd2pi_mem_disp,"
         "op_cvttpd2pi_reg,op_cvttpd2pi_mem,"
         "op_movdq2q,op_movq2dq,op_emms_standalone,"
-        "op_movq_reg_mem,op_movdqa_reg_ls,op_movdqu_reg_ls,op_mmx_sse2_bridge")
+        "op_movq_reg_mem,op_movdqa_reg_ls,op_movdqu_reg_ls,op_mmx_sse2_bridge,"
+        "op_cvtpi2pd_reg,op_cvtpi2pd_mem,op_cvtpi2pd_mem_disp,"
+        "op_cvtpi2pd_discarded_read,op_cvtpi2pd_bridge")
     string(CONCAT cpu_mmx_sse2_exports ${cpu_mmx_sse2_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_mmx_sse2_${variant} mmx_sse2)
