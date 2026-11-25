@@ -9565,6 +9565,110 @@ DPP_F16_CVT_WORDS = [
     "v_mov_b32_sdwa v15, v27 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
 ]
 
+# Quad-local DPP16 and DPP8 binary16 arithmetic (add/sub/subrev/mul) and rounding (floor/ceil/trunc/rndne)
+# fixtures under the low-16-only and static finite-proof contract (#839). All inputs carry noisy upper-16
+# halves, destinations are preloaded with non-zero sentinels, and results cover subnormals, signed zero,
+# ties-to-even rounding, half16 chaining, and DPP16 bit-15 abs/neg modifiers.
+DPP_F16_ARITH_ROUND_PROGRAMS = {
+    "arith_dpp16": [
+        "v_mov_b32_e32 v20, 0xdead3e00",  # +1.5
+        "v_mov_b32_e32 v21, 0xbeefc200",  # -3.0
+        "v_mov_b32_e32 v22, 0x12343800",  # +0.5
+        "v_mov_b32_e32 v23, 0x56780003",  # subnormal 3 * 2^-24
+        "v_mov_b32_e32 v24, 0x3f400000",
+        "v_mov_b32_e32 v25, 0xdeadbeef",
+        "v_mov_b32_e32 v26, 0xc0a00000",
+        "v_mov_b32_e32 v27, 0x41200000",
+        "v_add_f16_dpp v24, -v20, |v21| quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_sub_f16_dpp v25, |v21|, v22 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+        "v_subrev_f16_dpp v26, v22, -v20 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+        "v_mul_f16_dpp v27, v23, v24 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+        "v_mov_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v13, v25 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v14, v26 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v15, v27 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    ],
+    "arith_dpp8": [
+        "v_mov_b32_e32 v20, 0xdead8000",  # -0.0
+        "v_mov_b32_e32 v21, 0xbeef8000",  # -0.0
+        "v_mov_b32_e32 v22, 0x12343c00",  # +1.0
+        "v_mov_b32_e32 v23, 0x56784100",  # +2.5
+        "v_mov_b32_e32 v28, 0x9abc0005",  # subnormal 5 * 2^-24
+        "v_mov_b32_e32 v24, 0x3f400000",
+        "v_add_f16_dpp v24, v20, v21 dpp8:[1,2,3,0,5,6,7,4]",
+        "v_sub_f16_dpp v25, v22, v23 dpp8:[2,3,0,1,6,7,4,5]",
+        "v_subrev_f16_dpp v26, v22, v23 dpp8:[3,2,1,0,7,6,5,4]",
+        "v_mul_f16_dpp v27, v28, v26 dpp8:[1,0,3,2,5,4,7,6]",
+        "v_mov_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v13, v25 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v14, v26 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v15, v27 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    ],
+    "round_dpp16": [
+        "v_mov_b32_e32 v20, 0xdead3d00",  # +1.25
+        "v_mov_b32_e32 v21, 0xbeefb400",  # -0.25
+        "v_mov_b32_e32 v22, 0x12343e00",  # +1.5
+        "v_mov_b32_e32 v23, 0x5678c100",  # -2.5
+        "v_mov_b32_e32 v24, 0xdeadbeef",
+        "v_floor_f16_dpp v24, -v20 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf",
+        "v_ceil_f16_dpp v25, -|v21| quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf",
+        "v_trunc_f16_dpp v26, -v22 quad_perm:[3,2,1,0] row_mask:0xf bank_mask:0xf",
+        "v_rndne_f16_dpp v27, |v23| quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+        "v_mov_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v13, v25 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v14, v26 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v15, v27 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    ],
+    "round_dpp8": [
+        "v_mov_b32_e32 v20, 0xdead0001",  # smallest positive subnormal 2^-24
+        "v_mov_b32_e32 v21, 0xbeefb800",  # -0.5
+        "v_mov_b32_e32 v22, 0x12343e00",  # +1.5
+        "v_mov_b32_e32 v24, 0x3f400000",
+        "v_floor_f16_dpp v24, v20 dpp8:[1,2,3,0,5,6,7,4]",
+        "v_ceil_f16_dpp v25, v20 dpp8:[2,3,0,1,6,7,4,5]",
+        "v_trunc_f16_dpp v26, v21 dpp8:[3,2,1,0,7,6,5,4]",
+        "v_rndne_f16_dpp v27, v22 dpp8:[1,0,3,2,5,4,7,6]",
+        "v_mov_b32_sdwa v12, v24 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v13, v25 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v14, v26 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+        "v_mov_b32_sdwa v15, v27 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
+    ],
+}
+DPP_F16_ARITH_ROUND_EXPECTED = {
+    "arith_dpp16": (0x3e00, 0x4100, 0xc000, 0x0004),
+    "arith_dpp8": (0x8000, 0xbe00, 0x3e00, 0x0008),
+    "round_dpp16": (0xc000, 0x8000, 0xbc00, 0x4000),
+    "round_dpp8": (0x0000, 0x3c00, 0x8000, 0x4000),
+}
+# Op and modifier mutations for the four DPP16/DPP8 arithmetic and rounding draw programs; each
+# mutation changes at least one exported channel by at least 1.0 in numerical value (never relying
+# on a signed-zero-only delta across fsub %x, -0.0).
+DPP_F16_ARITH_ROUND_MUTATIONS = {
+    "arith_dpp16": (
+        ("v_add_f16_dpp v24, -v20, |v21|", "v_add_f16_dpp v24, v20, |v21|"),
+        ("v_add_f16_dpp v24, -v20, |v21|", "v_add_f16_dpp v24, -v20, v21"),
+        ("v_sub_f16_dpp v25", "v_subrev_f16_dpp v25"),
+        ("v_subrev_f16_dpp v26", "v_sub_f16_dpp v26"),
+        ("v_mul_f16_dpp v27", "v_add_f16_dpp v27"),
+    ),
+    "arith_dpp8": (
+        ("v_add_f16_dpp v24, v20, v21", "v_add_f16_dpp v24, v20, v22"),
+        ("v_sub_f16_dpp v25", "v_subrev_f16_dpp v25"),
+        ("v_sub_f16_dpp v25", "v_add_f16_dpp v25"),
+        ("v_mul_f16_dpp v27", "v_add_f16_dpp v27"),
+    ),
+    "round_dpp16": (
+        ("v_floor_f16_dpp v24, -v20", "v_floor_f16_dpp v24, v20"),
+        ("v_ceil_f16_dpp v25", "v_floor_f16_dpp v25"),
+        ("v_trunc_f16_dpp v26", "v_floor_f16_dpp v26"),
+        ("v_rndne_f16_dpp v27, |v23|", "v_rndne_f16_dpp v27, v23"),
+    ),
+    "round_dpp8": (
+        ("v_ceil_f16_dpp v25", "v_floor_f16_dpp v25"),
+        ("v_rndne_f16_dpp v27", "v_trunc_f16_dpp v27"),
+    ),
+}
+
 
 def dpp_f16_narrow16_ref(bits):
     """Exact IEEE-754 binary32-to-binary16 RNE reference matching tools/pixel_aot.py narrow16()."""
@@ -9641,12 +9745,58 @@ def check_dpp_f16_contract_controls():
         (f"v_cvt_f16_f32_dpp v23, v70 {identity}", "DPP operand v70 is read before it is written"),
         (f"v_cvt_f16_f32_dpp v256, v20 {identity}", "Invalid f16 DPP operation"),
         (f"v_fmac_f16_dpp v20, v20, v20 {identity}", "Unsupported instruction"),
-        (f"v_add_f16_dpp v23, v20, v20 {identity}", "Unsupported instruction"),
+        (f"v_min_f16_dpp v23, v20, v20 {identity}", "Unsupported instruction"),
+        (f"v_max_f16_dpp v23, v20, v20 {identity}", "Unsupported instruction"),
         (f"v_sin_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
         (f"v_cos_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
-        (f"v_floor_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
+        (f"v_fract_f16_dpp v23, v20 {identity}", "Unsupported instruction"),
     ):
         expect_value_error(translate_f16, uncompressed_export(["v_mov_b32_e32 v20, s44", bad]), message)
+    # Positive and negative controls for binary16 arithmetic & rounding DPP16/DPP8.
+    for name, body in DPP_F16_ARITH_ROUND_PROGRAMS.items():
+        prog = uncompressed_export(body)
+        hlsl = translate_f16(prog)
+        if name == "arith_dpp16":
+            assert "QuadReadAcrossX(" in hlsl and "QuadReadAcrossY(" in hlsl and "QuadReadAcrossDiagonal(" in hlsl
+            src1_lines = [line for line in hlsl.splitlines() if "_1 = " in line and "uint hf" in line]
+            assert len(src1_lines) == 4 and all("QuadRead" not in line for line in src1_lines), src1_lines
+        elif name == "arith_dpp8":
+            assert "QuadReadLaneAt(" in hlsl
+        for old, new in DPP_F16_ARITH_ROUND_MUTATIONS[name]:
+            mutated = [line.replace(old, new) for line in prog]
+            assert mutated != prog, (name, old)
+            assert translate_f16(mutated) != hlsl, (name, old, new)
+    proven_pair = ["v_mov_b32_e32 v20, 0x3c00", "v_mov_b32_e32 v21, 0x4000"]
+    arith_ok = uncompressed_export([*proven_pair, f"v_add_f16_dpp v24, v20, v21 {identity}",
+                                    f"v_mov_b32_sdwa v12, v24 {sdwa}WORD_0"])
+    round_ok = uncompressed_export([*proven_pair, f"v_floor_f16_dpp v24, v20 {identity}",
+                                    f"v_mov_b32_sdwa v12, v24 {sdwa}WORD_0"])
+    expect_value_error(translate_int, arith_ok, "binary16 denormal mode unknown at entry")
+    expect_value_error(translate_int, round_ok, "binary16 denormal mode unknown at entry")
+    expect_value_error(translate_f16, [HALF_RTZ, *arith_ok], "under round toward zero: v_add_f16_dpp")
+    expect_value_error(translate_f16, [HALF_RTZ, *round_ok], "under round toward zero: v_floor_f16_dpp")
+    expect_value_error(translate_f16, uncompressed_export([*proven_pair, f"v_add_f16_dpp v24, v20, v21 {identity}",
+                                                           f"v_mov_b32_sdwa v12, v24 {sdwa}WORD_1"]),
+                       "Reads the undefined high half of a 16-bit result")
+    expect_value_error(translate_f16, uncompressed_export([*proven_pair, f"v_floor_f16_dpp v24, v20 {identity}",
+                                                           "v_mov_b32_e32 v12, v24"]),
+                       "Expected a numeric register")
+    for prefix, bad, message in (
+        (["v_mov_b32_e32 v20, s44"], f"v_add_f16_dpp v24, v20, v20 {identity}", "binary16 operand lacks a finite proof: v20"),
+        (["v_mov_b32_e32 v20, s44"], f"v_floor_f16_dpp v24, v20 {identity}", "binary16 operand lacks a finite proof: v20"),
+        (["v_mov_b32_e32 v20, 0x7c00"], f"v_floor_f16_dpp v24, v20 {identity}", "binary16 operand is not finite: v20"),
+        (["v_mov_b32_e32 v20, 0x7e00"], f"v_add_f16_dpp v24, v20, v20 {identity}", "binary16 operand is not finite: v20"),
+        (["v_mov_b32_e32 v20, 0x7bff"], f"v_add_f16_dpp v24, v20, v20 {identity}", "binary16 result overflows: v_add_f16_dpp"),
+        (["v_mov_b32_e32 v20, 0x7bff"], f"v_mul_f16_dpp v24, v20, v20 {identity}", "binary16 result overflows: v_mul_f16_dpp"),
+        (proven_pair, "v_add_f16_dpp v24, -v20, v21 dpp8:[1,2,3,0,5,6,7,4]", "Source modifiers are not allowed on -v20"),
+        (proven_pair, "v_add_f16_dpp v24, v20, |v21| dpp8:[1,2,3,0,5,6,7,4]", "Source modifiers are not allowed on |v21|"),
+        (proven_pair, "v_floor_f16_dpp v24, -v20 dpp8:[1,2,3,0,5,6,7,4]", "Source modifiers are not allowed on -v20"),
+        (proven_pair, f"v_add_f16_dpp v256, v20, v21 {identity}", "Invalid f16 DPP operation"),
+        (proven_pair, f"v_floor_f16_dpp v256, v20 {identity}", "Invalid f16 DPP operation"),
+        (proven_pair, f"v_add_f16_dpp v24, v20, v21 {identity} bound_ctrl:1", "Unsupported DPP16 modifier bound_ctrl:1"),
+        (proven_pair, f"v_floor_f16_dpp v24, v20 {identity} fi:1", "Unsupported DPP16 modifier fi:1"),
+    ):
+        expect_value_error(translate_f16, uncompressed_export([*prefix, bad]), message)
     # Scheduling: outstanding sample and non-entry EXEC mask must refuse.
     base = uncompressed_export([])
     sample = next(i for i, line in enumerate(base) if line.startswith("image_sample"))
@@ -9741,6 +9891,31 @@ def check_dpp_f16_draw(directory, compiler, renderer, backend):
         words_src.write_text(mutated_hlsl, encoding="ascii")
         compile_shader(compiler, words_src, words_shader)
         run_pixel_batch(renderer, backend, words_shader, [(cases[0][0], "mismatch")])
+
+    # 3. Binary16 arithmetic (add/sub/subrev/mul) and rounding (floor/ceil/trunc/rndne) DPP16 & DPP8 draws,
+    # verified in both default denorm mode and binary32 -denorm ftz, plus op/modifier mutations.
+    for name, body in DPP_F16_ARITH_ROUND_PROGRAMS.items():
+        prog = uncompressed_export(body)
+        expected = DPP_F16_ARITH_ROUND_EXPECTED[name]
+        src_path = directory / f"dpp_f16_{name}.hlsl"
+        cso_path = directory / f"dpp_f16_{name}.cso"
+        pass_case = directory / f"dpp_f16_{name}_pass.case"
+        pass_case.write_bytes(bytes(256) + struct.pack("<4I", *expected) * 64 + b"\x01")
+        src_path.write_text(translate_f16(prog), encoding="ascii")
+        compile_shader(compiler, src_path, cso_path)
+        run_pixel_batch(renderer, backend, cso_path, [(pass_case, "pass")])
+        # Binary32 -denorm ftz must preserve binary16 subnormals and -0.0.
+        compile_shader(compiler, src_path, cso_path, mode="ftz")
+        run_pixel_batch(renderer, backend, cso_path, [(pass_case, "pass")])
+        for old, new in DPP_F16_ARITH_ROUND_MUTATIONS[name]:
+            mutated = [line.replace(old, new) for line in prog]
+            assert mutated != prog, (name, old)
+            src_path.write_text(translate_f16(mutated), encoding="ascii")
+            compile_shader(compiler, src_path, cso_path)
+            statuses, _ = run_pixel_batch_statuses(renderer, backend, cso_path, [pass_case])
+            print(f"dpp_f16 {name} mutation {old!r} -> {new!r}: statuses {statuses}")
+            if "mismatch" not in statuses:
+                raise AssertionError(f"dpp_f16 {name} mutation {old!r} -> {new!r} escaped detection")
     return 0
 
 
@@ -14011,7 +14186,7 @@ def check_f16_arith_controls(*, run_reference=True):
         refuse(line, "Binary16 e32 src1 must be a VGPR")
     # Forms the lowering does not accept fall through to the generic refusal, and so do the neighbouring binary16 ops.
     for line in ("v_add_f16_e64 v24, v18, v19 clamp", "v_mul_f16_e64 v24, v18, v19 mul:2", "v_mul_f16_e64 v24, v18, v19 div:2",
-                 "v_add_f16_e64 v24, v18, v19 op_sel:[0,1]", "v_add_f16_dpp v24, v18, v19 quad_perm:[0,1,2,3]",
+                 "v_add_f16_e64 v24, v18, v19 op_sel:[0,1]", "v_min_f16_dpp v24, v18, v19 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
                  "v_add_f16_sdwa v24, v18, v19 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0 src1_sel:WORD_0",
                  "v_add_f16 v24, v18, v19, v19", "v_add_f16 v24, v18", "v_min_f16_e64 v24, v18, v19",
                  "v_max_f16_e32 v24, v18, v19"):
@@ -14841,7 +15016,7 @@ def check_f16_round_controls():
     for line in ("v_floor_f16_e64 v24, v18 clamp", "v_ceil_f16_e64 v24, v18 clamp", "v_trunc_f16_e64 v24, v18 mul:2",
                  "v_rndne_f16_e64 v24, v18 div:2", "v_rndne_f16_e64 v24, v18 mul:4", "v_floor_f16_e64 v24, v18 op_sel:[0,1]",
                  "v_floor_f16_e64 v24, -v18 clamp", "v_floor_f16_e32 v24, v18 clamp",
-                 "v_floor_f16_dpp v24, v18 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                 "v_fract_f16_dpp v24, v18 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
                  "v_floor_f16_sdwa v24, v18 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0",
                  "v_floor_f16 v24, v18, v19", "v_floor_f16 v24", "v_fract_f16_e32 v24, v18", "v_rcp_f16_e32 v24, v18",
                  "v_sqrt_f16_e64 v24, v18", "v_fract_f16_e64 v24, v18"):
@@ -18371,6 +18546,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(SMOVREL_BODY), translate))
     fixtures.append((uncompressed_export(DPP_F16_CVT_LANES), translate_f16))
     fixtures.append((uncompressed_export(DPP_F16_CVT_WORDS), translate_f16))
+    fixtures.extend((uncompressed_export(body), translate_f16) for body in DPP_F16_ARITH_ROUND_PROGRAMS.values())
     fixtures.extend((bit_program(op), translate) for op in BIT_OPERATIONS)
     fixtures.extend((program, function) for _, program, function, _ in e64_spelling_programs())
     fixtures.append((vop1_nop_program(), translate))

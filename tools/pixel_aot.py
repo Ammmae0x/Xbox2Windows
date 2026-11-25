@@ -2298,6 +2298,48 @@ def dpp_vgpr(token, vector, sample_dest, *, allow_mods):
     return value, use_abs, neg
 
 
+def half16_dpp_source(token, vector, sample_dest, known_ssa_bits, known_half, *, allow_mods):
+    """Parse one DPP VGPR source of a binary16 VOP1/VOP2 op under the static finite-proof contract.
+
+    Accepts a VGPR holding either a statically known word (known_ssa_bits) or a proven binary16
+    half16 result (known_half), with optional bit-15 abs/neg modifiers on DPP16 (refused on DPP8).
+    """
+    neg = False
+    use_abs = False
+    raw = token
+    if raw.startswith("-"):
+        if not allow_mods:
+            raise ValueError(f"Source modifiers are not allowed on {token}")
+        neg = True
+        raw = raw[1:]
+    if m := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", raw):
+        if not allow_mods:
+            raise ValueError(f"Source modifiers are not allowed on {token}")
+        use_abs = True
+        raw = m.group(1) or m.group(2)
+    m = re.fullmatch(r"v(\d+)", raw)
+    if not m or not 0 <= int(m.group(1)) <= 255:
+        raise ValueError(f"DPP operand must be a VGPR, got {token}")
+    if raw not in vector:
+        raise ValueError(f"DPP operand {raw} is read before it is written")
+    if raw in sample_dest:
+        raise ValueError("Sample used before vmcnt wait")
+    value = vector[raw]
+    if isinstance(value, str) and value in known_ssa_bits:
+        ssa_var, bits = value, known_ssa_bits[value] & 0xffff
+    elif (name := half16_name(raw, vector)) is not None and name in known_half:
+        ssa_var, bits = name, known_half[name] & 0xffff
+    else:
+        raise ValueError(f"binary16 operand lacks a finite proof: {raw}")
+    if (bits >> 10) & 0x1f == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: {raw}")
+    if use_abs:
+        bits &= 0x7fff
+    if neg:
+        bits ^= 0x8000
+    return ssa_var, bits, use_abs, neg
+
+
 def parse_dpp(rest, operand_count):
     """Parse operands and quad-local DPP16 (quad_perm) or DPP8 (dpp8) modifiers."""
     parts_ = rest.split(", ")
@@ -5785,6 +5827,67 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 bits = f"({bits} ^ 0x80000000u)"
             vector[dst] = ("half16", f"alu{i}")
             lines.append(f"    precise float alu{i} = asfloat(narrow16(asfloat({bits})));")
+        elif m := match(rf"v_({'|'.join(VOP2_F16)})_f16_dpp (v\d+), (.+)"):
+            # Quad-local DPP16/DPP8 binary16 VOP2 arithmetic under the shared low-16-only and
+            # static finite-proof contract (#839): src0 is quad-swizzled via emit_quad_swizzle_u32,
+            # src1 stays on the current lane, DPP16 allows bit-15 abs/neg modifiers on either source
+            # (refused on DPP8), and the destination is tagged ("half16", alu) with its proven bits.
+            name, dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid f16 DPP operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 2)
+            s0_val, b0, abs0, neg0 = half16_dpp_source(
+                tokens[0], vector, sample_dest, known_ssa_bits, known_half, allow_mods=not is_dpp8)
+            s1_val, b1, abs1, neg1 = half16_dpp_source(
+                tokens[1], vector, sample_dest, known_ssa_bits, known_half, allow_mods=not is_dpp8)
+            result = f16_vop2_result(name, b0, b1)
+            if result is None:
+                raise ValueError(f"binary16 result overflows: v_{name}_f16_dpp")
+            s0_bits = f"(({emit_quad_swizzle_u32(lines, i, s0_val, perm)}) & 0xffffu)"
+            if abs0:
+                s0_bits = f"({s0_bits} & 0x7fffu)"
+            if neg0:
+                s0_bits = f"({s0_bits} ^ 0x8000u)"
+            s1_bits = f"(asuint({s1_val}) & 0xffffu)"
+            if abs1:
+                s1_bits = f"({s1_bits} & 0x7fffu)"
+            if neg1:
+                s1_bits = f"({s1_bits} ^ 0x8000u)"
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    uint hf{i}_1 = {s1_bits};")
+            expression = VOP2_F16[name].format(f"widen16(hf{i}_0)", f"widen16(hf{i}_1)")
+            lines.append(f"    precise float hs{i} = {expression};")
+            lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
+            vector[dst] = ("half16", f"alu{i}")
+            known_half[f"alu{i}"] = result
+        elif m := match(rf"v_({'|'.join(VOP1_F16_ROUND)})_f16_dpp (v\d+), (.+)"):
+            # Quad-local DPP16/DPP8 binary16 VOP1 rounding under the same low-16-only and
+            # static finite-proof contract (#839).
+            name, dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid f16 DPP operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 1)
+            s0_val, b0, abs0, neg0 = half16_dpp_source(
+                tokens[0], vector, sample_dest, known_ssa_bits, known_half, allow_mods=not is_dpp8)
+            result = f16_round_result(name, b0)
+            s0_bits = f"(({emit_quad_swizzle_u32(lines, i, s0_val, perm)}) & 0xffffu)"
+            if abs0:
+                s0_bits = f"({s0_bits} & 0x7fffu)"
+            if neg0:
+                s0_bits = f"({s0_bits} ^ 0x8000u)"
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    precise float hs{i} = {VOP1_F16_ROUND[name].format(f'widen16(hf{i}_0)')};")
+            lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
+            vector[dst] = ("half16", f"alu{i}")
+            known_half[f"alu{i}"] = result
         elif m := match(rf"v_({'|'.join(DPP_INT32)})_dpp (v\d+), (.+)"):
             op, dst, rest = m.groups()
             arity, template, helper = DPP_INT32[op]

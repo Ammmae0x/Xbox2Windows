@@ -864,6 +864,10 @@ def check_parsing():
            "x PROC FRAME\n    .endprolog\nIFDEF A\n    jae short l\nELSE\n    jnz short l\nENDIF\n"
            "l:  mov DWORD PTR [rdx], eax ; c\ng:: ud2\n    emit rax\nvalue DQ 0\n    dd 1\n    ret\nx ENDP\nEND\n")
     assert fc.masm_mnemonics(asm) == {"cmpxchg", "movsb", "jae", "jne", "mov", "ud2", "ret"}, fc.masm_mnemonics(asm)
+    # Anonymous labels, conditional-assembly directives and assembly-time assignments are not instructions.
+    pseudo_ops_asm = ("@@:\n    mov eax, ecx\n    jmp @b\nword_index = 0\n"
+                      "REPT 2\n    nop\nENDM\nIFIDNI <a>, <b>\n    ret\nENDIF\n")
+    assert fc.masm_mnemonics(pseudo_ops_asm) == {"mov", "jmp", "nop", "ret"}, fc.masm_mnemonics(pseudo_ops_asm)
     with tempfile.TemporaryDirectory() as tmp:
         isolated = fc.measure({}, sample_repo(tmp, {"branch": asm}))["x64_zen2"]
         assert isolated["fixture_forms_not_in_reference"] == [], isolated["fixture_forms_not_in_reference"]
@@ -873,6 +877,7 @@ def check_parsing():
     assert full["x64_zen2"]["covered"] == full["gfx1013"]["covered"] == 0
     unmatched = full["x64_zen2"]["fixture_forms_not_in_reference"]
     assert {"delta", "local", "plane_request"}.isdisjoint(unmatched), unmatched
+    assert unmatched == [], unmatched
 
 
 def check_junit_errors():
@@ -1362,6 +1367,42 @@ def check_sdwa_cmp_coverage():
         assert ("SDWA", "v_cmp_lt_f16_sdwa") not in fc.gfx_forms(stripped, reference), name
 
 
+def check_dpp_f16_arith_round_forms():
+    """The 16 quad-local DPP16/DPP8 binary16 arithmetic and rounding forms count as covered once
+    the translator accepts their fixtures; unlowered f16 DPP/SDWA neighbours stay uncovered."""
+    import pixel_aot_check as pixel
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        for body in pixel.DPP_F16_ARITH_ROUND_PROGRAMS.values():
+            pixel.translate_f16(pixel.uncompressed_export(body))
+        ops = ("add", "sub", "subrev", "mul", "floor", "ceil", "trunc", "rndne")
+        forms = {(group, f"v_{op}_f16_dpp") for group in ("DPP16", "DPP8") for op in ops}
+        assert len(forms) == 16
+        neighbours = {
+            ("DPP16", "v_min_f16_dpp"), ("DPP8", "v_min_f16_dpp"),
+            ("DPP16", "v_max_f16_dpp"), ("DPP8", "v_max_f16_dpp"),
+            ("DPP16", "v_fract_f16_dpp"), ("DPP8", "v_fract_f16_dpp"),
+            ("DPP16", "v_fmac_f16_dpp"), ("DPP8", "v_fmac_f16_dpp"),
+            ("DPP16", "v_ldexp_f16_dpp"), ("DPP8", "v_ldexp_f16_dpp"),
+            ("SDWA", "v_add_f16_sdwa"), ("SDWA", "v_floor_f16_sdwa"),
+        }
+        for name in ("gfx1013.tsv", "rdna2.tsv"):
+            reference = fc.load_reference(name)
+            assert forms <= reference, (name, sorted(forms - reference))
+            assert neighbours <= reference, (name, sorted(neighbours - reference))
+            covered = fc.gfx_forms(pixel.ACCEPTED, reference)
+            assert forms <= covered, (name, sorted(forms - covered))
+            assert not (neighbours & covered), (name, sorted(neighbours & covered))
+        # Control: removing one opcode removes both its DPP16 and DPP8 forms from the count.
+        stripped = pixel.ACCEPTED - {"v_add_f16_dpp"}
+        assert not {("DPP16", "v_add_f16_dpp"), ("DPP8", "v_add_f16_dpp")} & fc.gfx_forms(
+            stripped, fc.load_reference("gfx1013.tsv"))
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
@@ -1382,6 +1423,7 @@ if __name__ == "__main__":
     check_f16_fmac_ldexp_forms()
     check_f16_cvt_int16_forms()
     check_f16_to_int16_forms()
+    check_dpp_f16_arith_round_forms()
     check_swap_coverage()
     check_pk_fmac_coverage()
     check_sdwa_cmp_coverage()

@@ -2697,12 +2697,16 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             sbase_str = f"s[{sbase}:{sbase + base_width - 1}]"
         soffset = (w1 >> 25) & 0x7f
         imm_offset = w1 & 0x1fffff
+        if imm_offset & 0x100000:
+            # GFX9+ SMEM OFFSET[20:0] is a signed 21-bit byte offset (LLVM sign-extends it)
+            imm_offset -= 0x200000
+        imm_str = f"-0x{-imm_offset:x}" if imm_offset < 0 else f"0x{imm_offset:x}"
         if soffset == 125:
-            off_str = f"0x{imm_offset:x}"
+            off_str = imm_str
         else:
             off_str = decode_s_reg(soffset)
             if imm_offset:
-                off_str += f" offset:0x{imm_offset:x}"
+                off_str += f" offset:{imm_str}"
         mods = []
         if (w0 >> 16) & 1:
             mods.append("glc")
@@ -2737,9 +2741,13 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             deriv_addrs = 0
         addr_count = base_addrs + extra_addrs + deriv_addrs
         a16 = (w1 >> 30) & 1
-        packed_load_2d = a16 and op_name == "image_load" and dim_name == "SQ_RSRC_IMG_2D"
-        if packed_load_2d:
-            addr_count = 1  # The two unsigned coordinates share a VGPR.
+        packed_2d = (
+            a16
+            and op_name in ("image_load", "image_sample", "image_sample_lz")
+            and dim_name == "SQ_RSRC_IMG_2D"
+        )
+        if packed_2d:
+            addr_count = 1  # Two 16-bit 2D coordinates share one VGPR.
         d16 = (w1 >> 31) & 1
         # A gather returns the four texels of the selected component whatever the one-hot mask is.
         n_data = 4 if op_name.startswith("image_gather4") else max(1, bin(dmask).count("1"))
@@ -2782,7 +2790,7 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             mods.append("a16")
         if d16:
             mods.append("d16")
-        if packed_load_2d and nsize:
+        if packed_2d and nsize:
             mods.append("invalid_nsa")  # A single address VGPR requires no NSA extension.
         # Word 0 bits 6 and 14 and word 1 bits 29:26 are reserved on gfx10: LLVM assembles none of them and
         # ignores them when disassembling, so a set bit is surfaced instead of vanishing from the listing.
