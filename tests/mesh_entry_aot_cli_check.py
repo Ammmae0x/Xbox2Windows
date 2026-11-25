@@ -381,7 +381,7 @@ class MeshEntryAotCliNegativeAndMutationTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 1, proc.stderr)
             self.assertNotIn("Traceback", proc.stderr)
-            self.assertIn("Unsupported amplification stage", proc.stderr)
+            self.assertIn("ValueError: Unsupported amplification stage", proc.stderr)
             self.assertFalse(out_path.parent.exists())
 
             # Every guarded exception type in except (...) dies if removed.
@@ -407,7 +407,7 @@ class MeshEntryAotCliNegativeAndMutationTests(unittest.TestCase):
                     self.assertEqual(code, 1)
                     self.assertEqual(out, "")
                     self.assertNotIn("Traceback", err)
-                    self.assertIn(str(exc), err)
+                    self.assertIn(f"{type(exc).__name__}: {exc}", err)
                     self.assertFalse(out_path.parent.exists())
 
     def test_os_replace_and_staging_write_failures_leave_zero_temp_dirs(self):

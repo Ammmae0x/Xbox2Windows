@@ -1179,7 +1179,7 @@ def main(argv=None) -> int:
             staged.write_text(src, encoding="ascii")
             os.replace(staged, a.output)
     except (OSError, ValueError, KeyError, json.JSONDecodeError, struct.error, zlib.error) as exc:
-        p.exit(1, f"{exc}\n")
+        p.exit(1, f"{type(exc).__name__}: {exc}\n")
     return 0
 
 
