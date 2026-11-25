@@ -213,6 +213,25 @@ static bool destination_writable(const void* destination, std::size_t bytes)
     return x2w_local::committed_writable(destination, bytes);
 }
 
+// Copies bytes of data into a plain-memory destination whose whole declared capacity must be writable. With
+// xmem.dll loaded, x2w_xmem_copy_to_destination makes the check and the copy under XMem's mapping mutex, so an
+// XMem run break (the pages of a shared view unmapped and mapped again) can neither make a mapped destination
+// look reserved nor take it away during the copy. Without xmem.dll the check and the copy run here.
+// ERROR_SUCCESS; ERROR_NOACCESS when the destination is not writable (nothing written); another error when the
+// copy faulted.
+static DWORD copy_to_destination(void* destination, std::size_t capacity, const void* data, std::size_t bytes)
+{
+    using CopyToDestination = BOOL(WINAPI*)(void*, SIZE_T, const void*, SIZE_T);
+    static const CopyToDestination copy = [] {
+        const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+        return xmem ? reinterpret_cast<CopyToDestination>(GetProcAddress(xmem, "x2w_xmem_copy_to_destination")) : nullptr;
+    }();
+    if (copy) return copy(destination, capacity, data, bytes) ? ERROR_SUCCESS : GetLastError();
+    if (!destination_writable(destination, capacity)) return ERROR_NOACCESS;
+    std::memcpy(destination, data, bytes);
+    return ERROR_SUCCESS;
+}
+
 // Return the exact queued requests that continue this stream in this submission, in queue order.
 // Status entries and requests for unrelated files are skipped. In the same file, any non-matching
 // size, non-consecutive offset, or submission boundary ends the continuation chain (Refs #1136, #1144, #1198, #1214).
@@ -930,11 +949,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 // The title's destination can be smaller in memory than its declared capacity (#870:
                 // a write fault inside this copy). Judge the whole declared capacity before the first
                 // byte is written, so a refusal leaves every page untouched.
-                if (destination_writable(destination, destination_capacity)) {
-                    std::memcpy(destination, data, decode_length);
-                } else {
-                    outcome = "destination not writable";
-                    failure = StorageFailure::destination_not_writable;
+                const DWORD copied = copy_to_destination(destination, destination_capacity, data, decode_length);
+                if (copied != ERROR_SUCCESS) {
+                    outcome = copied == ERROR_NOACCESS ? "destination not writable" : "copy faulted (source not readable)";
+                    failure = copied == ERROR_NOACCESS ? StorageFailure::destination_not_writable : StorageFailure::other;
                     data = nullptr;
                     written = false;
                 }
