@@ -283,6 +283,7 @@ def compile_o2_and_verify(original_path, native_fns, cxx_path, pairs):
              f"/Fo{tmp / 'sse_fp_logic_o2.obj'}", f"/Fe{dll_path}"],
             capture_output=True,
             text=True,
+            errors="replace",  # cl and link can use different encodings for localized output.
         )
         if proc.returncode != 0:
             raise AssertionError(f"/O2 compile failed:\n{proc.stdout}\n{proc.stderr}")
