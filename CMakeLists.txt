@@ -10502,6 +10502,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:intake_forward>" "$<TARGET_FILE:intake_provider>")
     add_test(NAME layout_chunk_summary COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/layout_chunks_check.py")
+    add_test(NAME textures_paged_resource_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/paged_resource_check.py")
+    set_tests_properties(textures_paged_resource_check PROPERTIES TIMEOUT 60)
     add_test(NAME dependency_paths_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dependency_paths_check.py")
     add_test(NAME pe_dependency_paths_cli_check COMMAND "${INTAKE_PYTHON}" -B
