@@ -130,6 +130,13 @@ add_dependencies(startup_dstorage_break_window_check startup_stub_xcrdapi xmem_s
 add_test(NAME startup_dstorage_break_window COMMAND startup_dstorage_break_window_check
          "$<TARGET_FILE:xmem_shim_test_controls>" "$<TARGET_FILE:startup_stub_xcrdapi>")
 set_tests_properties(startup_dstorage_break_window PROPERTIES TIMEOUT 60)
+# Which copies take xmem's mapping mutex (x2w_xmem_copy_counts): with shared views, a VirtualAlloc destination copies
+# without it and one in a run with it (plain); with shared views off, an XMem page destination copies without it.
+add_test(NAME startup_dstorage_break_window_plain COMMAND startup_dstorage_break_window_check
+         "$<TARGET_FILE:xmem_shim_test_controls>" "$<TARGET_FILE:startup_stub_xcrdapi>" plain)
+add_test(NAME startup_dstorage_break_window_views_off COMMAND startup_dstorage_break_window_check
+         "$<TARGET_FILE:xmem_shim_test_controls>" "$<TARGET_FILE:startup_stub_xcrdapi>" views-off)
+set_tests_properties(startup_dstorage_break_window_plain startup_dstorage_break_window_views_off PROPERTIES TIMEOUT 60)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/startup_stubs/xcrdapi.cpp)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/startup_stubs/xcrdapi.cpp" xcrdapi_text)
 string(REPLACE "\"x2w_xmem_copy_to_destination\"" "\"x2w_xmem_copy_to_destination_control\"" xcrdapi_control_text

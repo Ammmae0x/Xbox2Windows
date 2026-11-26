@@ -10,6 +10,7 @@
 #include "startup_stubs/trap.h"
 #include "startup_stubs/profile_zone.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/resident_pages.h"
 #include "startup_stubs/inflate.h"
 #include "startup_stubs/dstorage_error_record.h"
 #include "startup_stubs/dstorage_file_read.h"
@@ -175,28 +176,6 @@ static bool has_zlib_header(const unsigned char* bytes, std::size_t size)
     return true;
 }
 
-// True when every page of [start, end) is resident and plain read-write: valid in the working set, PAGE_READWRITE
-// or PAGE_EXECUTE_READWRITE, no guard bit. One QueryWorkingSetEx per 512 pages, so the cost follows the
-// destination's size, not the region's. Reads attributes only; no page is touched.
-static bool resident_read_write(std::uintptr_t start, std::uintptr_t end)
-{
-    PSAPI_WORKING_SET_EX_INFORMATION pages[512];
-    std::uintptr_t page = start & ~std::uintptr_t{0xFFF};
-    while (page < end) {
-        DWORD count = 0;
-        for (; count < 512 && page < end; ++count, page += 0x1000) pages[count].VirtualAddress = reinterpret_cast<void*>(page);
-        if (!QueryWorkingSetEx(GetCurrentProcess(), pages, count * sizeof(pages[0]))) return false;
-        for (DWORD i = 0; i < count; ++i) {
-            const auto& page_info = pages[i].VirtualAttributes;
-            const DWORD protect = static_cast<DWORD>(page_info.Win32Protection);
-            if (!page_info.Valid || page_info.Bad || (protect & PAGE_GUARD) ||
-                ((protect & 0xFF) != PAGE_READWRITE && (protect & 0xFF) != PAGE_EXECUTE_READWRITE))
-                return false;
-        }
-    }
-    return true;
-}
-
 // True when every byte of [destination, destination + bytes) is committed and writable, with no guard or
 // no-access page in between. Nothing is written or touched. Resident read-write pages are accepted from
 // their working-set attributes; any other page (not resident, copy-on-write, guard, no access) sends the
@@ -209,14 +188,15 @@ static bool destination_writable(const void* destination, std::size_t bytes)
     const auto start = reinterpret_cast<std::uintptr_t>(destination);
     if (!destination || bytes > UINTPTR_MAX - start) return false;
     x2w_local::commit_lazy(destination, bytes);
-    if (resident_read_write(start, start + bytes)) return true;
+    if (x2w_local::resident_read_write(start, start + bytes)) return true;
     return x2w_local::committed_writable(destination, bytes);
 }
 
 // Copies bytes of data into a plain-memory destination whose whole declared capacity must be writable. With
-// xmem.dll loaded, x2w_xmem_copy_to_destination makes the check and the copy under XMem's mapping mutex, so an
-// XMem run break (the pages of a shared view unmapped and mapped again) can neither make a mapped destination
-// look reserved nor take it away during the copy. Without xmem.dll the check and the copy run here.
+// xmem.dll loaded, x2w_xmem_copy_to_destination makes the check and the copy, under XMem's mapping mutex when
+// either range overlaps one of its runs, so an XMem run break (the pages of a shared view unmapped and mapped again)
+// can neither make a mapped destination look reserved nor take it away during the copy. Without xmem.dll the check
+// and the copy run here.
 // ERROR_SUCCESS; ERROR_NOACCESS when the destination is not writable (nothing written); another error when the
 // copy faulted.
 static DWORD copy_to_destination(void* destination, std::size_t capacity, const void* data, std::size_t bytes)

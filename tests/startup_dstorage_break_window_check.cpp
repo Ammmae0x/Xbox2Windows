@@ -6,7 +6,7 @@
 // surviving page reads as reserved. The xmem build with its test controls holds an unmap in that window
 // (X2W_XMEM_TEST_HOLD_WINDOW=<name>: it sets "<name>.unmapped" and waits up to five seconds for "<name>.release").
 //
-// usage: startup_dstorage_break_window_check <xmem.dll built with its test controls> <XCRDAPI.dll>
+// usage: startup_dstorage_break_window_check <xmem.dll built with its test controls> <XCRDAPI.dll> [plain|views-off]
 // Cases, each against the real stand-in's queue with a memory source:
 // - no break: a request into a mapped page of the run lands;
 // - read-only destination: refused, nothing written (the writability check also runs on the xmem path);
@@ -15,6 +15,9 @@
 //   every byte landed. An XCRDAPI that judges the destination with its own VirtualQuery instead refuses inside the
 //   window: "FAIL break window: refused while the run was broken" (the negative control in
 //   tests/cmake/xmem_page_runs.cmake).
+// `plain` and `views-off` instead check which copies take xmem's mapping mutex (x2w_xmem_copy_counts): with shared
+// views, a request into a VirtualAlloc destination copies without it and one into the run with it; with
+// X2W_XMEM_SHARED_VIEWS unset (`views-off`), a request into an XMem page copies without it as well.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -42,6 +45,7 @@ using VirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
 using AllocatePagesFn = BOOL(WINAPI*)(ULONG_PTR, PULONG_PTR, PULONG_PTR);
 using MapPagesFn = void*(WINAPI*)(void*, ULONG_PTR, const ULONG_PTR*);
 using ScatterFn = BOOL(WINAPI*)(void* const*, ULONG_PTR, const ULONG_PTR*);
+using CopyCountsFn = BOOL(WINAPI*)(ULONGLONG*, ULONGLONG*);
 
 constexpr SIZE_T page = 65536;
 constexpr unsigned run_pages = 8;
@@ -115,17 +119,59 @@ DWORD WINAPI unmap_one(void* context)
     unmap->result = unmap->scatter(&unmap->address, 1, nullptr);  // no pages: unmap
     return 0;
 }
+
+// One request per row; the change of xmem's copy counts across it names the path the copy took.
+int copy_rows(HMODULE xmem, unsigned char* run_page, bool views_off)
+{
+    const auto counts = reinterpret_cast<CopyCountsFn>(GetProcAddress(xmem, "x2w_xmem_copy_counts"));
+    ULONGLONG locked = 0, unlocked = 0;
+    if (!counts || !counts(&locked, &unlocked)) {
+        std::printf("FAIL setup: x2w_xmem_copy_counts (needs the test-controls build)\n");
+        return 1;
+    }
+    const auto row = [&](const char* name, unsigned char* destination, ULONGLONG want_locked, ULONGLONG want_unlocked) {
+        ULONGLONG locked0 = 0, unlocked0 = 0, locked1 = 0, unlocked1 = 0;
+        counts(&locked0, &unlocked0);
+        std::memset(destination, 0xAA, bytes);
+        long hr = -1;
+        const bool done = completed_within(submit(destination, bytes, bytes), 5000, hr);
+        counts(&locked1, &unlocked1);
+        std::printf("%s: completed %d hr 0x%08lx; copies under the mapping mutex %llu, without it %llu\n", name, done,
+                    static_cast<unsigned long>(hr), locked1 - locked0, unlocked1 - unlocked0);
+        if (!done || hr != 0 || std::memcmp(destination, source, bytes) != 0) fail(name, "the request did not land");
+        else if (locked1 - locked0 != want_locked || unlocked1 - unlocked0 != want_unlocked) fail(name, "wrong copy path");
+        else std::printf("ok: %s\n", name);
+    };
+    if (views_off) {
+        row("views off, XMem page destination", run_page, 0, 1);
+    } else {
+        auto* plain = static_cast<unsigned char*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!plain) {
+            fail("plain destination", "VirtualAlloc");
+        } else {
+            row("plain destination", plain, 0, 1);
+            VirtualFree(plain, 0, MEM_RELEASE);
+        }
+        row("run destination", run_page, 1, 0);
+    }
+    if (failures) return 1;
+    std::printf("dstorage copy paths: %s\n", views_off ? "views off: no mutex" : "the mutex only for the run");
+    return 0;
+}
 }  // namespace
 
 int main(int argc, char** argv)
 {
-    if (argc != 3) {
-        std::printf("usage: startup_dstorage_break_window_check <xmem.dll with test controls> <XCRDAPI.dll>\n");
+    const bool plain_mode = argc == 4 && std::strcmp(argv[3], "plain") == 0;
+    const bool views_off = argc == 4 && std::strcmp(argv[3], "views-off") == 0;
+    if (argc != 3 && !plain_mode && !views_off) {
+        std::printf("usage: startup_dstorage_break_window_check <xmem.dll with test controls> <XCRDAPI.dll> "
+                    "[plain|views-off]\n");
         return 2;
     }
     char hold_name[64];
     std::snprintf(hold_name, sizeof(hold_name), "x2w-dstorage-break-window-%lu", GetCurrentProcessId());
-    SetEnvironmentVariableA("X2W_XMEM_SHARED_VIEWS", "1");
+    SetEnvironmentVariableA("X2W_XMEM_SHARED_VIEWS", views_off ? nullptr : "1");
     SetEnvironmentVariableA("X2W_XMEM_JOIN_CALLS", nullptr);  // the run is mapped by one call; no join is needed
     SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", hold_name);
 
@@ -167,6 +213,7 @@ int main(int argc, char** argv)
         std::printf("FAIL setup: could not map %u pages (err %lu)\n", run_pages, GetLastError());
         return 1;
     }
+    if (plain_mode || views_off) return copy_rows(xmem, base + 2 * page, views_off);
     MEMORY_BASIC_INFORMATION run{};
     if (!VirtualQuery(base, &run, sizeof(run)) || run.Type != MEM_MAPPED || run.RegionSize < run_pages * page) {
         std::printf("FAIL setup: the %u pages are not one view (region 0x%zx), so no unmap takes a run apart\n", run_pages,

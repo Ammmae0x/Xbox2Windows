@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/resident_pages.h"
 #include "startup_stubs/profile_zone.h"
 
 #include <vector>
@@ -1892,14 +1893,43 @@ bool copy_guarded(void* destination, const void* data, SIZE_T bytes) noexcept
 // The longest hold of memory.mutex by a destination copy, and the largest copy, so far (under memory.mutex).
 double copy_hold_max_ms = 0;
 SIZE_T copy_bytes_max = 0;
+#ifdef X2W_XMEM_TEST_CONTROLS
+// Test build only (x2w_xmem_copy_counts): destination copies made under memory.mutex and without it.
+volatile LONG64 locked_copies, unlocked_copies;
+#endif
+
+// Whether [address, address + bytes) overlaps a recorded run. Caller holds memory.mutex.
+bool overlaps_run(ULONG_PTR address, SIZE_T bytes)
+{
+    if (!bytes) return false;
+    const auto run = memory.runs.upper_bound(address);
+    if (run != memory.runs.begin() && address - std::prev(run)->first < std::prev(run)->second.bytes) return true;
+    return run != memory.runs.end() && run->first - address < bytes;
+}
+
+// [destination, destination + capacity) committed and writable: resident read-write pages from their working-set
+// attributes, any other page through the region walk (as XCRDAPI's destination check without xmem.dll).
+bool destination_writable(void* destination, SIZE_T capacity)
+{
+    const auto start = reinterpret_cast<ULONG_PTR>(destination);
+    if (capacity && destination && capacity <= ~ULONG_PTR{0} - start &&
+        x2w_local::resident_read_write(start, start + capacity))
+        return true;
+    return x2w_local::committed_writable(destination, capacity);
+}
 }  // namespace
 
-// The DirectStorage stand-in's copy into a plain-memory destination (XCRDAPI). The check that all of
-// [destination, destination + capacity) is committed and writable and the copy of bytes from data both run under
-// memory.mutex. Unmapping a page of a shared run takes the whole run away until its other pages are mapped again
-// (map_pages_locked, remap_alias_pages), all under that mutex, so neither the check nor the copy can fall into that
-// window, and no such window can open while the copy runs. Lazily mapped pages of both ranges are committed first,
-// before the mutex is taken: a fault under it is passed on (mapping_thread), not served.
+// The DirectStorage stand-in's copy into a plain-memory destination (XCRDAPI): the check that all of
+// [destination, destination + capacity) is committed and writable, then the copy of bytes from data. Unmapping a page
+// of a shared run takes the whole run away until its other pages are mapped again (map_pages_locked,
+// remap_alias_pages, merge_with_previous), all under memory.mutex. With shared views on (shared_views_on), a short
+// hold of that mutex first looks up whether either range overlaps a recorded run. If one does, the check and the
+// copy run under the mutex, so neither can fall into that window and no such window can open while the copy runs.
+// Otherwise, and always with shared views off (every page then has a view of its own, and no unmap takes a
+// neighbour away), both run without the mutex, as in XCRDAPI without xmem.dll. A run can then appear over either
+// range only through a mapping call on those addresses during the copy, which is the caller's race. Lazily mapped
+// pages of both ranges are committed first, before any mutex: a fault under it is passed on (mapping_thread), not
+// served.
 // TRUE when the bytes were copied. FALSE with ERROR_NOACCESS when the destination is not writable (nothing is
 // written), ERROR_INVALID_ADDRESS when the copy faulted (a source page not readable; part of the destination may be
 // written), or ERROR_INVALID_PARAMETER for more bytes than capacity or null data.
@@ -1913,15 +1943,34 @@ extern "C" BOOL WINAPI x2w_xmem_copy_to_destination(void* destination, SIZE_T ca
     if (capacity && destination && capacity <= ~ULONG_PTR{0} - start) x2w_xmem_commit_range(destination, capacity);
     if (bytes) x2w_xmem_commit_range(data, bytes);
     DWORD error = ERROR_SUCCESS;
+    bool in_runs = false;
+    if (shared_views_on.load(std::memory_order_acquire)) {
+        const std::lock_guard guard(memory.mutex);
+        in_runs = overlaps_run(start, capacity) || overlaps_run(reinterpret_cast<ULONG_PTR>(data), bytes);
+    }
+    if (!in_runs) {
+#ifdef X2W_XMEM_TEST_CONTROLS
+        InterlockedIncrement64(&unlocked_copies);
+#endif
+        if (!destination_writable(destination, capacity))
+            error = ERROR_NOACCESS;
+        else if (bytes && !copy_guarded(destination, data, bytes))
+            error = ERROR_INVALID_ADDRESS;
+        SetLastError(error);
+        return error == ERROR_SUCCESS;
+    }
     double held_ms = 0;
     bool longest = false, largest = false;
     {
         const MappingThread marker;
         const std::lock_guard guard(memory.mutex);
+#ifdef X2W_XMEM_TEST_CONTROLS
+        InterlockedIncrement64(&locked_copies);
+#endif
         LARGE_INTEGER frequency{}, begin{}, end{};
         QueryPerformanceFrequency(&frequency);
         QueryPerformanceCounter(&begin);
-        if (!x2w_local::committed_writable(destination, capacity))
+        if (!destination_writable(destination, capacity))
             error = ERROR_NOACCESS;
         else if (bytes && !copy_guarded(destination, data, bytes))
             error = ERROR_INVALID_ADDRESS;
@@ -1944,6 +1993,24 @@ extern "C" BOOL WINAPI x2w_xmem_copy_to_destination(void* destination, SIZE_T ca
                         static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(capacity));
     SetLastError(error);
     return error == ERROR_SUCCESS;
+}
+
+// Test export, counted in the test-controls build only: destination copies (x2w_xmem_copy_to_destination) made under
+// memory.mutex because a range overlapped a run, and those made without it. The deployed build returns FALSE with
+// ERROR_NOT_SUPPORTED.
+extern "C" BOOL WINAPI x2w_xmem_copy_counts(ULONGLONG* locked, ULONGLONG* unlocked)
+{
+#ifdef X2W_XMEM_TEST_CONTROLS
+    if (!locked || !unlocked) return FALSE;
+    *locked = static_cast<ULONGLONG>(locked_copies);
+    *unlocked = static_cast<ULONGLONG>(unlocked_copies);
+    return TRUE;
+#else
+    (void)locked;
+    (void)unlocked;
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return FALSE;
+#endif
 }
 
 // Experimental export (X2W_XMEM_LAZY_STARTUP): commits the whole lazy startup block holding address and stops
@@ -2122,11 +2189,8 @@ constexpr int io_attempts = 4;
 // Whether [buffer, buffer + bytes) holds a page of a run. Takes memory.mutex, so it returns after the break in progress.
 bool in_a_run(const void* buffer, DWORD bytes)
 {
-    const auto first = reinterpret_cast<ULONG_PTR>(buffer);
     const std::lock_guard guard(memory.mutex);
-    const auto run = memory.runs.upper_bound(first);
-    if (run != memory.runs.begin() && first - std::prev(run)->first < std::prev(run)->second.bytes) return true;
-    return run != memory.runs.end() && run->first - first < bytes;
+    return overlaps_run(reinterpret_cast<ULONG_PTR>(buffer), bytes);
 }
 
 template <class Call>
