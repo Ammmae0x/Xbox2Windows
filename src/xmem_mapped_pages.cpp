@@ -2040,6 +2040,90 @@ const int virtual_query_ex_wrapped = [] {
                     queries);
     return queries;
 }();
+
+// With X2W_XMEM_SHARED_VIEWS=1 the main module's ReadFile and WriteFile imports also go around run breaks. Inside one,
+// a kernel copy into or out of a page of the run being taken apart fails at once, with no fault to retry. Measured
+// under Wine (tests/xmem_run_break_readers_check.cpp, ReadFile_import and WriteFile_import): ReadFile fails with
+// ERROR_NOACCESS and leaves the file position where it was, WriteFile with ERROR_INVALID_USER_BUFFER. A synchronous
+// call (no OVERLAPPED) that fails with one of those while a break was in progress, or began or ended around it, and
+// whose buffer lies in a run, waits for memory.mutex (the end of the break) and runs again, at most io_attempts times
+// in all. A call that fails that way with no break around it, or outside the runs, fails at once as before.
+// Not covered: overlapped I/O (the copy happens at completion, after the call has returned), a call that a break
+// cuts short after part of the copy (a short count), and I/O from other modules or through GetProcAddress.
+using WriteFileFn = BOOL(WINAPI*)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+ReadFileFn next_read_file;  // read_file_committed with lazy commit, kernel32's ReadFile without
+WriteFileFn kernel_write_file;
+constexpr int io_attempts = 4;
+
+ULONG64 break_generation()
+{
+    AcquireSRWLockShared(&remap_window.lock);
+    const ULONG64 value = remap_window.generation;
+    ReleaseSRWLockShared(&remap_window.lock);
+    return value;
+}
+
+// Whether [buffer, buffer + bytes) holds a page of a run. Takes memory.mutex, so it returns after the break in progress.
+bool in_a_run(const void* buffer, DWORD bytes)
+{
+    const auto first = reinterpret_cast<ULONG_PTR>(buffer);
+    const std::lock_guard guard(memory.mutex);
+    const auto run = memory.runs.upper_bound(first);
+    if (run != memory.runs.begin() && first - std::prev(run)->first < std::prev(run)->second) return true;
+    return run != memory.runs.end() && run->first - first < bytes;
+}
+
+template <class Call>
+BOOL io_outside_breaks(const void* buffer, DWORD bytes, LPOVERLAPPED overlapped, const Call& call)
+{
+    if (overlapped || !buffer || !bytes || mapping_thread || !shared_views_on.load(std::memory_order_acquire)) return call();
+    for (int attempt = 1;; ++attempt) {
+        const ULONG64 before = break_generation();
+        if (call()) return TRUE;
+        const DWORD error = GetLastError();
+        const bool broken = (before & 1) || break_generation() != before;
+        if ((error != ERROR_NOACCESS && error != ERROR_INVALID_USER_BUFFER) || !broken || attempt == io_attempts ||
+            !in_a_run(buffer, bytes)) {
+            SetLastError(error);
+            return FALSE;
+        }
+    }
+}
+
+BOOL WINAPI read_file_stable(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVERLAPPED overlapped)
+{
+    return io_outside_breaks(buffer, bytes, overlapped, [&] { return next_read_file(file, buffer, bytes, read, overlapped); });
+}
+
+BOOL WINAPI write_file_stable(HANDLE file, LPCVOID buffer, DWORD bytes, LPDWORD written, LPOVERLAPPED overlapped)
+{
+    return io_outside_breaks(buffer, bytes, overlapped, [&] { return kernel_write_file(file, buffer, bytes, written, overlapped); });
+}
+
+const int file_io_wrapped = [] {
+    if (!x2w_local::env_on("X2W_XMEM_SHARED_VIEWS")) return 0;
+    const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    const auto kernel_read_file = reinterpret_cast<ReadFileFn>(GetProcAddress(kernel32, "ReadFile"));
+    kernel_write_file = reinterpret_cast<WriteFileFn>(GetProcAddress(kernel32, "WriteFile"));
+    if (!kernel_read_file || !kernel_write_file) return 0;
+    // With lazy commit the ReadFile imports already point at read_file_committed, which stays the inner call.
+    next_read_file = lazy_commit_installed && real_read_file ? &read_file_committed : kernel_read_file;
+    int wrapped = patch_main_import("ReadFile", reinterpret_cast<const void*>(&read_file_stable));
+    wrapped += patch_main_import("WriteFile", reinterpret_cast<const void*>(&write_file_stable));
+    HMODULE self = nullptr;
+    if (wrapped && !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                       reinterpret_cast<LPCWSTR>(&read_file_stable), &self)) {
+        const DWORD error = GetLastError();
+        const int restored = patch_main_import("ReadFile", reinterpret_cast<const void*>(next_read_file)) +
+                             patch_main_import("WriteFile", reinterpret_cast<const void*>(kernel_write_file));
+        x2w_local::logf("x2w-xmem shared views (X2W_XMEM_SHARED_VIEWS): xmem.dll could not be pinned (error %lu); "
+                        "%d of %d ReadFile/WriteFile import(s) restored", static_cast<unsigned long>(error), restored, wrapped);
+        wrapped = 0;
+    }
+    x2w_local::logf("x2w-xmem shared views (X2W_XMEM_SHARED_VIEWS): %d ReadFile/WriteFile import(s) run again after a run "
+                    "break that refused their buffer", wrapped);
+    return wrapped;
+}();
 }  // namespace
 
 // Experimental export: writes bytes into physical pages named by the title's

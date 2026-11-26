@@ -7,8 +7,9 @@
 // and then checks the reader's answer: the neighbour page is committed, mapped and holds its data.
 //
 // Cases (one window each): x2w_xmem_stable_call, XMemVirtualQuery, this program's VirtualQueryEx import (wrapped by
-// xmem.dll when it loads with the switch), x2w_local::writable, x2w_startup::measure_placed_buffer and
-// x2w_startup::snapshot_samplers.
+// xmem.dll when it loads with the switch), this program's ReadFile and WriteFile imports (synchronous, into and out
+// of the page; wrapped the same way), x2w_local::writable, x2w_startup::measure_placed_buffer and
+// x2w_startup::snapshot_samplers. Then io_outside_runs: a ReadFile into a reserved page in no run fails at once.
 //
 // With `control` (the build whose local_log.h asks xmem.dll for a missing export, so the header readers run
 // directly) the three header readers answer inside the window: the check expects that, and fails if they wait.
@@ -31,7 +32,8 @@
 // `default` (X2W_XMEM_SHARED_VIEWS unset): every page has a view of its own, and readers that overlap an unmap
 // answer inside it, without waiting for memory.mutex, as before x2w_xmem_stable_call.
 // `lazy` (X2W_XMEM_SHARED_VIEWS=1, X2W_XMEM_LAZY_COMMIT=1): XMemVirtualQuery and VirtualQueryEx wait for a break
-// with their output buffer in a mapped slot that is not committed yet; the answer reaches it after the break.
+// with their output buffer in a mapped slot that is not committed yet; the answer reaches it after the break. Then a
+// ReadFile into another such slot, with no break: the lazy-commit ReadFile wrapper still runs inside the run-break one.
 //
 // `two-runs` and `mirror` run those two cases alone (an access violation there ends the process).
 //
@@ -191,6 +193,101 @@ void break_during_fn(const Shim& shim, unsigned char* base)
     CloseHandle(c.release);
 }
 
+// Kernel I/O into or out of a page of the run: this program's ReadFile and WriteFile imports (wrapped by xmem.dll
+// when it loads with the switch). Synchronous calls on a file opened without FILE_FLAG_OVERLAPPED.
+constexpr DWORD io_bytes = 4096;
+
+struct TempFile {
+    char path[MAX_PATH] = {};
+    explicit TempFile(const char* stem)
+    {
+        char dir[MAX_PATH];
+        GetTempPathA(sizeof(dir), dir);
+        std::snprintf(path, sizeof(path), "%sx2w-run-break-%s-%lu.bin", dir, stem, GetCurrentProcessId());
+    }
+    ~TempFile() { DeleteFileA(path); }
+    HANDLE open(DWORD access, DWORD disposition) const
+    {
+        return CreateFileA(path, access, 0, nullptr, disposition, FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+};
+
+// The file's bytes: the neighbour page's mark, then 0xa5.
+void io_pattern(unsigned char* out)
+{
+    std::memset(out, 0xa5, io_bytes);
+    const std::uint32_t mark = 0x51000000u + neighbour;
+    std::memcpy(out, &mark, sizeof(mark));
+}
+
+bool read_file_into(unsigned char* target)
+{
+    TempFile file("read");
+    unsigned char data[io_bytes];
+    io_pattern(data);
+    HANDLE h = file.open(GENERIC_WRITE, CREATE_ALWAYS);
+    DWORD done = 0;
+    const bool written = h != INVALID_HANDLE_VALUE && WriteFile(h, data, io_bytes, &done, nullptr) && done == io_bytes;
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    if (!written) return false;
+    h = file.open(GENERIC_READ, OPEN_EXISTING);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    done = 0;
+    const BOOL ok = ReadFile(h, target, io_bytes, &done, nullptr);
+    const DWORD error = ok ? 0 : GetLastError();
+    LARGE_INTEGER position{};
+    SetFilePointerEx(h, LARGE_INTEGER{}, &position, FILE_CURRENT);
+    CloseHandle(h);
+    std::printf("ReadFile into the run: ok=%d bytes=%lu error=%lu position=%lld\n", ok, done, error, position.QuadPart);
+    return ok && done == io_bytes && std::memcmp(target, data, io_bytes) == 0;
+}
+
+bool write_file_from(unsigned char* target)
+{
+    TempFile file("write");
+    HANDLE h = file.open(GENERIC_WRITE, CREATE_ALWAYS);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD done = 0;
+    const BOOL ok = WriteFile(h, target, io_bytes, &done, nullptr);
+    const DWORD error = ok ? 0 : GetLastError();
+    CloseHandle(h);
+    std::printf("WriteFile from the run: ok=%d bytes=%lu error=%lu\n", ok, done, error);
+    if (!ok || done != io_bytes) return false;
+    unsigned char data[io_bytes];
+    h = file.open(GENERIC_READ, OPEN_EXISTING);
+    const bool read = h != INVALID_HANDLE_VALUE && ReadFile(h, data, io_bytes, &done, nullptr) && done == io_bytes;
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    return read && std::memcmp(data, target, io_bytes) == 0;
+}
+
+// A read into a reserved page that is in no run fails at once, as without the wrapper: nothing waits for it.
+void io_outside_runs()
+{
+    const char* const name = "io_outside_runs";
+    auto* const reserved = static_cast<unsigned char*>(VirtualAlloc(nullptr, page, MEM_RESERVE, PAGE_NOACCESS));
+    if (!check(reserved != nullptr, "reserve", name)) return;
+    TempFile file("outside");
+    unsigned char data[io_bytes];
+    io_pattern(data);
+    HANDLE h = file.open(GENERIC_WRITE | GENERIC_READ, CREATE_ALWAYS);
+    DWORD done = 0;
+    if (!check(h != INVALID_HANDLE_VALUE && WriteFile(h, data, io_bytes, &done, nullptr) &&
+               SetFilePointer(h, 0, nullptr, FILE_BEGIN) == 0, "temp_file", name)) {
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        VirtualFree(reserved, 0, MEM_RELEASE);
+        return;
+    }
+    const ULONGLONG from = GetTickCount64();
+    const BOOL ok = ReadFile(h, reserved, io_bytes, &done, nullptr);
+    const DWORD error = GetLastError();
+    const ULONGLONG took = GetTickCount64() - from;
+    CloseHandle(h);
+    VirtualFree(reserved, 0, MEM_RELEASE);
+    std::printf("ReadFile into a reserved page outside the runs: ok=%d error=%lu %llu ms\n", ok, error, took);
+    check(!ok && error == ERROR_NOACCESS, "read_into_reserved_page_fails_with_ERROR_NOACCESS", name);
+    check(took < 1000, "read_into_reserved_page_fails_at_once", name);
+}
+
 // Default mode: eight single-page views; the unmap of page 5 is held open while readers query page 2.
 void default_case(const Shim& shim, unsigned char* base)
 {
@@ -303,6 +400,31 @@ void lazy_case(const Shim& shim, unsigned char* base)
     shim.release(pages, tokens);
     CloseHandle(unmapped);
     CloseHandle(release);
+}
+
+// Lazy commit and shared views: the ReadFile import goes through both wrappers. A read into a mapped slot that is not
+// committed yet (no break around it) commits the slot first and succeeds, as with lazy commit alone.
+void lazy_read_file(const Shim& shim, unsigned char* at)
+{
+    const char* const name = "lazy_read_file";
+    SIZE_T count = 1, token = 0;
+    if (!check(shim.allocate(0x20400000, &count, &token) && shim.map(at, 1, &token) == at, "map", name)) return;
+    if (check(raw_state(at) != MEM_COMMIT, "slot_not_committed_yet", name)) {
+        TempFile file("lazy");
+        unsigned char data[io_bytes];
+        io_pattern(data);
+        HANDLE h = file.open(GENERIC_WRITE | GENERIC_READ, CREATE_ALWAYS);
+        DWORD done = 0;
+        const bool ready = h != INVALID_HANDLE_VALUE && WriteFile(h, data, io_bytes, &done, nullptr) &&
+                           SetFilePointer(h, 0, nullptr, FILE_BEGIN) == 0;
+        const BOOL ok = ready && ReadFile(h, at, io_bytes, &done, nullptr);
+        const DWORD error = ok ? 0 : GetLastError();
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        std::printf("lazy: ReadFile into an uncommitted mapped slot: ok=%d error=%lu\n", ok, error);
+        check(ok && done == io_bytes && std::memcmp(at, data, io_bytes) == 0, "read_into_the_slot", name);
+    }
+    shim.map(at, 1, nullptr);
+    shim.release(1, &token);
 }
 
 struct Events {
@@ -546,7 +668,10 @@ int main(int argc, char** argv)
     if (next_break_control || default_mode || lazy || two_runs || mirror) {
         if (next_break_control) next_break_case(shim, at, false);
         if (default_mode) default_case(shim, at);
-        if (lazy) lazy_case(shim, at);
+        if (lazy) {
+            lazy_case(shim, at);
+            lazy_read_file(shim, at + 40 * page);
+        }
         if (two_runs) two_runs_case(shim, at);
         if (mirror) mirror_case(shim, base);
         VirtualFree(base, 0, MEM_RELEASE);
@@ -573,6 +698,9 @@ int main(int argc, char** argv)
             MEMORY_BASIC_INFORMATION info{};
             return VirtualQueryEx(GetCurrentProcess(), target, &info, sizeof(info)) == sizeof(info) && info.State == MEM_COMMIT;
         });
+        window_case(shim, at, index++, "ReadFile_import", true, read_file_into);
+        window_case(shim, at, index++, "WriteFile_import", true, write_file_from);
+        io_outside_runs();
     }
     // The header readers: waiting with the export, answering inside the window without it (control).
     const bool waits = !control;

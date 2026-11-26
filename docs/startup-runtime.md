@@ -3184,8 +3184,9 @@ at most one retry for each unmap or join.
 
 Shared views are opt-in. The caller chooses before the first mapping call by setting
 `X2W_XMEM_SHARED_VIEWS=1` in the process environment; the shim reads it once, on that call. It also
-reads it once when `xmem.dll` loads: with it set then, the main module's `VirtualQueryEx` imports
-are wrapped (see below), and the module is pinned at load when one is.
+reads it once when `xmem.dll` loads: with it set then, the main module's `VirtualQueryEx`,
+`ReadFile` and `WriteFile` imports are wrapped (see below), and the module is pinned at load when
+one is.
 
 A region query or a kernel copy does not fault, so inside an unmap it would see the pages of the
 view being taken apart as reserved. With shared views such readers run through the export
@@ -3193,13 +3194,21 @@ view being taken apart as reserved. With shared views such readers run through t
 around it. `XMemVirtualQuery`, the main module's `VirtualQueryEx` imports and the shim's own
 `VirtualQuery` and `ReadProcessMemory` readers (`src/startup_stubs/local_log.h`, slot 133,
 the sampler snapshot) use it. Without shared views every page has a view of its own and readers
-run once, as before. Title `ReadFile`/`WriteFile` into mapped pages are not covered.
+run once, as before.
+
+Inside an unmap a kernel copy into or out of a page of that view fails at once. Measured under
+Wine: `ReadFile` fails with `ERROR_NOACCESS` and leaves the file position as it was, `WriteFile`
+with `ERROR_INVALID_USER_BUFFER`. The main module's `ReadFile` and `WriteFile` imports therefore
+run again, up to 4 times in all, when a synchronous call fails with one of those errors while an
+unmap or join was in progress or began or ended around it, and its buffer lies in a view of a
+run; they wait for that one to end first. Overlapped I/O (the copy happens at completion), a call
+cut short after part of the copy, and I/O from other modules are not covered.
 
 | | Default | `X2W_XMEM_SHARED_VIEWS=1` |
 |---|---|---|
 | Views | one per page | one per run of adjacent pages |
 | Fault handler | none | registered by the first mapping call, never removed |
-| `FreeLibrary` | unloads `xmem.dll` | module is pinned and stays until the process ends (at load when the main module imports `VirtualQueryEx`, else at the first mapping call) |
+| `FreeLibrary` | unloads `xmem.dll` | module is pinned and stays until the process ends (at load when the main module imports `VirtualQueryEx`, `ReadFile` or `WriteFile`, else at the first mapping call) |
 
 The handler is process-wide, and Windows has no removal that also waits for a dispatch already
 under way, so the opt-in keeps the module, the handler and the shim's state in place for the life
