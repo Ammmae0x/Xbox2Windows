@@ -6917,6 +6917,37 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_crypto_aes_pclmul>" "$<TARGET_FILE:cpu_crypto_aes_pclmul_lifted>")
     set_tests_properties(cpu_aot_crypto_aes_pclmul PROPERTIES SKIP_RETURN_CODE 77)
 
+    # cpu_aot_aes_pclmul
+    set(cpu_aes_pclmul_aot_exports
+        "op_aesenc_reg,op_aesenclast_reg,op_aesdec_reg,op_aesdeclast_reg,"
+        "op_aesimc_reg,op_aeskeygenassist_reg,"
+        "op_pclmulqdq_00_reg,op_pclmulqdq_11_reg,op_pclmulqdq_ignore_bits_reg,"
+        "op_aesenc_mem,op_aesenclast_mem,op_aesdec_mem,op_aesdeclast_mem,"
+        "op_aesimc_mem,op_aeskeygenassist_mem,op_pclmulqdq_01_mem,"
+        "op_vaesenc_reg,op_vaesenclast_reg,op_vaesdec_reg,op_vaesdeclast_reg,"
+        "op_vaesimc_reg,op_vaeskeygenassist_reg,"
+        "op_vpclmulqdq_10_reg,op_vpclmulqdq_ignore_bits_reg,"
+        "op_vaesenc_mem,op_vaesenclast_mem,op_vaesdec_mem,op_vaesdeclast_mem,"
+        "op_vaesimc_mem,op_vaeskeygenassist_mem,op_vpclmulqdq_11_mem,"
+        "op_sse_preserves_ymm_hi,op_vex_zeroes_ymm_hi,op_vzeroupper_clears_ymm_hi,"
+        "op_r8_source_then_store,op_dst_alias_src,op_aes_pclmul_discarded_read")
+    string(CONCAT cpu_aes_pclmul_aot_exports ${cpu_aes_pclmul_aot_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_aes_pclmul_aot_${variant} aes_pclmul_aot)
+        cpu_translation(cpu_aes_pclmul_aot_${variant} cpu_aes_pclmul_aot "${cpu_aes_pclmul_aot_exports}")
+    endforeach()
+    target_compile_definitions(cpu_aes_pclmul_aot_altered PRIVATE ALTER_AES_PCLMUL)
+    add_test(NAME cpu_aot_aes_pclmul COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/aes_pclmul_aot_check.py"
+        "$<TARGET_FILE:cpu_aes_pclmul_aot_original>"
+        "$<TARGET_FILE:cpu_aes_pclmul_aot_original_lifted>"
+        "$<TARGET_FILE:cpu_aes_pclmul_aot_altered>"
+        "$<TARGET_FILE:cpu_aes_pclmul_aot_altered_lifted>"
+        "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(cpu_aot_aes_pclmul PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_aes_pclmul.txt")
+
     # cpu_aot_sha256
     set(cpu_sha256_aot_exports
         "op_sha256rnds2_reg,op_sha256rnds2_mem,op_sha256rnds2_mem_r8,"
