@@ -630,13 +630,15 @@ FaultRetry fault_retry;
 // Test build only (X2W_XMEM_TEST_CONTROLS; tests/xmem_page_runs_check.py): X2W_XMEM_TEST_FAULT=<stage>:<skip> makes one step of
 // the next unmap fail as if Windows had refused it, after skipping <skip> such steps. Stage 1 is
 // unmapping a run, stage 2 mapping surviving pages again, stage 3 both the unmap and the restore.
+// Stages 4 and 5 are steps of a cross-call merge (merge_with_previous): 4 the map of the joined view,
+// 5 joining the two placeholders.
 #ifdef X2W_XMEM_TEST_CONTROLS
 struct TestFault {
     unsigned stage = 0, skip = 0;
     TestFault()
     {
         char text[32];
-        if (GetEnvironmentVariableA("X2W_XMEM_TEST_FAULT", text, sizeof(text)) && text[0] >= '1' && text[0] <= '3' && text[1] == ':') {
+        if (GetEnvironmentVariableA("X2W_XMEM_TEST_FAULT", text, sizeof(text)) && text[0] >= '1' && text[0] <= '5' && text[1] == ':') {
             stage = static_cast<unsigned>(text[0] - '0');
             skip = static_cast<unsigned>(std::strtoul(text + 2, nullptr, 10));
         }
@@ -762,6 +764,63 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failu
     return lost;
 }
 
+// Shared views only. Startup maps nearly every page with a call of its own, and under Wine each map
+// costs more the more views the process has. A run mapped by a call of its own therefore joins the
+// recorded run R that ends at its address, when its first page is the next slot of the section behind
+// R's last page and R and the new pages lie in one reservation of the shim: the new pages' range is
+// split to a placeholder of its own, R is unmapped, the two placeholders are joined and one view is
+// mapped over both. R is taken apart as in an unmap (begin_break), so a thread that touches R in
+// between is retried and x2w_xmem_stable_call readers wait. On a refused step before R is unmapped
+// nothing changed; after it, R is mapped again as it was (map_recorded). Both return separate, and
+// the caller maps the new pages on their own. lost: R could not be mapped again; the pages that have
+// no view are forgotten, as in an unmap. X2W_XMEM_TEST_NO_MERGE=1 turns the merge off (tests only).
+enum class Merge { joined, separate, lost };
+
+Merge merge_with_previous(ULONG_PTR address, const Backing& head, SIZE_T bytes, MapFailure* failure)
+{
+#ifdef X2W_XMEM_TEST_CONTROLS
+    if (x2w_local::env_on("X2W_XMEM_TEST_NO_MERGE")) return Merge::separate;
+#endif
+    const auto next = memory.runs.lower_bound(address);
+    if (next == memory.runs.begin()) return Merge::separate;
+    const auto [base, size] = *std::prev(next);
+    if (base + size != address) return Merge::separate;
+    const auto tail = memory.views.find(address - page_bytes);
+    if (tail == memory.views.end()) return Merge::separate;
+    const Backing& previous = memory.backings.at(tail->second);
+    if (previous.section != head.section || previous.offset + page_bytes != head.offset) return Merge::separate;
+    const auto reservation = owned_reservation(base);
+    if (reservation == memory.reservations.end() || address + bytes > reservation->first + reservation->second)
+        return Merge::separate;
+    const Backing start = memory.backings.at(memory.views.at(base));
+    auto* const target = reinterpret_cast<void*>(address);
+    if (!exact_placeholder(target, bytes)) {
+        InterlockedIncrement64(&split_attempts);
+        if (!VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) return Merge::separate;
+    }
+    TestFault test;
+    begin_break({{base, size}});
+    const EndBreak end;
+    if (!unmap_view(base)) return Merge::separate;
+    memory.runs.erase(base);
+    hold_window();
+    auto* const whole = reinterpret_cast<void*>(base);
+    if (!test.hit(5) && VirtualFree(whole, size + bytes, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) {
+        InterlockedIncrement64(&map_attempts);
+        if (!test.hit(4) && MapViewOfFile3(start.section, GetCurrentProcess(), whole, start.offset, size + bytes,
+                                           MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) {
+            memory.runs[base] = size + bytes;
+            return Merge::joined;
+        }
+    }
+    // map_recorded splits the joined placeholder back to R's size (map_split: the reservation is the shim's).
+    const ULONG_PTR lost = map_recorded(base, size, false, failure);
+    if (!lost) return Merge::separate;
+    x2w_local::logf("x2w-xmem merge of a run with the next mapping call failed: %llu page(s) of the run could not be "
+                    "mapped again and were forgotten", static_cast<unsigned long long>(lost));
+    return Merge::lost;
+}
+
 // Destinations must be caller-owned, page-sized Windows placeholders. Live views
 // are owned by this shim until it unmaps them. The caller must not replace them.
 template <typename AddressAt>
@@ -806,8 +865,18 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
                     const Backing& b = memory.backings.at(last->second);
                     if (last->first != first->first + bytes || b.section != head.section || b.offset != head.offset + bytes) break;
                 }
+                // Only a run that is the whole batch joins an earlier one: a later run of the batch that
+                // fails unmaps everything in made, which a joined run is not.
+                const Merge merge = share_views && first == batch.begin() && last == batch.end()
+                                        ? merge_with_previous(first->first, head, bytes, failure)
+                                        : Merge::separate;
+                if (merge == Merge::lost) {
+                    coalesce_unused(batch);
+                    SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+                    return FALSE;
+                }
                 ULONG_PTR failed_address;
-                if (!map_run(first->first, head, bytes, made, failed_address)) {
+                if (merge == Merge::separate && !map_run(first->first, head, bytes, made, failed_address)) {
                     const DWORD error = GetLastError();
                     if (failure) failure->record("map-view", failed_address, batch.at(failed_address), error);
                     for (const auto& [base, size] : made) {

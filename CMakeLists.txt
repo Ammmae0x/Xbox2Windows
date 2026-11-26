@@ -356,6 +356,25 @@ set_tests_properties(xmem_run_break_readers xmem_run_break_readers_control xmem_
                      xmem_run_break_readers_default xmem_run_break_readers_lazy PROPERTIES TIMEOUT 60)
 set_tests_properties(xmem_run_break_readers_default PROPERTIES
     PASS_REGULAR_EXPRESSION "default mode: readers answer inside an unmap" FAIL_REGULAR_EXPRESSION "check_failed")
+# Cross-call merge of shared views (merge_with_previous): single-page calls on consecutive slots join one view, and
+# the steps around it (an unmap inside, slots out of order, a reader inside the held window, refused steps, two
+# reservations). The control keeps one view per call (X2W_XMEM_TEST_NO_MERGE=1, test build only); the deployed shim
+# ignores that switch; without X2W_XMEM_SHARED_VIEWS every page keeps a view of its own.
+add_executable(xmem_cross_call_merge_check tests/xmem_cross_call_merge_check.cpp)
+target_compile_features(xmem_cross_call_merge_check PRIVATE cxx_std_17)
+add_dependencies(xmem_cross_call_merge_check xmem_shim xmem_shim_test_controls)
+add_test(NAME xmem_cross_call_merge COMMAND xmem_cross_call_merge_check "$<TARGET_FILE:xmem_shim_test_controls>" check)
+add_test(NAME xmem_cross_call_merge_control COMMAND xmem_cross_call_merge_check "$<TARGET_FILE:xmem_shim_test_controls>" control)
+add_test(NAME xmem_cross_call_merge_deployed COMMAND xmem_cross_call_merge_check "$<TARGET_FILE:xmem_shim>" deployed)
+add_test(NAME xmem_cross_call_merge_default COMMAND xmem_cross_call_merge_check "$<TARGET_FILE:xmem_shim>" default)
+set_tests_properties(xmem_cross_call_merge xmem_cross_call_merge_control xmem_cross_call_merge_deployed
+                     xmem_cross_call_merge_default PROPERTIES TIMEOUT 60)
+set_tests_properties(xmem_cross_call_merge_control PROPERTIES ENVIRONMENT "X2W_XMEM_TEST_NO_MERGE=1"
+    PASS_REGULAR_EXPRESSION "no-merge control: 32 views" FAIL_REGULAR_EXPRESSION "check_failed")
+set_tests_properties(xmem_cross_call_merge_deployed PROPERTIES ENVIRONMENT "X2W_XMEM_TEST_NO_MERGE=1"
+    PASS_REGULAR_EXPRESSION "merge: 1 view of 32 pages" FAIL_REGULAR_EXPRESSION "check_failed")
+set_tests_properties(xmem_cross_call_merge_default PROPERTIES
+    PASS_REGULAR_EXPRESSION "no-merge control: 32 views" FAIL_REGULAR_EXPRESSION "check_failed")
 add_executable(xmem_section_lease_check tests/xmem_section_lease_check.cpp tests/desktop_gpu.cpp)
 target_include_directories(xmem_section_lease_check PRIVATE src)
 target_compile_features(xmem_section_lease_check PRIVATE cxx_std_17)
