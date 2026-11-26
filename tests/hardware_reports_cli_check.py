@@ -4,6 +4,7 @@
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import runpy
 import subprocess
@@ -43,6 +44,8 @@ def _run_subprocess(*args: str) -> subprocess.CompletedProcess[str]:
         [sys.executable, "-B", str(TOOL), *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         timeout=30,
     )
 
