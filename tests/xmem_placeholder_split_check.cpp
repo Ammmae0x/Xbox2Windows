@@ -7,8 +7,12 @@
 //                                                     split step to fail
 //   xmem_placeholder_split_check <xmem.dll> deployed  the same checks in the deployed build with the same switch, which
 //                                                     that build ignores, so they pass
-// control and deployed exit 77 where the OS reports the bit, because there the fallback is never used. Each mode sets
-// or clears X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK itself, so an inherited value cannot change the result.
+//   xmem_placeholder_split_check <xmem.dll> partial   test-controls build with shared views: a two-page view over a
+//                                                     private reservation whose second page is committed is refused
+//                                                     by the region walk (x2w_xmem_alias_counts), and the committed
+//                                                     page keeps its bytes
+// control, deployed and partial exit 77 where the OS reports the bit, because there the fallback is never used. Each
+// mode sets or clears X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK itself, so an inherited value cannot change the result.
 #include <windows.h>
 #include "xmem_page_batch.h"
 #include <cstdio>
@@ -21,6 +25,7 @@ constexpr UINT pool_pages = 4;
 using Reserve = void* (WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
 using AllocPages = BOOL (WINAPI*)(ULONG_PTR, ULONG_PTR*, ULONG_PTR*);
 using Scatter = BOOL (WINAPI*)(void* const*, ULONG_PTR, const ULONG_PTR*);
+using AliasCounts = BOOL (WINAPI*)(ULONGLONG*, ULONGLONG*);
 
 bool require(bool ok, const char* step)
 {
@@ -46,18 +51,62 @@ MEMORY_BASIC_INFORMATION query(const BYTE* pointer)
     VirtualQuery(pointer, &info, sizeof(info));
     return info;
 }
+
+// partial: two pages of the reservation become a private reservation whose second page is committed and tagged. Its
+// first region is reserved, so a check of that region alone would accept the whole two-page view.
+int partial_case(HMODULE xmem, BYTE* pool, decltype(&X2WMapPageBatch) batch_map)
+{
+    const auto counts = reinterpret_cast<AliasCounts>(GetProcAddress(xmem, "x2w_xmem_alias_counts"));
+    ULONGLONG refusals0 = 0, splits0 = 0, refusals1 = 0, splits1 = 0;
+    if (!require(counts && counts(&refusals0, &splits0), "read the alias counts (test-controls build)")) return 1;
+    BYTE* const piece = pool + 192 * page_bytes;
+    if (!require(VirtualFree(piece, 2 * page_bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), "split out two pages") ||
+        !require(VirtualAlloc2(GetCurrentProcess(), piece, 2 * page_bytes, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
+                               PAGE_READWRITE, nullptr, 0) == piece, "reserve the two pages privately") ||
+        !require(VirtualAlloc(piece + page_bytes, page_bytes, MEM_COMMIT, PAGE_READWRITE) == piece + page_bytes,
+                 "commit the second page"))
+        return 1;
+    std::memset(piece + page_bytes, 0x7a, page_bytes);
+    const X2WPageRange two{0, 1, 2};
+    const X2WPageBatch onto_partial{reinterpret_cast<UINT64>(piece), 1, &two};
+    const HRESULT hr = batch_map(1, &onto_partial, reinterpret_cast<UINT64>(pool), pool_pages, 0, nullptr);
+    if (!require(counts(&refusals1, &splits1), "read the alias counts")) return 1;
+    const MEMORY_BASIC_INFORMATION first = query(piece), second = query(piece + page_bytes);
+    std::printf("batch onto a reserved page and a committed one -> 0x%08lx; alias refusals %llu, placeholder "
+                "releases tried %llu; after: state 0x%lx type 0x%lx, then state 0x%lx type 0x%lx byte 0x%02x\n",
+                static_cast<unsigned long>(hr), refusals1 - refusals0, splits1 - splits0, first.State, first.Type,
+                second.State, second.Type, second.State == MEM_COMMIT ? piece[page_bytes] : 0u);
+    // The walk refuses the two-page view. The batch then retries each page on its own (install_alias_plan): the
+    // reserved page alone may be released and mapped, and the rollback unmaps it again; the committed page alone is
+    // refused. A walk that checks only the first region of each allocation accepts the view, and under Wine the
+    // release then succeeds and the view replaces the committed page (measured 2026-11-27 before the fix).
+    if (!require(refusals1 - refusals0 >= 1, "the region walk refuses the two-page view") ||
+        !require(FAILED(hr), "the partly committed target is refused") ||
+        !require(first.State == MEM_RESERVE && second.State == MEM_COMMIT && second.Type == MEM_PRIVATE &&
+                     piece[page_bytes] == 0x7a && piece[2 * page_bytes - 1] == 0x7a,
+                 "the committed page keeps its bytes and the reserved page stays reserved"))
+        return 1;
+    std::puts("partial: a view over a reserved and a committed page was refused; the committed page kept its bytes");
+    return 0;
+}
 }  // namespace
 
 int wmain(int argc, wchar_t** argv)
 {
     const bool control = argc == 3 && std::wcscmp(argv[2], L"control") == 0;
     const bool deployed = argc == 3 && std::wcscmp(argv[2], L"deployed") == 0;
-    if (argc != 2 && !control && !deployed) return 2;
+    const bool partial = argc == 3 && std::wcscmp(argv[2], L"partial") == 0;
+    if (argc != 2 && !control && !deployed && !partial) return 2;
     // xmem reads the switch once, in its first placeholder probe; set it before loading xmem.dll.
     SetEnvironmentVariableW(L"X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK", control || deployed ? L"1" : nullptr);
+    if (partial) {
+        // A two-page view needs shared views (one view per run of pool pages); joins across calls stay off.
+        SetEnvironmentVariableW(L"X2W_XMEM_SHARED_VIEWS", L"1");
+        SetEnvironmentVariableW(L"X2W_XMEM_JOIN_CALLS", nullptr);
+    }
     const bool bit = os_reports_placeholder_bit();
     std::printf("placeholder bit reported=%d\n", bit);
-    if ((control || deployed) && bit) {
+    if ((control || deployed || partial) && bit) {
         std::puts("SKIP: the OS reports the placeholder bit, so the fallback is never used");
         return 77;
     }
@@ -78,6 +127,7 @@ int wmain(int argc, wchar_t** argv)
         !require(scatter(addresses, pool_pages, grants), "map the pool"))
         return 1;
     for (UINT i = 0; i < pool_pages; ++i) std::memset(addresses[i], 0x51 + i, page_bytes);
+    if (partial) return partial_case(xmem, pool, batch_map);
 
     // Negative control: a committed page inside the reservation is not a placeholder. The batch must fail and leave
     // the page committed with its bytes.

@@ -95,6 +95,13 @@ set_tests_properties(xmem_placeholder_split_control PROPERTIES
 add_test(NAME xmem_placeholder_split_deployed COMMAND xmem_placeholder_split_check "$<TARGET_FILE:xmem_shim>" deployed)
 set_tests_properties(xmem_placeholder_split_deployed PROPERTIES
     ENVIRONMENT "${xmem_placeholder_env}" SKIP_RETURN_CODE 77 TIMEOUT 60)
+# A two-page view over a reserved page and a committed page of one private allocation: the fallback checks every
+# region of the view and refuses it (test-controls build: x2w_xmem_alias_counts), and the committed page keeps its
+# bytes. The program turns shared views on for this mode.
+add_test(NAME xmem_placeholder_split_partial COMMAND xmem_placeholder_split_check
+         "$<TARGET_FILE:xmem_shim_test_controls>" partial)
+set_tests_properties(xmem_placeholder_split_partial PROPERTIES
+    ENVIRONMENT "${xmem_placeholder_env}" SKIP_RETURN_CODE 77 TIMEOUT 60)
 add_executable(xmem_map_split_first_check tests/xmem_map_split_first_check.cpp)
 target_include_directories(xmem_map_split_first_check PRIVATE src)
 target_compile_features(xmem_map_split_first_check PRIVATE cxx_std_17)

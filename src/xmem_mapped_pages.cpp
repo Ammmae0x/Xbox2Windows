@@ -372,6 +372,11 @@ auto owned_reservation(ULONG_PTR address)
 
 // MapViewOfFile3 and placeholder-split attempts made by map_split (x2w_xmem_map_counts).
 volatile LONG64 map_attempts, split_attempts;
+#ifdef X2W_XMEM_TEST_CONTROLS
+// Test build only (x2w_xmem_alias_counts): views install_alias_view could not map in place inside an owned
+// reservation, split by whether alias_placeholders refused the range or a placeholder release was tried.
+volatile LONG64 alias_refusals, alias_splits;
+#endif
 
 // True when [target, target + bytes) is a whole reserved region of its own: a placeholder that
 // MEM_REPLACE_PLACEHOLDER can take as it is, so no split is needed first.
@@ -1373,8 +1378,10 @@ bool alias_placeholders(ULONG_PTR address, SIZE_T bytes)
 {
     // VirtualQuery alone cannot distinguish a reserved private allocation from a placeholder, and on Windows
     // PRESERVE_PLACEHOLDER can silently release that allocation. Where the region query does not report the bit
-    // and the OS refuses that release (placeholder_fallback), any reserved region may be offered: a plain one
-    // fails the split instead of being released.
+    // and the OS refuses that release for a plain reservation (placeholder_fallback), reserved regions may be
+    // offered. Every region the view covers must be reserved, not only the first one of each allocation: Wine
+    // (Proton Experimental, 2026-11) released a private allocation made in place of a placeholder together with
+    // its committed second page, and the view then replaced that page (xmem_placeholder_split_partial).
     const bool fallback = placeholder_fallback();
     const auto end = address + bytes;
     while (address < end) {
@@ -1382,15 +1389,21 @@ bool alias_placeholders(ULONG_PTR address, SIZE_T bytes)
         if (!QueryVirtualMemoryInformation(GetCurrentProcess(), reinterpret_cast<void*>(address),
                                            MemoryRegionInfo, &info, sizeof(info), nullptr))
             return false;
-        if (!(info.Flags & placeholder_reservation)) {
-            MEMORY_BASIC_INFORMATION region{};
-            if (!fallback || VirtualQuery(reinterpret_cast<void*>(address), &region, sizeof(region)) != sizeof(region) ||
-                region.State != MEM_RESERVE)
-                return false;
-        }
         const auto base = reinterpret_cast<ULONG_PTR>(info.AllocationBase);
         if (address - base >= info.RegionSize) return false;
-        address += info.RegionSize - (address - base);
+        const auto allocation_end = base + info.RegionSize;
+        if (!(info.Flags & placeholder_reservation)) {
+            if (!fallback) return false;
+            const auto stop = end < allocation_end ? end : allocation_end;
+            for (auto at = address; at < stop;) {
+                MEMORY_BASIC_INFORMATION region{};
+                if (VirtualQuery(reinterpret_cast<void*>(at), &region, sizeof(region)) != sizeof(region) ||
+                    region.State != MEM_RESERVE || !region.RegionSize)
+                    return false;
+                at = reinterpret_cast<ULONG_PTR>(region.BaseAddress) + region.RegionSize;
+            }
+        }
+        address = allocation_end;
     }
     return true;
 }
@@ -1408,8 +1421,13 @@ bool install_alias_view(ULONG_PTR address, const Backing& backing, SIZE_T bytes,
     if (!map()) {
         const DWORD original_error = GetLastError();
         const auto reservation = owned_reservation(address);
-        if (reservation == memory.reservations.end() ||
-            bytes > reservation->second - (address - reservation->first) || !alias_placeholders(address, bytes)) {
+        const bool inside = reservation != memory.reservations.end() &&
+                            bytes <= reservation->second - (address - reservation->first);
+        const bool accepted = inside && alias_placeholders(address, bytes);
+#ifdef X2W_XMEM_TEST_CONTROLS
+        if (inside) InterlockedIncrement64(accepted ? &alias_splits : &alias_refusals);
+#endif
+        if (!accepted) {
             SetLastError(original_error);
             return false;
         }
@@ -1791,6 +1809,24 @@ extern "C" BOOL WINAPI x2w_xmem_map_counts(ULONGLONG* maps, ULONGLONG* splits)
     *maps = static_cast<ULONGLONG>(map_attempts);
     *splits = static_cast<ULONGLONG>(split_attempts);
     return TRUE;
+}
+
+// Test export, counted in the test-controls build only: views X2WMapPageBatch could not map in place inside an
+// owned reservation whose range alias_placeholders refused, and those for which it tried a placeholder release.
+// The deployed build returns FALSE with ERROR_NOT_SUPPORTED.
+extern "C" BOOL WINAPI x2w_xmem_alias_counts(ULONGLONG* refusals, ULONGLONG* splits)
+{
+#ifdef X2W_XMEM_TEST_CONTROLS
+    if (!refusals || !splits) return FALSE;
+    *refusals = static_cast<ULONGLONG>(alias_refusals);
+    *splits = static_cast<ULONGLONG>(alias_splits);
+    return TRUE;
+#else
+    (void)refusals;
+    (void)splits;
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return FALSE;
+#endif
 }
 
 // Experimental export: the slab accounting behind those pages (#1199): slabs open, slots in use and slots free
