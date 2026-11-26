@@ -232,4 +232,72 @@ op_monitorx_rcx_rdx PROC FRAME
     ret
 op_monitorx_rcx_rdx ENDP
 
+; 32-bit ADD flag path preserved across RDPRU (ECX=0); upper 32 bits of inputs ignored.
+op_add32_rdpru PROC FRAME
+    .endprolog
+    mov r9d, ecx
+    mov r10d, edx
+    mov rax, -1
+    mov rdx, -1
+    mov ecx, 0
+    add r9d, r10d
+    db 0fh, 01h, 0fdh       ; rdpru
+    mov qword ptr [r8], rax
+    mov qword ptr [r8+8], rdx
+    mov qword ptr [r8+16], rcx
+    mov ecx, 0
+    mov r9d, 0
+    mov r10d, 0
+    mov r11d, 0
+    setb cl
+    sete r9b
+    sets r10b
+    seto r11b
+    shl r9d, 1
+    or ecx, r9d
+    shl r10d, 2
+    or ecx, r10d
+    shl r11d, 3
+    or ecx, r11d
+    mov qword ptr [r8+24], rcx
+    shl rdx, 32
+    or rax, rdx
+    ret
+op_add32_rdpru ENDP
+
+; 32-bit CMP flag path preserved across MONITORX/MWAITX; upper 32 bits of inputs ignored.
+op_cmp32_mwaitx PROC FRAME
+    .endprolog
+    mov r9d, ecx
+    mov r10d, edx
+    lea rax, [r8]
+    xor ecx, ecx
+    xor edx, edx
+    db 0fh, 01h, 0fah       ; monitorx
+    mov qword ptr [r8], r9
+    mov eax, 0
+    mov ecx, 0
+    cmp r9d, r10d
+    db 0fh, 01h, 0fbh       ; mwaitx
+    mov qword ptr [r8+8], rax
+    mov qword ptr [r8+16], rcx
+    mov ecx, 0
+    mov r9d, 0
+    mov r10d, 0
+    mov r11d, 0
+    setb cl
+    sete r9b
+    sets r10b
+    seto r11b
+    shl r9d, 1
+    or ecx, r9d
+    shl r10d, 2
+    or ecx, r10d
+    shl r11d, 3
+    or ecx, r11d
+    mov qword ptr [r8+24], rcx
+    mov rax, rcx
+    ret
+op_cmp32_mwaitx ENDP
+
 END

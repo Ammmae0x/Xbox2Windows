@@ -7,11 +7,12 @@ where rcx, rdx, and r8 carry flat caller-owned 64-bit argument values/pointers
 bounded 64-byte output slot).
 
 Supported AMD Zen 2 user-mode instructions (docs/coverage/x64_zen2.tsv group Integer):
-  - RDPRU    (0F 01 FD): reads monotonic 64-bit performance counter selected by
-                         ECX (0 = MPERF, 1 = APERF; statically validated at lift
-                         time), zero-extends EAX -> RAX and EDX -> RDX, preserves
-                         RCX and RFLAGS, and resists /O2 CSE/DCE via volatile
-                         monotonic read + signal fences.
+  - RDPRU    (0F 01 FD): statically validates ECX in {0, 1} (0 = MPERF, 1 = APERF),
+                         zero-extends EAX -> RAX and EDX -> RDX, preserves RCX and
+                         RFLAGS, and resists /O2 CSE/DCE via volatile read + signal
+                         fences. Bounded approximation: both selectors (0 and 1) map
+                         to a serialized host RDTSC read (monotonic progression only;
+                         does not return distinct hardware MPERF/APERF counter values).
   - MONITORX (0F 01 FA): arms address-range monitor on flat caller-owned
                          [rcx|rdx|r8] linear address in RAX with ECX == 0 and
                          EDX == 0; probes address readability, preserves all GPRs
@@ -22,6 +23,8 @@ Supported AMD Zen 2 user-mode instructions (docs/coverage/x64_zen2.tsv group Int
                          rejected because it implicitly reads nonvolatile EBX, and
                          reserved bits ECX[31:2] are rejected); preserves all GPRs
                          and RFLAGS without eliding surrounding observable stores.
+                         Bounded approximation: lowers to a fenced _mm_pause()
+                         (an allowed early wake-up).
 
 Bounded volatile GPR transport (RAX, RCX, RDX, R8..R11 only):
   - mov (reg-reg, reg-imm, [r8 + disp] 32/64-bit store)
@@ -228,9 +231,10 @@ static inline void store64(word address, std::uint64_t value) {
     std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 
-// RDPRU counter read (ECX = 0 MPERF / 1 APERF). The volatile capture and signal
-// fences prevent /O2 from CSE-merging consecutive reads or DCE-eliminating
-// overwritten reads.
+// RDPRU bounded approximation: ECX (0 = MPERF, 1 = APERF) is statically validated,
+// and both selectors map to a serialized host RDTSC read (monotonic only, not true
+// hardware MPERF/APERF). The volatile capture and signal fences prevent /O2 from
+// CSE-merging consecutive reads or DCE-eliminating overwritten reads.
 static inline std::uint64_t op_rdpru_read(std::uint32_t selector) {
     (void)selector;
     std::atomic_signal_fence(std::memory_order_seq_cst);
@@ -254,8 +258,9 @@ static inline void op_monitorx(word address) {
     std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 
-// MWAITX: bounded user-mode wait hint (ECX in {0, 1}; timer mode ECX[1] rejected at lift time).
-// Preserves all GPRs and RFLAGS and keeps surrounding observable stores ordered.
+// MWAITX bounded approximation: lowers to a fenced _mm_pause() (an allowed early
+// wake-up; ECX in {0, 1}; timer mode ECX[1] rejected at lift time). Preserves all
+// GPRs and RFLAGS and keeps surrounding observable stores ordered.
 static inline void op_mwaitx(std::uint32_t hints, std::uint32_t extensions) {
     std::atomic_signal_fence(std::memory_order_seq_cst);
     const volatile std::uint32_t observed = hints ^ (extensions << 16);

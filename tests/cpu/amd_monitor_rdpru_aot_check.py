@@ -30,6 +30,7 @@ import pefile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from cpu_leaf_aot import bounded_code, export_rva  # noqa: E402
+import cpu_amd_monitor_rdpru_aot  # noqa: E402
 from cpu_amd_monitor_rdpru_aot import lift_code  # noqa: E402
 
 EXPORTS = (
@@ -40,6 +41,8 @@ EXPORTS = (
     "op_monitorx_mwaitx_r8",
     "op_monitorx_mwaitx_intbrk",
     "op_monitorx_rcx_rdx",
+    "op_add32_rdpru",
+    "op_cmp32_mwaitx",
 )
 
 ALTERED_EXPORTS = (
@@ -71,6 +74,43 @@ FLAG_PAIRS = (
     (0x8000000000000000, 1),
     (1, 0x8000000000000000),
 )
+
+FLAG_PAIRS_32 = (
+    (0, 0),
+    (1, 1),
+    (5, 9),
+    (9, 5),
+    (0x7FFFFFFF, 1),
+    (0x80000000, 0x80000000),
+    (0xFFFFFFFF, 1),
+    (0xFFFFFFFF, 0xFFFFFFFF),
+    (0x80000000, 1),
+    (1, 0x80000000),
+    (0x100000005, 0x200000009),
+    (0x900000009, 0x100000005),
+)
+
+
+def add32_flags(a, b):
+    a &= MASK32
+    b &= MASK32
+    r = (a + b) & MASK32
+    cf = 1 if (a + b) > MASK32 else 0
+    zf = 1 if r == 0 else 0
+    sf = 1 if (r >> 31) else 0
+    of = 1 if (((~(a ^ b)) & (a ^ r)) >> 31) & 1 else 0
+    return cf | (zf << 1) | (sf << 2) | (of << 3)
+
+
+def cmp32_flags(a, b):
+    a &= MASK32
+    b &= MASK32
+    r = (a - b) & MASK32
+    cf = 1 if a < b else 0
+    zf = 1 if r == 0 else 0
+    sf = 1 if (r >> 31) else 0
+    of = 1 if (((a ^ b) & (a ^ r)) >> 31) & 1 else 0
+    return cf | (zf << 1) | (sf << 2) | (of << 3)
 
 
 def add64_flags(a, b):
@@ -411,10 +451,68 @@ def check_runtime_suite(label, funcs, serial_tsc, *, check_tsc_bracket, check_nu
         assert fault_slots[1] == SENTINEL64, f"{label}: post-MONITORX store hoisted before fault"
         total += 1
 
+    # 6. 32-bit ADD and CMP flag paths across RDPRU and MONITORX/MWAITX
+    for a, b in FLAG_PAIRS_32:
+        before = serial_tsc() if check_tsc_bracket else 0
+        ret, slots = call_export(funcs["op_add32_rdpru"], a, b)
+        after = serial_tsc() if check_tsc_bracket else MASK64
+        lo, hi, ecx_out, flags_out = slots[0], slots[1], slots[2], slots[3]
+        assert lo <= MASK32 and hi <= MASK32
+        assert ret == ((hi << 32) | lo)
+        if check_tsc_bracket:
+            assert before <= ret <= after
+        assert ecx_out == 0 and flags_out == add32_flags(a, b)
+
+        ret_c, slots_c = call_export(funcs["op_cmp32_mwaitx"], a, b)
+        want_c = cmp32_flags(a, b)
+        assert slots_c[0] == (a & MASK32) and slots_c[1] == 0 and slots_c[2] == 0 and slots_c[3] == want_c
+        assert ret_c == want_c
+        total += 2
+
     return total
 
 
-def check_altered_and_mutants(lifted, altered_lifted):
+MUTANT_SPECS = (
+    ("mut_rdpru_no_zext", "op_rdpru_mperf", "rax = static_cast<std::uint32_t>(pru); rdx = pru >> 32;",
+     "rax = pru | 0x100000000ull; rdx = (pru >> 32) | 0x100000000ull;"),
+    ("mut_rdpru_swap_halves", "op_rdpru_mperf", "rax = static_cast<std::uint32_t>(pru); rdx = pru >> 32;",
+     "rax = pru >> 32; rdx = static_cast<std::uint32_t>(pru);"),
+    ("mut_rdpru_clobber_flags", "op_rdpru_mperf", "rdx = pru >> 32; }",
+     "rdx = pru >> 32; cf = false; zf = false; sf = false; of = false; }"),
+    ("mut_mwaitx_clobber_flags", "op_monitorx_mwaitx_r8", "op_mwaitx(static_cast<std::uint32_t>(rax), 0u);",
+     "op_mwaitx(static_cast<std::uint32_t>(rax), 0u); cf = false; zf = false; sf = false; of = false;"),
+    ("mut_mwaitx_drop_hint_ext", "op_monitorx_mwaitx_intbrk", "op_mwaitx(static_cast<std::uint32_t>(rax), 1u);",
+     "op_mwaitx(static_cast<std::uint32_t>(rax), 1u); rax = 0ull; rcx = 0ull;"),
+    ("mut_cmp32_flip_cf", "op_cmp32_mwaitx", "op_cmp32(r9, r10, cf, zf, sf, of);",
+     "op_cmp32(r9, r10, cf, zf, sf, of); cf = static_cast<std::uint32_t>(r9) > static_cast<std::uint32_t>(r10);"),
+)
+
+
+def emit_mutants(original_path, out_cpp):
+    """Emit compiled C++ mutation controls from translated functions."""
+    unique_exports = []
+    for _, src_name, _, _ in MUTANT_SPECS:
+        if src_name not in unique_exports:
+            unique_exports.append(src_name)
+    base_src, _ = cpu_amd_monitor_rdpru_aot.translate(original_path, unique_exports)
+    chunks = [base_src]
+    with pefile.PE(str(original_path), fast_load=True) as pe:
+        by_name = {}
+        for name in unique_exports:
+            entry = export_rva(pe, name)
+            fn_src, _ = lift_code(name, entry, bounded_code(pe, entry))
+            by_name[name] = fn_src
+    for mut_name, src_name, needle, repl in MUTANT_SPECS:
+        src = by_name[src_name]
+        if needle not in src:
+            raise AssertionError(f"mutant {mut_name}: needle {needle!r} not found in {src_name}")
+        mutated = src.replace(f"lifted_{src_name}", mut_name, 1).replace(needle, repl, 1)
+        chunks.append(mutated)
+    out_cpp.parent.mkdir(parents=True, exist_ok=True)
+    out_cpp.write_text("\n".join(chunks) + "\n", encoding="utf-8")
+
+
+def check_altered_and_mutants(lifted, altered_lifted, mutants_path=None, serial_tsc=None):
     # Altered-lifted build must diverge on every altered export.
     _, s_orig_m = call_export(lifted["op_rdpru_mperf"], 5, 9)
     _, s_alt_m = call_export(altered_lifted["op_rdpru_mperf"], 5, 9)
@@ -440,27 +538,43 @@ def check_altered_and_mutants(lifted, altered_lifted):
     _, s_alt_ib = call_export(altered_lifted["op_monitorx_mwaitx_intbrk"], 1, 2)
     assert s_orig_ib[1] == 0x10 and s_alt_ib[1] == 0x20
 
-    # Faulty mutant models must disagree with lifted outputs.
     mutants = 0
-    # 1. Missing 32->64 zero extension on RAX/RDX after RDPRU
-    assert (s_orig_m[0] >> 32) == 0 and (s_orig_m[1] >> 32) == 0
-    mutants += 1
-    # 2. Swapped RAX/RDX halves in returned 64-bit counter
-    ret_m, slots_m = call_export(lifted["op_rdpru_mperf"], 1, 2)
-    swapped = (slots_m[0] << 32) | slots_m[1]
-    assert ret_m != swapped or slots_m[0] == slots_m[1]
-    mutants += 1
-    # 3. Clobbering RFLAGS on RDPRU
-    _, s_of = call_export(lifted["op_rdpru_mperf"], 0x7FFFFFFFFFFFFFFF, 1)
-    assert s_of[3] == add64_flags(0x7FFFFFFFFFFFFFFF, 1) and s_of[3] != 0
-    mutants += 1
-    # 4. Clobbering RFLAGS on MWAITX
-    _, s_cf = call_export(lifted["op_monitorx_mwaitx_r8"], 5, 9)
-    assert s_cf[3] == cmp64_flags(5, 9) and s_cf[3] != 0
-    mutants += 1
-    # 5. Dropping MWAITX EAX hint or ECX=1 extension
-    assert s_orig_ib[1] == 0x10 and s_orig_ib[2] == 1
-    mutants += 1
+    if mutants_path is not None:
+        mut_lib = ctypes.CDLL(str(Path(mutants_path).resolve()))
+        mut = {}
+        for mut_name, _, _, _ in MUTANT_SPECS:
+            fn = getattr(mut_lib, mut_name)
+            fn.argtypes = [ctypes.c_uint64] * 3
+            fn.restype = ctypes.c_uint64
+            mut[mut_name] = fn
+
+        # 1. Missing 32->64 zero extension on RAX/RDX after RDPRU
+        _, sm1 = call_export(mut["mut_rdpru_no_zext"], 1, 2)
+        assert (sm1[0] >> 32) != 0 and (sm1[1] >> 32) != 0
+        mutants += 1
+        # 2. Swapped RAX/RDX halves in returned 64-bit counter
+        before = serial_tsc()
+        rm2, sm2 = call_export(mut["mut_rdpru_swap_halves"], 1, 2)
+        after = serial_tsc()
+        unswapped = (sm2[0] << 32) | sm2[1]
+        assert sm2[0] != sm2[1] and before <= unswapped <= after and not (before <= rm2 <= after)
+        mutants += 1
+        # 3. Clobbering RFLAGS on RDPRU
+        _, sm3 = call_export(mut["mut_rdpru_clobber_flags"], 0x7FFFFFFFFFFFFFFF, 1)
+        assert sm3[3] != add64_flags(0x7FFFFFFFFFFFFFFF, 1)
+        mutants += 1
+        # 4. Clobbering RFLAGS on MWAITX
+        _, sm4 = call_export(mut["mut_mwaitx_clobber_flags"], 5, 9)
+        assert sm4[3] != cmp64_flags(5, 9)
+        mutants += 1
+        # 5. Dropping MWAITX EAX hint and ECX=1 extension
+        _, sm5 = call_export(mut["mut_mwaitx_drop_hint_ext"], 1, 2)
+        assert sm5[1] != 0x10 or sm5[2] != 1
+        mutants += 1
+        # 6. Flipping CF in op_cmp32 (a < b -> a > b)
+        rc6, _ = call_export(mut["mut_cmp32_flip_cf"], 5, 9)
+        assert rc6 != cmp32_flags(5, 9)
+        mutants += 1
     return len(ALTERED_EXPORTS), mutants
 
 
@@ -482,11 +596,15 @@ def record_covered_forms(original_path):
 
 
 def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "emit-mutants":
+        emit_mutants(Path(sys.argv[2]), Path(sys.argv[3]))
+        return
+
     if os.environ.get("FORM_COVERAGE_RECORD"):
         Path(os.environ["FORM_COVERAGE_RECORD"]).unlink(missing_ok=True)
 
-    original_path, lifted_path, lifted_o2_path, altered_path, altered_lifted_path = (
-        Path(p) for p in sys.argv[1:6]
+    original_path, lifted_path, lifted_o2_path, altered_path, altered_lifted_path, mutants_path = (
+        Path(p) for p in sys.argv[1:7]
     )
 
     accepted, rejected = check_translator()
@@ -509,10 +627,10 @@ def main():
 
     dbg_total = check_runtime_suite("lifted", lifted, serial_tsc, check_tsc_bracket=True, check_null_fault=True)
     o2_total = check_runtime_suite("lifted_o2", lifted_o2, serial_tsc, check_tsc_bracket=True, check_null_fault=True)
-    alt_count, mut_count = check_altered_and_mutants(lifted, altered_lifted)
+    alt_count, mut_count = check_altered_and_mutants(lifted, altered_lifted, mutants_path, serial_tsc)
     print(
         f"lifted Debug ({dbg_total} checks) + /O2 ({o2_total} checks) + NULL fault-ordering passed; "
-        f"{alt_count} altered-build + {mut_count} mutant controls caught"
+        f"{alt_count} altered-build + {mut_count} compiled C++ mutant controls caught"
     )
 
     has_mwaitx = bool(has_mwaitx_fn())

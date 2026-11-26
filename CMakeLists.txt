@@ -7729,7 +7729,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(cpu_aot_rdtscp PROPERTIES SKIP_RETURN_CODE 77)
     set(cpu_amd_monitor_rdpru_aot_exports
         "op_rdpru_mperf,op_rdpru_aperf,op_rdpru_twice,op_rdpru_unused,"
-        "op_monitorx_mwaitx_r8,op_monitorx_mwaitx_intbrk,op_monitorx_rcx_rdx")
+        "op_monitorx_mwaitx_r8,op_monitorx_mwaitx_intbrk,op_monitorx_rcx_rdx,"
+        "op_add32_rdpru,op_cmp32_mwaitx")
     string(CONCAT cpu_amd_monitor_rdpru_aot_exports ${cpu_amd_monitor_rdpru_aot_exports})
     foreach(variant IN ITEMS original altered)
         cpu_asm_fixture(cpu_amd_monitor_rdpru_aot_${variant} amd_monitor_rdpru_aot)
@@ -7744,13 +7745,21 @@ if(EXISTS "${INTAKE_PYTHON}")
             "/Fe${cpu_amd_monitor_rdpru_o2}"
         DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/cpu_amd_monitor_rdpru_aot_original_lifted.cpp" VERBATIM)
     add_custom_target(cpu_amd_monitor_rdpru_aot_original_lifted_o2 ALL DEPENDS "${cpu_amd_monitor_rdpru_o2}")
+    set(cpu_amd_monitor_rdpru_mutants_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_amd_monitor_rdpru_aot_mutants.cpp")
+    add_custom_command(OUTPUT "${cpu_amd_monitor_rdpru_mutants_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/amd_monitor_rdpru_aot_check.py"
+            emit-mutants "$<TARGET_FILE:cpu_amd_monitor_rdpru_aot_original>" "${cpu_amd_monitor_rdpru_mutants_cpp}"
+        DEPENDS cpu_amd_monitor_rdpru_aot_original tests/cpu/amd_monitor_rdpru_aot_check.py
+            tools/cpu_amd_monitor_rdpru_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_amd_monitor_rdpru_aot_mutants SHARED "${cpu_amd_monitor_rdpru_mutants_cpp}")
     add_test(NAME cpu_aot_amd_monitor_rdpru COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/amd_monitor_rdpru_aot_check.py"
         "$<TARGET_FILE:cpu_amd_monitor_rdpru_aot_original>"
         "$<TARGET_FILE:cpu_amd_monitor_rdpru_aot_original_lifted>"
         "${cpu_amd_monitor_rdpru_o2}"
         "$<TARGET_FILE:cpu_amd_monitor_rdpru_aot_altered>"
-        "$<TARGET_FILE:cpu_amd_monitor_rdpru_aot_altered_lifted>")
+        "$<TARGET_FILE:cpu_amd_monitor_rdpru_aot_altered_lifted>"
+        "$<TARGET_FILE:cpu_amd_monitor_rdpru_aot_mutants>")
     set_tests_properties(cpu_aot_amd_monitor_rdpru PROPERTIES
         SKIP_RETURN_CODE 77
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_amd_monitor_rdpru.txt")
