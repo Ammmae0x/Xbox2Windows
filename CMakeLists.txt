@@ -10557,6 +10557,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(ffx_working_set_delta_cli_check PROPERTIES TIMEOUT 60)
     add_test(NAME bink_descriptors_aot_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/bink_descriptors_aot_check.py")
+    add_test(NAME tooling_bink_descriptors_aot_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/bink_descriptors_aot_cli_check.py")
+    set_tests_properties(tooling_bink_descriptors_aot_cli_check PROPERTIES TIMEOUT 60)
     add_test(NAME range_manifest_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/range_manifest_check.py")
     add_test(NAME pe_resource_inventory_cli_check COMMAND "${INTAKE_PYTHON}" -B
