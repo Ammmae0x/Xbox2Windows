@@ -336,7 +336,6 @@ void default_case(const Shim& shim, unsigned char* base)
     shim.release(pages, tokens);
     CloseHandle(unmapped);
     CloseHandle(release);
-    std::printf("default mode: readers answer inside an unmap\n");
 }
 
 // Lazy commit: the output buffers lie in a mapped page whose slot is not committed until it is touched.
@@ -675,6 +674,8 @@ int main(int argc, char** argv)
         if (two_runs) two_runs_case(shim, at);
         if (mirror) mirror_case(shim, base);
         VirtualFree(base, 0, MEM_RELEASE);
+        // The default mode's pass line, at the end and only with no failed check (ctest matches it).
+        if (default_mode && !failures) std::printf("default mode: readers answer inside an unmap\n");
         std::printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
         return failures ? 1 : 0;
     }
