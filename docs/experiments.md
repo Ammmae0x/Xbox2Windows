@@ -15719,9 +15719,9 @@ ctest --preset release --no-tests=error -R '^cpu_aot_vex_parity$' -V
 
 ### gfx1013 pixel DPP16 quad broadcast
 
-The pixel translator lowers `quad_perm:[k,k,k,k]` (k = 0 to 3) with full `row_mask` and `bank_mask` on `v_mov_b32` and the VOP1/VOP2 float, integer and integer-to-float forms to `QuadReadLaneAt(value, k)`. The four lanes of a pixel quad are one 2 x 2 block (lane = x & 1 | (y & 1) << 1). It is accepted only in a straight-line pixel stage that ran `s_wqm_b64 exec, exec` (or `s_wqm_b32 exec_lo, exec_lo`) with EXEC unchanged since: the entry EXEC can leave out lanes of a partly covered quad, and the guest would then read an inactive source lane while `QuadReadLaneAt` returns a helper lane's value. Without that proof the instruction is refused, as are swaps, pair broadcasts, row shifts, mirrors, DPP8, partial masks, `bound_ctrl:0`, non-VGPR sources and vertex stages. `fi:1` is accepted with the proof and changes nothing, since no source lane is disabled. A stage that holds a quad read compiles as `ps_6_0` with DXC (`X2W_DXC`, the Windows Kits `bin` folder or `PATH`), and its vertex stage as `vs_6_0`.
+The pixel translator lowers `quad_perm:[k,k,k,k]` (k = 0 to 3) with full `row_mask` and `bank_mask` on `v_mov_b32` and the VOP1/VOP2 float, integer and integer-to-float forms to `QuadReadLaneAt(value, k)`. The four lanes of a pixel quad are one 2 x 2 block (lane = x & 1 | (y & 1) << 1). It is accepted in the entry straight-line prefix of a pixel stage that ran `s_wqm_b64 exec, exec` (or `s_wqm_b32 exec_lo, exec_lo`) with EXEC unchanged since: the entry EXEC can leave out lanes of a partly covered quad, and the guest would then read an inactive source lane while `QuadReadLaneAt` returns a helper lane's value. A later uniform loop or forward branch elsewhere in the same stage does not drop that proof (the M200-01/003 shape). Without the proof the instruction is refused, as are a broadcast after a branch target, after EXEC changed, or with divergent EXEC before the broadcast, swaps, pair broadcasts, row shifts, mirrors, DPP8, partial masks, `bound_ctrl:0`, non-VGPR sources and vertex stages. `fi:1` is accepted with the proof and changes nothing, since no source lane is disabled. A stage that holds a quad read compiles as `ps_6_0` with DXC (`X2W_DXC`, the Windows Kits `bin` folder or `PATH`), and its vertex stage as `vs_6_0`.
 
-Reproduce: `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_broadcast" -V`. The controls cover the translation, every refusal and the missing `s_wqm`; the WARP and hardware draws compare all 256 pixels of two fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls. This does not establish full-game startup.
+Reproduce: `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_dpp_quad_broadcast" -V`. The controls cover the translation, every refusal, the missing `s_wqm`, the loop fixture and the divergent-EXEC control; the WARP and hardware draws compare all 256 pixels of the integer, float and loop fixtures with a CPU reference, with wrong-lane and own-lane translations as failing controls. This does not establish full-game startup.
 
 ## Startup root signature changes
 
@@ -16101,6 +16101,20 @@ Building on #2443 (Slice 1), `X2W_D3D12_RELEASE_RETIRED=1` extends desktop objec
 
 ```powershell
 ctest --preset dev --no-tests=error -R '^startup_resource_(retire|budget)' -V
+```
+
+## Refusing unmodelled modifiers in the startup translator
+
+Several `Stage` instruction handlers accepted a `mods` list without reading it, so an encoding modifier such as
+`clamp`, `omod` (`mul:2`), or `op_sel` on `v_mov_b32`, `v_cvt_pkrtz_f16_f32`, or `v_interp_mov_f32` was silently
+dropped from the emitted HLSL (#1771). `MODIFIER_FREE_HANDLERS` declares these five handlers (`op_v_mov_b32`,
+`op_v_cvt_pkrtz_f16_f32`, `op_v_interp_p1_f32`, `op_v_interp_p2_f32`, and `op_v_interp_mov_f32`), and `Stage.one`
+refuses any non-empty `mods` list before dispatching to them. Scalar-ALU handlers are omitted because their encodings
+have no modifier field. Separately, `op_v_interp_p1_f32` and `op_v_interp_p2_f32` refuse `abs`/`neg` modifiers (`|...|`
+or `-...`) printed on the ignored data-source operand (`ops[1]`).
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_modifier_free$' -V
 ```
 
 ## Source `abs` modifiers (`|src|` and `-|src|`) on `v_cndmask_b32_e64` in the startup translator
