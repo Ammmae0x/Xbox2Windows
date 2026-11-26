@@ -13,7 +13,14 @@
 // With `control` (the build whose local_log.h asks xmem.dll for a missing export, so the header readers run
 // directly) the three header readers answer inside the window: the check expects that, and fails if they wait.
 //
-// Usage: xmem_run_break_readers_check <xmem.dll built with its test controls> [control]
+// Then a page that faults in two breaks in a row (retry_remapped_page): a thread faults on a page of a run taken
+// apart by break A, and the test build's X2W_XMEM_TEST_HOLD_RETRY holds the handler until break A has ended, so the
+// handler reads the generation after it; the thread is retried and reads its page. Break B then takes the same page
+// apart, and the thread faults on it again: that fault must be retried as well (a different break). With
+// `next-break-control` the handler is not held, so it reads break A while A is open: that order passes even when
+// the handler names the breaks wrongly, which shows the hold is what this case depends on.
+//
+// Usage: xmem_run_break_readers_check <xmem.dll built with its test controls> [control|next-break-control]
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -112,13 +119,92 @@ void window_case(const Shim& shim, unsigned char* base, int index, const char* n
     CloseHandle(unmapped);
     CloseHandle(release);
 }
+struct Events {
+    char name[64];
+    HANDLE first, second;
+    Events(const char* stem, const char* a, const char* b)
+    {
+        std::snprintf(name, sizeof(name), "x2w-run-break-%s-%lu", stem, GetCurrentProcessId());
+        char event_name[96];
+        std::snprintf(event_name, sizeof(event_name), "%s.%s", name, a);
+        first = CreateEventA(nullptr, TRUE, FALSE, event_name);
+        std::snprintf(event_name, sizeof(event_name), "%s.%s", name, b);
+        second = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    }
+    ~Events()
+    {
+        CloseHandle(first);
+        CloseHandle(second);
+    }
+};
+
+// Break A: unmap page 7 of a run of eight; break B: unmap page 6 of what is left, [0, 7). The reader's page 2 is in
+// both. hold_retry: the handler for the fault in break A reads the break only after A has ended.
+void next_break_case(const Shim& shim, unsigned char* base, bool hold_retry)
+{
+    const char* const name = hold_retry ? "next_break" : "next_break_control";
+    SIZE_T count = pages, tokens[pages] = {};
+    if (!shim.allocate(0x20400000, &count, tokens) || count != pages || shim.map(base, pages, tokens) != base) {
+        check(false, "map_run", name);
+        return;
+    }
+    for (SIZE_T i = 0; i < pages; ++i) *reinterpret_cast<std::uint32_t*>(base + i * page) = 0x52000000u + static_cast<std::uint32_t>(i);
+    unsigned char* const target = base + 2 * page;
+    Events window_a("a", "unmapped", "release"), window_b("b", "unmapped", "release"), retry("retry", "faulted", "go");
+    HANDLE second_read = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    std::atomic<int> reads{0};
+    std::uint32_t first_value = 0, second_value = 0;
+
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", window_a.name);
+    std::thread unmap_a([&] { shim.map(base + 7 * page, 1, nullptr); });
+    const bool a_open = WaitForSingleObject(window_a.first, 10000) == WAIT_OBJECT_0;
+    check(a_open, "break_a_held", name);
+    if (hold_retry) SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_RETRY", retry.name);
+    std::thread reader([&] {
+        first_value = *reinterpret_cast<volatile std::uint32_t*>(target);  // faults in break A
+        ++reads;
+        WaitForSingleObject(second_read, 10000);
+        second_value = *reinterpret_cast<volatile std::uint32_t*>(target);  // faults in break B
+        ++reads;
+    });
+    if (hold_retry) {
+        check(WaitForSingleObject(retry.first, 10000) == WAIT_OBJECT_0, "handler_held_before_reading_the_break", name);
+        SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_RETRY", nullptr);
+    } else {
+        Sleep(100);  // the handler reads break A while it is open, then waits for it
+    }
+    SetEvent(window_a.second);
+    unmap_a.join();
+    check(raw_state(target) == MEM_COMMIT, "break_a_ended", name);
+    if (hold_retry) SetEvent(retry.second);  // the handler now reads the generation after break A
+    for (int i = 0; i < 200 && reads.load() < 1; ++i) Sleep(10);
+    check(reads.load() == 1 && first_value == 0x52000002u, "first_fault_retried", name);
+
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", window_b.name);
+    std::thread unmap_b([&] { shim.map(base + 6 * page, 1, nullptr); });
+    const bool b_open = WaitForSingleObject(window_b.first, 10000) == WAIT_OBJECT_0;
+    check(b_open && raw_state(target) != MEM_COMMIT, "break_b_held_page_not_committed", name);
+    SetEvent(second_read);
+    Sleep(300);
+    check(reads.load() == 1, "second_fault_waits_for_break_b", name);
+    SetEvent(window_b.second);
+    unmap_b.join();
+    reader.join();
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", nullptr);
+    check(reads.load() == 2 && second_value == 0x52000002u, "second_fault_retried", name);
+    shim.map(base, 6, nullptr);
+    shim.release(pages, tokens);
+    CloseHandle(second_read);
+    if (!hold_retry) std::printf("next-break control: the handler read break A while it was open\n");
+}
 }  // namespace
 
 int main(int argc, char** argv)
 {
     const bool control = argc > 2 && std::strcmp(argv[2], "control") == 0;
-    if (argc < 2 || (argc > 2 && !control)) {
-        std::printf("usage: xmem_run_break_readers_check <test-controls xmem.dll> [control]\n");
+    const bool next_break_control = argc > 2 && std::strcmp(argv[2], "next-break-control") == 0;
+    if (argc < 2 || (argc > 2 && !control && !next_break_control)) {
+        std::printf("usage: xmem_run_break_readers_check <test-controls xmem.dll> [control|next-break-control]\n");
         return 2;
     }
     // The mode is read by the first mapping call; the VirtualQueryEx import is wrapped when xmem.dll loads.
@@ -144,6 +230,12 @@ int main(int argc, char** argv)
         return 1;
     }
     unsigned char* const at = base + page;
+    if (next_break_control) {
+        next_break_case(shim, at, false);
+        VirtualFree(base, 0, MEM_RELEASE);
+        std::printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
+        return failures ? 1 : 0;
+    }
     int index = 0;
     if (!control) {
         window_case(shim, at, index++, "x2w_xmem_stable_call", true, [&](unsigned char* target) {
@@ -178,6 +270,7 @@ int main(int argc, char** argv)
         const auto snapshot = x2w_startup::snapshot_samplers({reinterpret_cast<std::uintptr_t>(target), 4}, false);
         return snapshot.count == 4 && snapshot.readable.count() == 4 && snapshot.words[0][0] == 0x51000000u + neighbour;
     });
+    if (!control) next_break_case(shim, at, true);
     VirtualFree(base, 0, MEM_RELEASE);
     std::printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
     return failures ? 1 : 0;

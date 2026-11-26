@@ -346,7 +346,10 @@ target_include_directories(xmem_run_break_readers_control PRIVATE src)
 add_test(NAME xmem_run_break_readers COMMAND xmem_run_break_readers_check "$<TARGET_FILE:xmem_shim_test_controls>")
 add_test(NAME xmem_run_break_readers_control COMMAND xmem_run_break_readers_control
          "$<TARGET_FILE:xmem_shim_test_controls>" control)
-set_tests_properties(xmem_run_break_readers xmem_run_break_readers_control PROPERTIES TIMEOUT 60)
+add_test(NAME xmem_run_break_readers_next_break_control COMMAND xmem_run_break_readers_check
+         "$<TARGET_FILE:xmem_shim_test_controls>" next-break-control)
+set_tests_properties(xmem_run_break_readers xmem_run_break_readers_control xmem_run_break_readers_next_break_control
+                     PROPERTIES TIMEOUT 60)
 add_executable(xmem_section_lease_check tests/xmem_section_lease_check.cpp tests/desktop_gpu.cpp)
 target_include_directories(xmem_section_lease_check PRIVATE src)
 target_compile_features(xmem_section_lease_check PRIVATE cxx_std_17)

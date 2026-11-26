@@ -508,6 +508,30 @@ void end_break()
 
 struct EndBreak { ~EndBreak() { end_break(); } };
 
+// Test build only: X2W_XMEM_TEST_HOLD_RETRY=<name> holds the fault handler before it reads the break: it sets
+// "<name>.faulted", then waits up to five seconds for "<name>.go", so that a test can end the break first.
+#ifdef X2W_XMEM_TEST_CONTROLS
+void hold_retry()
+{
+    char name[96];
+    const DWORD length = GetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_RETRY", name, sizeof(name) - 16);
+    if (!length || length >= sizeof(name) - 16) return;
+    char event_name[128];
+    std::snprintf(event_name, sizeof(event_name), "%s.faulted", name);
+    HANDLE faulted = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    std::snprintf(event_name, sizeof(event_name), "%s.go", name);
+    HANDLE go = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    if (faulted && go) {
+        SetEvent(faulted);
+        WaitForSingleObject(go, 5000);
+    }
+    if (faulted) CloseHandle(faulted);
+    if (go) CloseHandle(go);
+}
+#else
+void hold_retry() {}
+#endif
+
 // Retries an access violation only when all of this holds: the address is inside a run that the
 // break in progress, or the last finished one, took apart; after that break has finished (the
 // mutex) the page is recorded and covered by a view; and this thread has not already retried this
@@ -520,6 +544,7 @@ LONG CALLBACK retry_remapped_page(EXCEPTION_POINTERS* e)
         return EXCEPTION_CONTINUE_SEARCH;
     const ULONG_PTR address = record->ExceptionInformation[1];
     const ULONG_PTR page = address & ~(ULONG_PTR{page_bytes} - 1);
+    hold_retry();
     bool inside = false;
     AcquireSRWLockShared(&remap_window.lock);
     const ULONG64 seen = remap_window.generation;
@@ -527,7 +552,9 @@ LONG CALLBACK retry_remapped_page(EXCEPTION_POINTERS* e)
         inside |= address - base < size;
     ReleaseSRWLockShared(&remap_window.lock);
     if (!inside || seen == 0) return EXCEPTION_CONTINUE_SEARCH;
-    const ULONG64 break_id = seen | 1;  // the break in progress, or the one that just finished
+    // The break in progress (odd), or the one that just finished (even: the one before). Not seen | 1, which for an
+    // even generation names the next break, so that a fault in it, on the same page, would not be retried.
+    const ULONG64 break_id = (seen - 1) | 1;
     thread_local ULONG_PTR retried_page = 0;
     thread_local ULONG64 retried_break = 0;
     if (retried_page == page && retried_break == break_id) return EXCEPTION_CONTINUE_SEARCH;
