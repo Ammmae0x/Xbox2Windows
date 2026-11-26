@@ -7147,6 +7147,40 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_sse34_fp>" "$<TARGET_FILE:cpu_sse34_fp_lifted>")
     set_tests_properties(cpu_aot_sse34_fp PROPERTIES SKIP_RETURN_CODE 77)
 
+    # cpu_aot_sse41_fp
+    set(cpu_sse41_fp_aot_exports
+        "op_roundps_reg_0,op_roundps_reg_1,op_roundps_reg_2,op_roundps_reg_3,op_roundps_reg_4,op_roundps_reg_8,"
+        "op_roundps_mem_rcx,op_roundps_mem_rdx,op_roundps_mem_r8,"
+        "op_roundpd_reg_0,op_roundpd_reg_1,op_roundpd_reg_2,op_roundpd_reg_3,op_roundpd_reg_4,"
+        "op_roundpd_mem_rcx,op_roundpd_mem_rdx,op_roundpd_mem_r8,"
+        "op_roundss_reg_0,op_roundss_reg_1,op_roundss_reg_2,op_roundss_reg_3,op_roundss_reg_4,"
+        "op_roundss_mem_rcx,op_roundss_mem_rdx,op_roundss_mem_r8,"
+        "op_roundsd_reg_0,op_roundsd_reg_1,op_roundsd_reg_2,op_roundsd_reg_3,op_roundsd_reg_4,"
+        "op_roundsd_mem_rcx,op_roundsd_mem_rdx,op_roundsd_mem_r8,"
+        "op_dpps_reg_f1,op_dpps_reg_ff,op_dpps_reg_5a,op_dpps_reg_0f,"
+        "op_dpps_mem_rcx,op_dpps_mem_rdx,op_dpps_mem_r8,"
+        "op_dppd_reg_33,op_dppd_reg_11,op_dppd_reg_22,op_dppd_reg_03,"
+        "op_dppd_mem_rcx,op_dppd_mem_rdx,op_dppd_mem_r8,"
+        "op_insertps_reg_s1_d2_z5,op_insertps_reg_s3_d0_z0,op_insertps_reg_s0_d3_z8,"
+        "op_insertps_mem_rcx,op_insertps_mem_rdx,op_insertps_mem_r8,"
+        "op_extractps_r32_lane2,op_extractps_r64_lane3,op_extractps_mem_lane1,"
+        "op_sse41_glue_pipeline")
+    string(CONCAT cpu_sse41_fp_aot_exports ${cpu_sse41_fp_aot_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sse41_fp_aot_${variant} sse41_fp_aot)
+        cpu_translation(cpu_sse41_fp_aot_${variant} cpu_sse41_fp_aot "${cpu_sse41_fp_aot_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sse41_fp_aot_altered PRIVATE ALTER_SSE41_FP)
+    add_test(NAME cpu_aot_sse41_fp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sse41_fp_aot_check.py"
+        "$<TARGET_FILE:cpu_sse41_fp_aot_original>"
+        "$<TARGET_FILE:cpu_sse41_fp_aot_original_lifted>"
+        "$<TARGET_FILE:cpu_sse41_fp_aot_altered>"
+        "$<TARGET_FILE:cpu_sse41_fp_aot_altered_lifted>")
+    set_tests_properties(cpu_aot_sse41_fp PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_sse41_fp.txt")
+
     cpu_asm_fixture(cpu_avx_packed_int avx_packed_int)
     set(avx_packed_int_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_packed_int_lifted.cpp")
     add_custom_command(OUTPUT "${avx_packed_int_fixture}"
