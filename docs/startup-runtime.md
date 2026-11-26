@@ -3287,9 +3287,13 @@ no target, depth or unordered-access flag, and a format with a known element siz
 texels and BC1 to BC7, whose largest mip must then be whole 4x4 blocks). The view must use a supported typed format that matches the storage format or belongs to its typeless parent. The 2D or 2D-array view must fit the mip and slice ranges. A mismatched or interior view overlapping a live resource preserves the destination descriptor.
 
 A three-dimensional description is taken in one layout only: `0x105` (4 KiB standard), one sample,
-at most 2048 texels on each side and an uncompressed format with a known element size, with one mip
-or a mip chain its largest side (depth included) allows, viewed as a Texture3D whose mips fit the
-chain. addrlib lays a 3D resource in a standard or display mode out in thick blocks
+at most 2048 texels on each side and a format with a known element size (8- to 128-bit texels and
+BC1 to BC7, whose largest mip must then be whole 4x4 blocks across and down; the depth is any), with
+one mip or a mip chain its largest side (depth included) allows, viewed as a Texture3D whose mips fit
+the chain. A block-compressed volume is laid out as the volume of its 4x4 blocks, each one depth layer
+deep: the sides are rounded up to whole blocks first, and every mip size after that is counted in
+blocks (`ElemLib::AdjustSurfaceInfo`), so a mip whose texel side is not a multiple of 4 can be a block
+wider in the layout than in the view. addrlib lays a 3D resource in a standard or display mode out in thick blocks
 (`Gfx10Lib::HwlIsThick`): the 12 address bits of a block follow the one-pipe rows of
 `GFX10_SW_4K_S3_PATINFO`, the block is 16x16x16, 8x16x16, 8x16x8, 8x8x8 or 4x8x8 elements for 1- to
 16-byte elements, and the volume is stored a layer of blocks (one block deep) at a time. Each layer
@@ -3301,7 +3305,7 @@ read as 256-byte micro blocks, gives its origin in x and y (`ComputeSurfaceInfoM
 depth layer is copied to its own footprint rows.
 Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
 the linear mode `0x100` without a live texture, cube views, three-dimensional descriptions in any
-other layout or with a block-compressed format, multisampled textures, the XOR swizzle modes and
+other layout, multisampled textures, the XOR swizzle modes and
 every other layout value. The texels must be readable and span
 at most 64 MiB.
 
@@ -3342,9 +3346,10 @@ Limits and choices that are not measured against a console:
   in `startup_gfx10_layout_check.cpp` (all five element sizes) and in the Python oracle of
   `startup_address_console_check.py` (4- and 8-byte elements), both written from the same source.
 - The thick `0x105` volume layout is compared with addrlib itself when the build has it
-  (`startup_gfx10_volume_addrlib`: every element address of every mip of 305 volumes, 115 of them
-  with a mip chain). Block-compressed volumes and volumes in the other modes are not handled; they
-  stay refused.
+  (`startup_gfx10_volume_addrlib`: every element address of every mip of 501 volumes, 115 of the uncompressed ones
+  with a mip chain, and 196 block-compressed ones, every mip count of four chains for each of BC1
+  to BC7). Only BC1 volumes are drawn. Volumes in the other modes are not handled; they stay
+  refused.
 
 Log lines (stderr and `X2W_TRAP_LOG`):
 
