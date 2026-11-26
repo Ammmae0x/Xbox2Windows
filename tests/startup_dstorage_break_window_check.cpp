@@ -13,7 +13,8 @@
 // - break held: while an unmap holds page 2's run apart (page 2 reads MEM_RESERVE), a request into page 2 must not
 //   complete for the whole hold window (1000 ms, polled every 10 ms); after the release it completes with S_OK and
 //   every byte landed. An XCRDAPI that judges the destination with its own VirtualQuery instead refuses inside the
-//   window: "FAIL break window: refused while the run was broken" (the negative control in CMakeLists.txt).
+//   window: "FAIL break window: refused while the run was broken" (the negative control in
+//   tests/cmake/xmem_page_runs.cmake).
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
