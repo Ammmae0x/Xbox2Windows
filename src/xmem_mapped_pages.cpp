@@ -370,18 +370,50 @@ auto owned_reservation(ULONG_PTR address)
     return address - it->first < it->second ? it : memory.reservations.end();
 }
 
+// MapViewOfFile3 and placeholder-split attempts made by map_split (x2w_xmem_map_counts).
+volatile LONG64 map_attempts, split_attempts;
+
+// True when [target, target + bytes) is a whole reserved region of its own: a placeholder that
+// MEM_REPLACE_PLACEHOLDER can take as it is, so no split is needed first.
+bool exact_placeholder(void* target, SIZE_T bytes)
+{
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(target, &info, sizeof(info)) == sizeof(info) && info.State == MEM_RESERVE &&
+           info.AllocationBase == target && info.BaseAddress == target && info.RegionSize == bytes;
+}
+
 // Only split a reservation owned by the shim. Caller-owned placeholders must already match the view.
+// Inside an owned reservation the split comes first when the target is not already an exact placeholder:
+// a map into the middle of a larger placeholder always fails, and under Wine every failed map is another
+// server round trip whose cost grows with the number of views (one 64 KiB page per call at startup).
+// The query and the split are not atomic, so if the split or the map after it fails, the map-first
+// path below runs as before. X2W_XMEM_TEST_MAP_FIRST=1 skips the split-first step (tests only).
 // Once a split succeeds, report the retry's result even if it fails for a different reason.
 template <class Map>
 bool map_split(void* target, SIZE_T bytes, Map map)
 {
-    if (map()) return true;
-    const DWORD error = GetLastError();
+    static const bool map_first = x2w_local::env_on("X2W_XMEM_TEST_MAP_FIRST");
     const auto address = reinterpret_cast<ULONG_PTR>(target);
     const auto reservation = owned_reservation(address);
-    if (reservation != memory.reservations.end() && bytes <= reservation->second - (address - reservation->first) &&
-        VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
-        return map();
+    const bool owned = reservation != memory.reservations.end() &&
+                       bytes <= reservation->second - (address - reservation->first);
+    if (owned && !map_first && !exact_placeholder(target, bytes)) {
+        InterlockedIncrement64(&split_attempts);
+        if (VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            InterlockedIncrement64(&map_attempts);
+            if (map()) return true;
+        }
+    }
+    InterlockedIncrement64(&map_attempts);
+    if (map()) return true;
+    const DWORD error = GetLastError();
+    if (owned) {
+        InterlockedIncrement64(&split_attempts);
+        if (VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            InterlockedIncrement64(&map_attempts);
+            return map();
+        }
+    }
     SetLastError(error);
     return false;
 }
@@ -1552,6 +1584,15 @@ extern "C" BOOL WINAPI x2w_xmem_page_stats(ULONGLONG* live_sections)
 // Experimental export: the slab accounting behind those pages (#1199): slabs open, slots in use and slots free
 // in the open slabs. A slab is reserved when it is created, its slots are committed on first use, and empty slabs
 // are closed when all of their slots are freed and unpinned.
+// Test export: MapViewOfFile3 and placeholder-split attempts made by the physical-page map path so far.
+extern "C" BOOL WINAPI x2w_xmem_map_counts(ULONGLONG* maps, ULONGLONG* splits)
+{
+    if (!maps || !splits) return FALSE;
+    *maps = static_cast<ULONGLONG>(map_attempts);
+    *splits = static_cast<ULONGLONG>(split_attempts);
+    return TRUE;
+}
+
 extern "C" BOOL WINAPI x2w_xmem_slab_stats(ULONGLONG* slabs, ULONGLONG* slots_in_use, ULONGLONG* slots_free)
 {
     if (!slabs || !slots_in_use || !slots_free) return FALSE;

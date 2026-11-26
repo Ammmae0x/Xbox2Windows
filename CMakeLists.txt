@@ -354,6 +354,17 @@ add_test(NAME xmem_placeholder_split_control COMMAND xmem_placeholder_split_chec
 set_tests_properties(xmem_placeholder_split_control PROPERTIES
     ENVIRONMENT "${xmem_placeholder_env};X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK=1"
     PASS_REGULAR_EXPRESSION "FAIL: map two pool pages into the middle of the reservation" SKIP_RETURN_CODE 77 TIMEOUT 60)
+add_executable(xmem_map_split_first_check tests/xmem_map_split_first_check.cpp)
+target_include_directories(xmem_map_split_first_check PRIVATE src)
+target_compile_features(xmem_map_split_first_check PRIVATE cxx_std_17)
+add_dependencies(xmem_map_split_first_check xmem_shim)
+add_test(NAME xmem_map_split_first COMMAND xmem_map_split_first_check "$<TARGET_FILE:xmem_shim>")
+add_test(NAME xmem_map_split_first_control COMMAND xmem_map_split_first_check "$<TARGET_FILE:xmem_shim>" control)
+set_tests_properties(xmem_map_split_first PROPERTIES TIMEOUT 60 ENVIRONMENT "${xmem_placeholder_env}")
+# The control passes only when the map-first order is measured (2 maps per page), not on a setup failure.
+set_tests_properties(xmem_map_split_first_control PROPERTIES
+    ENVIRONMENT "${xmem_placeholder_env};X2W_XMEM_TEST_MAP_FIRST=1"
+    PASS_REGULAR_EXPRESSION "map-first control: maps=2N" TIMEOUT 60)
 add_executable(xmem_startup_below_40_check tests/xmem_startup_below_40_check.cpp)
 target_link_libraries(xmem_startup_below_40_check PRIVATE OneCore)
 target_compile_features(xmem_startup_below_40_check PRIVATE cxx_std_17)
