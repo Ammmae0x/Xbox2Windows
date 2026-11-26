@@ -57,7 +57,13 @@ struct PhysicalMemory {
     ULONG_PTR mirror_cpu = 0, mirror_gpu = 0;
     SIZE_T mirror_bytes = 0;
     std::set<ULONG_PTR> explicit_mirror_pages;
-    std::map<ULONG_PTR, SIZE_T> runs;  // OS views: base -> bytes
+    // OS views: base -> bytes, and the id of the run break inside which the view was mapped (0: mapped outside any
+    // break). retry_remapped_page reads the id; it never expires while the view lasts.
+    struct Run {
+        SIZE_T bytes = 0;
+        ULONG64 stamp = 0;
+    };
+    std::map<ULONG_PTR, Run> runs;
     // The slabs and their 64 KiB slots; released slots are reused lowest first, so that pages reused together
     // are adjacent slots again.
     x2w_xmem::SlabSlots<HANDLE> slots{era_physical::page_bytes};
@@ -441,8 +447,8 @@ bool map_view(ULONG_PTR address, const Backing& backing)
 }
 
 // Maps bytes of one section at address as a single view; falls back to one view per page when the
-// range is not inside a single placeholder.
-bool map_run(ULONG_PTR address, const Backing& backing, SIZE_T bytes,
+// range is not inside a single placeholder. stamp: the run break in progress, or 0 (PhysicalMemory::Run).
+bool map_run(ULONG_PTR address, const Backing& backing, SIZE_T bytes, ULONG64 stamp,
              std::vector<std::pair<ULONG_PTR, SIZE_T>>& made, ULONG_PTR& failed_address)
 {
     auto* target = reinterpret_cast<void*>(address);
@@ -451,7 +457,7 @@ bool map_run(ULONG_PTR address, const Backing& backing, SIZE_T bytes,
                               MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
     };
     if (map_split(target, bytes, map)) {
-        memory.runs[address] = bytes;
+        memory.runs[address] = {bytes, stamp};
         made.emplace_back(address, bytes);
         return true;
     }
@@ -464,7 +470,7 @@ bool map_run(ULONG_PTR address, const Backing& backing, SIZE_T bytes,
             failed_address = address + done;
             return false;
         }
-        memory.runs[address + done] = page_bytes;
+        memory.runs[address + done] = {page_bytes, stamp};
         made.emplace_back(address + done, page_bytes);
     }
     return true;
@@ -491,36 +497,16 @@ void coalesce_unused(const Pages& batch)
     }
 }
 
-// Unmapping a page inside a run unmaps the whole run and maps its other pages again (map_pages), and so does a
-// cross-call merge (merge_with_previous) for the run it joins. A thread that touches one of those pages in between
-// faults. Each break records the address ranges of the runs it takes apart, and a generation that is odd while it
-// is in progress; the break's id is that odd value. The last `kept` breaks stay recorded, so that a fault handler
-// that runs late, after later breaks on other runs have begun (a merge of the CPU view and then of its GPU mirror
-// in one call, or the next call's merge), still finds the break its fault came from.
+// Unmapping a page inside a run unmaps the whole run and maps its other pages again (map_pages), and so do a
+// cross-call merge (merge_with_previous) for the run it joins and a page batch (remap_alias_pages) for the runs it
+// changes. A thread that touches one of those pages in between faults. Such a run break has a generation that is odd
+// while it is in progress; the break's id is that odd value. Every view mapped inside a break records the id
+// (PhysicalMemory::Run::stamp, under memory.mutex), so a fault handler that runs late, after any number of later
+// breaks on other runs (a merge of the CPU view and then of its GPU mirror in one call, or the next calls), still
+// finds the break that mapped the page again.
 struct RemapWindow {
-    static constexpr std::size_t kept = 64;
-    struct Break {
-        ULONG64 id = 0;  // 0: no break recorded in this slot yet
-        std::vector<std::pair<ULONG_PTR, SIZE_T>> ranges;
-    };
     SRWLOCK lock = SRWLOCK_INIT;
-    Break recent[kept];  // break id i in recent[(i / 2) % kept]
     ULONG64 generation = 0;
-
-    // The newest recorded break whose ranges hold address, or 0. Caller holds lock (shared).
-    ULONG64 newest_holding(ULONG_PTR address) const
-    {
-        ULONG64 found = 0;
-        for (const Break& b : recent) {
-            if (b.id <= found) continue;
-            for (const auto& [base, size] : b.ranges)
-                if (address - base < size) {
-                    found = b.id;
-                    break;
-                }
-        }
-        return found;
-    }
 };
 RemapWindow remap_window;
 // Set once shared views are on (FaultRetry::ready). Breaks also begin without them (every unmap counts in the
@@ -531,15 +517,13 @@ std::atomic<bool> shared_views_on{false};
 // mapped by a call of its own join the recorded run that ends at its address (merge_with_previous).
 std::atomic<bool> joins_on{false};
 
-void begin_break(const std::map<ULONG_PTR, SIZE_T>& broken)
+// Caller holds memory.mutex. Returns the break's id, the stamp of the views mapped until end_break.
+ULONG64 begin_break()
 {
-    std::vector<std::pair<ULONG_PTR, SIZE_T>> ranges(broken.begin(), broken.end());
     AcquireSRWLockExclusive(&remap_window.lock);
     const ULONG64 id = ++remap_window.generation;
-    auto& slot = remap_window.recent[(id / 2) % RemapWindow::kept];
-    slot.id = id;
-    slot.ranges.swap(ranges);  // the old slot's ranges are freed after the lock
     ReleaseSRWLockExclusive(&remap_window.lock);
+    return id;
 }
 void end_break()
 {
@@ -549,6 +533,14 @@ void end_break()
 }
 
 struct EndBreak { ~EndBreak() { end_break(); } };
+
+ULONG64 break_generation()
+{
+    AcquireSRWLockShared(&remap_window.lock);
+    const ULONG64 value = remap_window.generation;
+    ReleaseSRWLockShared(&remap_window.lock);
+    return value;
+}
 
 // Test build only: X2W_XMEM_TEST_HOLD_RETRY=<name> holds the fault handler before it reads the break: it sets
 // "<name>.faulted", then waits up to five seconds for "<name>.go", so that a test can end the break first.
@@ -574,11 +566,15 @@ void hold_retry()
 void hold_retry() {}
 #endif
 
-// Retries an access violation only when all of this holds: the address is inside a run that one of the recorded
-// breaks (the one in progress or the last RemapWindow::kept) took apart; after that break has finished (the mutex)
-// the page is recorded and covered by a view; and this thread has not already retried this page for the newest
-// such break. Everything else is passed on, so a fault that is not the transient one is reported after at most one
-// retry per break.
+// Retries an access violation only when all of this holds: after the break in progress, if any, has finished (the
+// mutex), the page is recorded, covered by a view, and in a run mapped inside a break (a nonzero Run::stamp); and
+// this thread has not already retried this page for that stamp. Everything else is passed on, so a fault that is not
+// the transient one is reported after at most one retry per break that mapped the page again.
+// Faults that cannot be the transient one do not wait for memory.mutex, which a mapping call holds for all of its
+// work: when no break is in progress or begins or ends around a region query of the page (the generation is even
+// before and unchanged after) and the query shows no mapped view there, the fault is passed on at once. Outside
+// breaks only a break takes away a view mapped inside one, so the check below would pass it on as well. Faults on
+// lazily committed memory and other faults outside the runs take that path.
 LONG CALLBACK retry_remapped_page(EXCEPTION_POINTERS* e)
 {
     const EXCEPTION_RECORD* record = e->ExceptionRecord;
@@ -587,24 +583,27 @@ LONG CALLBACK retry_remapped_page(EXCEPTION_POINTERS* e)
     const ULONG_PTR address = record->ExceptionInformation[1];
     const ULONG_PTR page = address & ~(ULONG_PTR{page_bytes} - 1);
     hold_retry();
-    AcquireSRWLockShared(&remap_window.lock);
-    // The newest break that took the page apart, in progress or finished; a later break on another run does not
-    // hide it. A fault in a later break of the same page names that break, so it is retried again.
-    const ULONG64 break_id = remap_window.newest_holding(address);
-    ReleaseSRWLockShared(&remap_window.lock);
-    if (!break_id) return EXCEPTION_CONTINUE_SEARCH;
-    thread_local ULONG_PTR retried_page = 0;
-    thread_local ULONG64 retried_break = 0;
-    if (retried_page == page && retried_break == break_id) return EXCEPTION_CONTINUE_SEARCH;
-    bool mapped = false;
+    const ULONG64 before = break_generation();
+    MEMORY_BASIC_INFORMATION info{};
+    const bool mapped_now = VirtualQuery(reinterpret_cast<void*>(page), &info, sizeof(info)) == sizeof(info) &&
+                            info.State == MEM_COMMIT && info.Type == MEM_MAPPED;
+    if (!(before & 1) && break_generation() == before && !mapped_now) return EXCEPTION_CONTINUE_SEARCH;
+    // The break that last mapped the page's run, however many breaks on other runs came after it. A later break of
+    // the same run stamps it again, so a fault in that break is retried again.
+    ULONG64 stamp = 0;
     {
         const std::lock_guard guard(memory.mutex);  // held by the mapping thread until its break is over
-        auto run = memory.runs.upper_bound(page);
-        mapped = memory.views.count(page) && run != memory.runs.begin() && page - std::prev(run)->first < std::prev(run)->second;
+        const auto run = memory.runs.upper_bound(page);
+        if (memory.views.count(page) && run != memory.runs.begin() &&
+            page - std::prev(run)->first < std::prev(run)->second.bytes)
+            stamp = std::prev(run)->second.stamp;
     }
-    if (!mapped) return EXCEPTION_CONTINUE_SEARCH;
+    if (!stamp) return EXCEPTION_CONTINUE_SEARCH;
+    thread_local ULONG_PTR retried_page = 0;
+    thread_local ULONG64 retried_stamp = 0;
+    if (retried_page == page && retried_stamp == stamp) return EXCEPTION_CONTINUE_SEARCH;
     retried_page = page;
-    retried_break = break_id;
+    retried_stamp = stamp;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 struct MappingThread {
@@ -742,7 +741,7 @@ void forget_page(ULONG_PTR address)
 
 // Maps every recorded page of [base, base + size) that has no view: neighbours on adjacent slots
 // together, one page at a time when a group is refused. A page that cannot be mapped is forgotten
-// and counted. fail is true when the test control refuses this range.
+// and counted. fail is true when the test control refuses this range. stamp: the break in progress.
 struct MapFailure {
     const char* stage = nullptr;
     ULONG_PTR address = 0;
@@ -764,7 +763,7 @@ struct MapFailure {
     }
 };
 
-ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failure)
+ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, ULONG64 stamp, bool fail, MapFailure* failure)
 {
     ULONG_PTR lost = 0;
     ULONG_PTR at = base;
@@ -784,14 +783,14 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failu
         }
         std::vector<std::pair<ULONG_PTR, SIZE_T>> made;
         ULONG_PTR failed_address;
-        if (fail || !map_run(at, head, bytes, made, failed_address)) {
+        if (fail || !map_run(at, head, bytes, stamp, made, failed_address)) {
             // map_run may have mapped some pages one at a time before it stopped; keep those.
             for (SIZE_T done = 0; done < bytes; done += page_bytes) {
                 if (memory.runs.count(at + done)) continue;
                 Backing one = head;
                 one.offset += done;
                 if (!fail && map_view(at + done, one)) {
-                    memory.runs[at + done] = page_bytes;
+                    memory.runs[at + done] = {page_bytes, stamp};
                 } else {
                     if (failure)
                         failure->record("restore-view", at + done, memory.views.at(at + done),
@@ -843,7 +842,8 @@ Merge merge_with_previous(ULONG_PTR address, const Backing& head, SIZE_T bytes, 
 #endif
     const auto next = memory.runs.lower_bound(address);
     if (next == memory.runs.begin()) return Merge::separate;
-    const auto [base, size] = *std::prev(next);
+    const ULONG_PTR base = std::prev(next)->first;
+    const SIZE_T size = std::prev(next)->second.bytes;
     if (base + size != address) return Merge::separate;
     if ((size + bytes) / page_bytes > merged_run_cap()) return Merge::separate;
     const auto tail = memory.views.find(address - page_bytes);
@@ -860,7 +860,7 @@ Merge merge_with_previous(ULONG_PTR address, const Backing& head, SIZE_T bytes, 
         if (!VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) return Merge::separate;
     }
     TestFault test;
-    begin_break({{base, size}});
+    const ULONG64 stamp = begin_break();
     const EndBreak end;
     if (!unmap_view(base)) return Merge::separate;
     memory.runs.erase(base);
@@ -870,12 +870,12 @@ Merge merge_with_previous(ULONG_PTR address, const Backing& head, SIZE_T bytes, 
         InterlockedIncrement64(&map_attempts);
         if (!test.hit(4) && MapViewOfFile3(start.section, GetCurrentProcess(), whole, start.offset, size + bytes,
                                            MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) {
-            memory.runs[base] = size + bytes;
+            memory.runs[base] = {size + bytes, stamp};
             return Merge::joined;
         }
     }
     // map_recorded splits the joined placeholder back to R's size (map_split: the reservation is the shim's).
-    const ULONG_PTR lost = map_recorded(base, size, false, failure);
+    const ULONG_PTR lost = map_recorded(base, size, stamp, false, failure);
     if (!lost) return Merge::separate;
     x2w_local::logf("x2w-xmem merge of a run with the next mapping call failed: %llu page(s) of the run could not be "
                     "mapped again and were forgotten", static_cast<unsigned long long>(lost));
@@ -938,7 +938,7 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
                     return FALSE;
                 }
                 ULONG_PTR failed_address;
-                if (merge == Merge::separate && !map_run(first->first, head, bytes, made, failed_address)) {
+                if (merge == Merge::separate && !map_run(first->first, head, bytes, 0, made, failed_address)) {
                     const DWORD error = GetLastError();
                     if (failure) failure->record("map-view", failed_address, batch.at(failed_address), error);
                     for (const auto& [base, size] : made) {
@@ -966,10 +966,10 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
                 auto run = memory.runs.upper_bound(address);
                 if (run == memory.runs.begin()) continue;
                 --run;
-                if (address - run->first < run->second) broken.insert(*run);
+                if (address - run->first < run->second.bytes) broken.emplace(run->first, run->second.bytes);
             }
             TestFault test;
-            begin_break(broken);
+            const ULONG64 stamp = begin_break();
             const EndBreak end;
             DWORD error = ERROR_SUCCESS;
             std::vector<std::pair<ULONG_PTR, SIZE_T>> unmapped;
@@ -993,7 +993,7 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
             if (!refused && !unmapped.empty()) hold_window();
             ULONG_PTR lost = 0;
             for (const auto& [base, size] : unmapped)
-                lost += map_recorded(base, size, refused ? test.stage == 3 && test.hit(3) : test.hit(2), failure);
+                lost += map_recorded(base, size, stamp, refused ? test.stage == 3 && test.hit(3) : test.hit(2), failure);
             if (!refused) coalesce_unused(batch);
             if (refused || lost) {
                 x2w_local::logf("x2w-xmem unmap of %llu page(s) failed (error %lu): %s; %llu surviving page(s) could not be mapped "
@@ -1330,7 +1330,7 @@ struct AliasEdit {
 };
 
 using AliasPlan = std::map<ULONG_PTR, AliasEdit>;
-using ViewRuns = std::map<ULONG_PTR, SIZE_T>;
+using ViewRuns = std::map<ULONG_PTR, PhysicalMemory::Run>;
 
 // The region query exposes the placeholder reservation flag in Flags even though the SDK does not name that bit.
 constexpr ULONG placeholder_reservation = 0x100;
@@ -1410,7 +1410,8 @@ bool alias_placeholders(ULONG_PTR address, SIZE_T bytes)
 
 // Both maps have the same node type. The node for each possible run base was reserved before
 // unmapping anything, so recording a successful OS call cannot fail for lack of C++ heap memory.
-bool install_alias_view(ULONG_PTR address, const Backing& backing, SIZE_T bytes,
+// stamp: the page batch's break (PhysicalMemory::Run).
+bool install_alias_view(ULONG_PTR address, const Backing& backing, SIZE_T bytes, ULONG64 stamp,
                         ViewRuns& nodes, X2WPageBatchStats& stats)
 {
     auto* target = reinterpret_cast<void*>(address);
@@ -1441,13 +1442,13 @@ bool install_alias_view(ULONG_PTR address, const Backing& backing, SIZE_T bytes,
         if (!map()) return false;
     }
     auto node = nodes.extract(address);
-    node.mapped() = bytes;
+    node.mapped() = {bytes, stamp};
     memory.runs.insert(std::move(node));
     ++stats.mapCalls;
     return true;
 }
 
-DWORD install_alias_plan(AliasPlan& plan, ViewRuns& nodes, bool share_views, bool restoring,
+DWORD install_alias_plan(AliasPlan& plan, ViewRuns& nodes, bool share_views, bool restoring, ULONG64 stamp,
                          std::vector<ULONG_PTR>& made, X2WPageBatchStats& stats)
 {
     DWORD error = ERROR_SUCCESS;
@@ -1467,7 +1468,7 @@ DWORD install_alias_plan(AliasPlan& plan, ViewRuns& nodes, bool share_views, boo
             const auto& next = memory.backings.at(token(end->second));
             if (next.section != head.section || next.offset != head.offset + bytes) break;
         }
-        if (install_alias_view(address, head, bytes, nodes, stats)) {
+        if (install_alias_view(address, head, bytes, stamp, nodes, stats)) {
             made.push_back(address);
             for (auto page = it; page != end; ++page)
                 page->second.actual = token(page->second);
@@ -1478,7 +1479,7 @@ DWORD install_alias_plan(AliasPlan& plan, ViewRuns& nodes, bool share_views, boo
             // A grouped view may cross placeholder boundaries. Retry each page once.
             for (auto page = it; page != end; ++page) {
                 if (install_alias_view(page->first, memory.backings.at(token(page->second)),
-                                       page_bytes, nodes, stats)) {
+                                       page_bytes, stamp, nodes, stats)) {
                     made.push_back(page->first);
                     page->second.actual = token(page->second);
                 } else {
@@ -1494,13 +1495,13 @@ DWORD install_alias_plan(AliasPlan& plan, ViewRuns& nodes, bool share_views, boo
 
 HRESULT remap_alias_pages(AliasPlan& plan, bool share_views, X2WPageBatchStats& stats)
 {
-    ViewRuns broken;
+    std::map<ULONG_PTR, SIZE_T> broken;
     for (const auto& [address, edit] : plan) {
         if (!edit.old) continue;
         const auto run = memory.runs.upper_bound(address);
-        if (run == memory.runs.begin() || address - std::prev(run)->first >= std::prev(run)->second)
+        if (run == memory.runs.begin() || address - std::prev(run)->first >= std::prev(run)->second.bytes)
             return E_UNEXPECTED;
-        broken.insert(*std::prev(run));
+        broken.emplace(std::prev(run)->first, std::prev(run)->second.bytes);
     }
     for (const auto& [base, size] : broken) {
         // Surviving neighbours of a shared view are part of the transaction as well.
@@ -1516,7 +1517,7 @@ HRESULT remap_alias_pages(AliasPlan& plan, bool share_views, X2WPageBatchStats& 
     std::vector<ULONG_PTR> made;
     made.reserve(plan.size());
     for (const auto& [address, edit] : plan) {
-        run_nodes.emplace(address, page_bytes);
+        run_nodes.emplace(address, PhysicalMemory::Run{page_bytes, 0});
         view_nodes.emplace(address, 0);
     }
     auto clear_run = [&](ULONG_PTR address, SIZE_T size) {
@@ -1525,7 +1526,7 @@ HRESULT remap_alias_pages(AliasPlan& plan, bool share_views, X2WPageBatchStats& 
             it->second.actual = 0;
     };
 
-    begin_break(broken);
+    const ULONG64 stamp = begin_break();
     const EndBreak end;
     DWORD error = ERROR_SUCCESS;
     for (const auto& [base, size] : broken) {
@@ -1537,7 +1538,7 @@ HRESULT remap_alias_pages(AliasPlan& plan, bool share_views, X2WPageBatchStats& 
         clear_run(base, size);
     }
     if (!error)
-        error = install_alias_plan(plan, run_nodes, share_views, false, made, stats);
+        error = install_alias_plan(plan, run_nodes, share_views, false, stamp, made, stats);
     bool restore_failed = false;
     if (error) {
         for (const auto address : made) {
@@ -1546,11 +1547,11 @@ HRESULT remap_alias_pages(AliasPlan& plan, bool share_views, X2WPageBatchStats& 
                 continue;
             }
             auto run = memory.runs.extract(address);
-            clear_run(address, run.mapped());
+            clear_run(address, run.mapped().bytes);
             run_nodes.insert(std::move(run));
         }
         made.clear();
-        if (install_alias_plan(plan, run_nodes, share_views, true, made, stats))
+        if (install_alias_plan(plan, run_nodes, share_views, true, stamp, made, stats))
             restore_failed = true;
     }
     // Publish the OS state, including any views left over if Windows refused rollback.
@@ -2116,21 +2117,13 @@ ReadFileFn next_read_file;  // read_file_committed with lazy commit, kernel32's 
 WriteFileFn kernel_write_file;
 constexpr int io_attempts = 4;
 
-ULONG64 break_generation()
-{
-    AcquireSRWLockShared(&remap_window.lock);
-    const ULONG64 value = remap_window.generation;
-    ReleaseSRWLockShared(&remap_window.lock);
-    return value;
-}
-
 // Whether [buffer, buffer + bytes) holds a page of a run. Takes memory.mutex, so it returns after the break in progress.
 bool in_a_run(const void* buffer, DWORD bytes)
 {
     const auto first = reinterpret_cast<ULONG_PTR>(buffer);
     const std::lock_guard guard(memory.mutex);
     const auto run = memory.runs.upper_bound(first);
-    if (run != memory.runs.begin() && first - std::prev(run)->first < std::prev(run)->second) return true;
+    if (run != memory.runs.begin() && first - std::prev(run)->first < std::prev(run)->second.bytes) return true;
     return run != memory.runs.end() && run->first - first < bytes;
 }
 

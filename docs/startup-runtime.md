@@ -3178,13 +3178,15 @@ pages 2.1 ms and of 4096 pages 13 ms; joining a page to a view of 63 took 1.5 ms
 mapped on its own costs (1.4 ms).
 
 Unmapping a page inside a shared view unmaps that view and maps its other pages again. A thread
-that touches one of those pages in between takes an access violation. A vectored handler retries
-it only when the address is inside a view that one of the last 64 unmaps or joins (the one in
-progress included) took apart, the page is recorded and covered by a view once that one is over,
-and the thread has not already retried that page for the newest such unmap or join. A handler that
-runs late, after a later unmap or join of another view has begun (one call joins a CPU view and
-then its GPU mirror), still finds the one its fault came from. Any other fault is passed on, after
-at most one retry for each unmap or join.
+that touches one of those pages in between takes an access violation. Each view mapped inside an
+unmap, a join or a page batch keeps that one's id. A vectored handler retries the fault only when,
+once the one in progress (if any) is over, the page is recorded, covered by a view, and that view
+carries such an id, and the thread has not already retried that page for that id. A handler that
+runs late, after any number of later unmaps or joins of other views (one call joins a CPU view and
+then its GPU mirror), still finds the one that mapped the page again. Any other fault is passed on,
+after at most one retry for each unmap or join that mapped the page's view. A fault with none in
+progress or beginning or ending around a region query of the page, and no mapped view there, is
+passed on without waiting for the mapping lock.
 
 Shared views are opt-in. The caller chooses before the first mapping call by setting
 `X2W_XMEM_SHARED_VIEWS=1` in the process environment; the shim reads it once, on that call. It also

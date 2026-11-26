@@ -23,11 +23,14 @@
 //
 // A fault whose handler reads the breaks only after a later break on another run has begun (two_runs: break B on a
 // disjoint run; mirror: one permissive XMemMapPhysicalPages call that joins the CPU run and then its GPU mirror run)
-// must be retried as well: the handler keeps the ranges of the recent breaks, not only of the last one. Joins across
-// calls need X2W_XMEM_JOIN_CALLS=1: main sets it for `mirror` and clears it for every other mode.
+// must be retried as well: the page's run keeps the stamp of the break that mapped it again, whatever breaks follow on
+// other runs. Joins across calls need X2W_XMEM_JOIN_CALLS=1: main sets it for `mirror` and clears it for every other
+// mode.
 //
-// The ring's edge (ring_edge): a held fault in break A whose handler reads the breaks after 63 later breaks is retried;
-// after 64 later breaks, A is no longer recorded and the fault is passed on (the reader's own __except catches it).
+// Many later breaks (later_breaks): a held fault in break A whose handler runs after 63, 64 or 200 later breaks on
+// another page is retried each time (the reader's own __except would catch a fault passed on). A fault that stays
+// (persistent_fault, a page of a run made no-access): passed on at once when no break mapped the run, and after one
+// retry when one did; a first-chance handler of the test counts the faults.
 //
 // A break that begins while x2w_xmem_stable_call's fn runs (break_during_fn): fn itself starts the unmap, waits until
 // the window is open and queries a page of the run (reserved). stable_call must see the generation change and run fn
@@ -39,11 +42,11 @@
 // with their output buffer in a mapped slot that is not committed yet; the answer reaches it after the break. Then a
 // ReadFile into another such slot, with no break: the lazy-commit ReadFile wrapper still runs inside the run-break one.
 //
-// `two-runs` and `mirror` run those two cases alone (an access violation there ends the process); `ring-edge` runs
-// ring_edge with 63 and then 64 later breaks.
+// `two-runs` and `mirror` run those two cases alone (an access violation there ends the process); `stamps` runs
+// later_breaks with 63, 64 and 200 later breaks, then persistent_fault.
 //
 // Usage: xmem_run_break_readers_check <xmem.dll built with its test controls>
-//        [control|next-break-control|default|lazy|two-runs|mirror|ring-edge]
+//        [control|next-break-control|default|lazy|two-runs|mirror|stamps]
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -644,17 +647,16 @@ __declspec(noinline) bool guarded_read(const volatile std::uint32_t* address, st
     }
 }
 
-// The edge of the ring of recorded breaks (RemapWindow::kept, 64). Break A takes apart run 1; a fault in it is held
-// before its handler reads the breaks (X2W_XMEM_TEST_HOLD_RETRY). A ends, then `later` breaks follow, each the unmap
-// of a lone page mapped by a call of its own (one break per unmap call; the lone page joins no run). The k-th break
-// after A is recorded in A's slot when k is a multiple of 64. With 63 later breaks A is still recorded and the fault
-// is retried (the reader reads its page); with 64, A's slot holds the newest break, no recorded break holds the
-// address, and the handler passes the fault on, which the reader's own __except catches.
-void ring_edge_case(const Shim& shim, unsigned char* run1, SIZE_T later, bool retried)
+// Break A takes apart run 1; a fault in it is held before its handler looks the page up (X2W_XMEM_TEST_HOLD_RETRY).
+// A ends, then `later` breaks follow, each the unmap of a lone page mapped by a call of its own (one break per unmap
+// call; the lone page joins no run). Run 1's views keep the stamp of break A, which mapped them again, however many
+// breaks follow, so the fault is retried and the reader reads its page. A fault passed on would reach the reader's
+// own __except.
+void later_breaks_case(const Shim& shim, unsigned char* run1, SIZE_T later)
 {
     char name[32], stem[32];
-    std::snprintf(name, sizeof(name), "ring_edge_%zu", later);
-    std::snprintf(stem, sizeof(stem), "ring-%zu", later);
+    std::snprintf(name, sizeof(name), "later_breaks_%zu", later);
+    std::snprintf(stem, sizeof(stem), "later-%zu", later);
     unsigned char* const lone = run1 + 32 * page;
     SIZE_T count = pages + 1, tokens[pages + 1] = {};
     if (!shim.allocate(0x20400000, &count, tokens) || count != pages + 1 || shim.map(run1, pages, tokens) != run1) {
@@ -686,16 +688,63 @@ void ring_edge_case(const Shim& shim, unsigned char* run1, SIZE_T later, bool re
         if (shim.map(lone, 1, nullptr) != lone || raw_state(lone) == MEM_COMMIT) break;
         ++made;
     }
+    const ULONGLONG elapsed = GetTickCount64() - started;
+    std::printf("%s: %zu later breaks in %llu ms\n", name, made, static_cast<unsigned long long>(elapsed));
     check(made == later, "later_breaks_made", name);
-    check(outcome.load() == 0 && GetTickCount64() - started < 4000, "handler_still_held_after_the_later_breaks", name);
-    SetEvent(retry.second);  // the handler reads the breaks now
+    check(outcome.load() == 0 && elapsed < 4000, "handler_still_held_after_the_later_breaks", name);
+    SetEvent(retry.second);  // the handler looks the page up now
     reader.join();
-    if (retried)
-        check(outcome.load() == 1 && value == 0x56000002u, "fault_retried_with_break_a_still_recorded", name);
-    else
-        check(outcome.load() == 2, "fault_passed_on_with_break_a_evicted", name);
+    check(outcome.load() == 1 && value == 0x56000002u, "fault_retried_after_the_later_breaks", name);
     shim.map(run1, 7, nullptr);
     shim.release(pages + 1, tokens);
+}
+
+std::atomic<int> first_chance_faults{0};
+ULONG_PTR counted_page = 0;
+
+// Added after xmem's handler with FirstHandler=1, so it sees each access violation first, also one xmem retries.
+LONG CALLBACK count_fault(EXCEPTION_POINTERS* e)
+{
+    const EXCEPTION_RECORD* record = e->ExceptionRecord;
+    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2 &&
+        (record->ExceptionInformation[1] & ~(ULONG_PTR{page} - 1)) == counted_page)
+        ++first_chance_faults;
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// A fault that stays: page 2 of a run made no-access, read once by a new thread. On a run no break has mapped (stamp
+// 0) the handler passes the fault on at once: one fault. After a break maps the run again (the unmap of page 7), it
+// retries once and then passes it on: two faults. Both reach the reader's __except.
+void persistent_fault_case(const Shim& shim, unsigned char* run1)
+{
+    const char* const name = "persistent_fault";
+    SIZE_T count = pages, tokens[pages] = {};
+    if (!shim.allocate(0x20400000, &count, tokens) || count != pages || shim.map(run1, pages, tokens) != run1) {
+        check(false, "map_run", name);
+        return;
+    }
+    unsigned char* const target = run1 + 2 * page;
+    const auto faults = [&](const char* step) {
+        DWORD old = 0;
+        if (!check(VirtualProtect(target, page, PAGE_NOACCESS, &old) != FALSE, step, name)) return -1;
+        counted_page = reinterpret_cast<ULONG_PTR>(target);
+        first_chance_faults = 0;
+        void* const counter = AddVectoredExceptionHandler(1, count_fault);
+        std::uint32_t value = 0;
+        bool read = true;
+        std::thread reader([&] { read = guarded_read(reinterpret_cast<volatile std::uint32_t*>(target), &value); });
+        reader.join();
+        if (counter) RemoveVectoredExceptionHandler(counter);
+        VirtualProtect(target, page, PAGE_READWRITE, &old);
+        const int counted = first_chance_faults.load();
+        std::printf("%s: %s -> read %d, first-chance faults %d\n", name, step, read, counted);
+        return counter && !read ? counted : -1;
+    };
+    check(faults("no_break_mapped_the_run") == 1, "passed_on_at_once_without_a_stamp", name);
+    check(shim.map(run1 + 7 * page, 1, nullptr) == run1 + 7 * page, "unmap_page_7", name);
+    check(faults("a_break_mapped_the_run") == 2, "retried_once_with_a_stamp", name);
+    shim.map(run1, 7, nullptr);
+    shim.release(pages, tokens);
 }
 }  // namespace
 
@@ -708,11 +757,11 @@ int main(int argc, char** argv)
     const bool lazy = argc > 2 && std::strcmp(argv[2], "lazy") == 0;
     const bool two_runs = argc > 2 && std::strcmp(argv[2], "two-runs") == 0;
     const bool mirror = argc > 2 && std::strcmp(argv[2], "mirror") == 0;
-    const bool ring_edge = argc > 2 && std::strcmp(argv[2], "ring-edge") == 0;
+    const bool stamps = argc > 2 && std::strcmp(argv[2], "stamps") == 0;
     if (argc < 2 || (argc > 2 && !control && !next_break_control && !default_mode && !lazy && !two_runs && !mirror &&
-                     !ring_edge)) {
+                     !stamps)) {
         std::printf("usage: xmem_run_break_readers_check <test-controls xmem.dll> "
-                    "[control|next-break-control|default|lazy|two-runs|mirror|ring-edge]\n");
+                    "[control|next-break-control|default|lazy|two-runs|mirror|stamps]\n");
         return 2;
     }
     // The mode is read by the first mapping call; the VirtualQueryEx import is wrapped when xmem.dll loads.
@@ -740,7 +789,7 @@ int main(int argc, char** argv)
         return 1;
     }
     unsigned char* const at = base + page;
-    if (next_break_control || default_mode || lazy || two_runs || mirror || ring_edge) {
+    if (next_break_control || default_mode || lazy || two_runs || mirror || stamps) {
         if (next_break_control) next_break_case(shim, at, false);
         if (default_mode) default_case(shim, at);
         if (lazy) {
@@ -749,9 +798,11 @@ int main(int argc, char** argv)
         }
         if (two_runs) two_runs_case(shim, at);
         if (mirror) mirror_case(shim, base);
-        if (ring_edge) {
-            ring_edge_case(shim, at, 63, true);
-            ring_edge_case(shim, at + 64 * page, 64, false);
+        if (stamps) {
+            later_breaks_case(shim, at, 63);
+            later_breaks_case(shim, at + 64 * page, 64);
+            later_breaks_case(shim, at + 128 * page, 200);
+            persistent_fault_case(shim, at + 192 * page);
         }
         VirtualFree(base, 0, MEM_RELEASE);
         // The default mode's pass line, at the end and only with no failed check (ctest matches it).
