@@ -5,9 +5,6 @@ import os
 import zlib
 
 
-SUPPORTED_CODECS = ("raw", "zlib")
-
-
 def _require_int(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer")
@@ -40,7 +37,7 @@ class PagedResource:
             offset = _require_int(segment.offset, "segment.offset")
             stored = _require_int(segment.stored, "segment.stored")
             size = _require_int(segment.size, "segment.size")
-            if not isinstance(segment.codec, str) or segment.codec not in SUPPORTED_CODECS:
+            if not isinstance(segment.codec, str) or not segment.codec:
                 raise ValueError(f"Unsupported segment codec {segment.codec!r}")
             if offset < physical_end or min(stored, size) <= 0:
                 raise ValueError("Overlapping, descending or empty segment")

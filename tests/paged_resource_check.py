@@ -167,12 +167,28 @@ class PagedResourceNegativeTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Segment extent disagrees"):
                     pr.PagedResource(stream, segs)
 
-        # Non-str / unsupported codec rejected upfront in PagedResource.__init__.
-        for bad_codec in (None, 123, b"raw", "", "lz4", "zstd"):
+        # Non-str / empty codecs are rejected upfront in PagedResource.__init__.
+        for bad_codec in (None, 123, b"raw", ""):
             with self.subTest(codec=bad_codec):
                 seg = pr.Segment(0, 4, 4, bad_codec)  # type: ignore[arg-type]
                 with self.assertRaisesRegex(ValueError, "Unsupported segment codec"):
                     pr.PagedResource(stream, [seg])
+
+        # Unknown string codecs stay deferred to read() so later segments remain addressable.
+        for unknown_codec in ("other", "lz4", "zstd"):
+            with self.subTest(unknown_codec=unknown_codec):
+                mixed = pr.PagedResource(
+                    io.BytesIO(b"abcdef"),
+                    [
+                        pr.Segment(0, 2, 2, "raw"),
+                        pr.Segment(2, 2, 2, unknown_codec),
+                        pr.Segment(4, 2, 2, "raw"),
+                    ],
+                )
+                self.assertEqual(mixed.read(0, 2), b"ab")
+                self.assertEqual(mixed.read(4, 2), b"ef")
+                with self.assertRaisesRegex(ValueError, f"Unsupported segment codec {unknown_codec}"):
+                    mixed.read(1, 2)
 
     def test_zlib_error_and_limit_cases(self) -> None:
         payload = b"ABCD" * 8  # 32 bytes
@@ -255,11 +271,11 @@ class PagedResourceNegativeTests(unittest.TestCase):
                 lambda mod: mod.Segment(True, 1, 1, "raw"),
             ),
             (
-                "skip_upfront_codec_check",
-                '            if not isinstance(segment.codec, str) or segment.codec not in SUPPORTED_CODECS:\n'
+                "skip_upfront_codec_type_check",
+                '            if not isinstance(segment.codec, str) or not segment.codec:\n'
                 '                raise ValueError(f"Unsupported segment codec {segment.codec!r}")\n',
                 "            pass\n",
-                lambda mod: mod.PagedResource(io.BytesIO(b"abcd"), [mod.Segment(0, 4, 4, "lz4")]),
+                lambda mod: mod.PagedResource(io.BytesIO(b"abcd"), [mod.Segment(0, 4, 4, "")]),
             ),
             (
                 "allow_negative_limit",
