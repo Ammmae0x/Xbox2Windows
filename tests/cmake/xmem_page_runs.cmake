@@ -74,32 +74,43 @@ if(TEST xmem_shim_page_runs)
     set_property(TEST xmem_shim_page_runs APPEND PROPERTY ENVIRONMENT "X2W_XMEM_JOIN_CALLS=")
 endif()
 
-# Slot 31 placeholder split inside an XMem reservation. The control disables the fallback used where the OS does
-# not report placeholders (Wine), so the split fails there; where the OS reports them, the control skips (77).
+# Slot 31 placeholder split inside an XMem reservation. The control (test-controls build) disables the fallback used
+# where the OS does not report placeholders (Wine), so the split fails there; where the OS reports them, the control
+# skips (77). The check program sets each mode's test switch itself.
 add_executable(xmem_placeholder_split_check tests/xmem_placeholder_split_check.cpp)
 target_include_directories(xmem_placeholder_split_check PRIVATE src)
 target_compile_features(xmem_placeholder_split_check PRIVATE cxx_std_17)
 target_link_libraries(xmem_placeholder_split_check PRIVATE OneCore)
-add_dependencies(xmem_placeholder_split_check xmem_shim)
+add_dependencies(xmem_placeholder_split_check xmem_shim xmem_shim_test_controls)
 set(xmem_placeholder_env "X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=0")
 add_test(NAME xmem_placeholder_split COMMAND xmem_placeholder_split_check "$<TARGET_FILE:xmem_shim>")
 set_tests_properties(xmem_placeholder_split PROPERTIES TIMEOUT 60 ENVIRONMENT "${xmem_placeholder_env}")
 # The control passes only when the split itself fails, not on an earlier setup failure.
-add_test(NAME xmem_placeholder_split_control COMMAND xmem_placeholder_split_check "$<TARGET_FILE:xmem_shim>" control)
+add_test(NAME xmem_placeholder_split_control COMMAND xmem_placeholder_split_check
+         "$<TARGET_FILE:xmem_shim_test_controls>" control)
 set_tests_properties(xmem_placeholder_split_control PROPERTIES
-    ENVIRONMENT "${xmem_placeholder_env};X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK=1"
+    ENVIRONMENT "${xmem_placeholder_env}"
     PASS_REGULAR_EXPRESSION "FAIL: map two pool pages into the middle of the reservation" SKIP_RETURN_CODE 77 TIMEOUT 60)
+# The deployed shim with X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK=1: the switch is ignored and the split succeeds.
+add_test(NAME xmem_placeholder_split_deployed COMMAND xmem_placeholder_split_check "$<TARGET_FILE:xmem_shim>" deployed)
+set_tests_properties(xmem_placeholder_split_deployed PROPERTIES
+    ENVIRONMENT "${xmem_placeholder_env}" SKIP_RETURN_CODE 77 TIMEOUT 60)
 add_executable(xmem_map_split_first_check tests/xmem_map_split_first_check.cpp)
 target_include_directories(xmem_map_split_first_check PRIVATE src)
 target_compile_features(xmem_map_split_first_check PRIVATE cxx_std_17)
-add_dependencies(xmem_map_split_first_check xmem_shim)
+add_dependencies(xmem_map_split_first_check xmem_shim xmem_shim_test_controls)
 add_test(NAME xmem_map_split_first COMMAND xmem_map_split_first_check "$<TARGET_FILE:xmem_shim>")
-add_test(NAME xmem_map_split_first_control COMMAND xmem_map_split_first_check "$<TARGET_FILE:xmem_shim>" control)
+add_test(NAME xmem_map_split_first_control COMMAND xmem_map_split_first_check
+         "$<TARGET_FILE:xmem_shim_test_controls>" control)
 set_tests_properties(xmem_map_split_first PROPERTIES TIMEOUT 60 ENVIRONMENT "${xmem_placeholder_env}")
-# The control passes only when the map-first order is measured (2 maps per page), not on a setup failure.
+# The control (test-controls build, X2W_XMEM_TEST_MAP_FIRST=1) passes only when the map-first order is measured
+# (2 maps per page), not on a setup failure.
 set_tests_properties(xmem_map_split_first_control PROPERTIES
-    ENVIRONMENT "${xmem_placeholder_env};X2W_XMEM_TEST_MAP_FIRST=1"
+    ENVIRONMENT "${xmem_placeholder_env}"
     PASS_REGULAR_EXPRESSION "map-first control: maps=2N" TIMEOUT 60)
+# The deployed shim with X2W_XMEM_TEST_MAP_FIRST=1: the switch is ignored, so the split-first counts hold.
+add_test(NAME xmem_map_split_first_deployed COMMAND xmem_map_split_first_check "$<TARGET_FILE:xmem_shim>" deployed)
+set_tests_properties(xmem_map_split_first_deployed PROPERTIES TIMEOUT 60 ENVIRONMENT "${xmem_placeholder_env}")
 
 # A request whose destination page an XMem run break holds unmapped (the xmem test-controls build's
 # X2W_XMEM_TEST_HOLD_WINDOW) must not complete within the 1000 ms hold, then land after the release.

@@ -1,10 +1,14 @@
 // Queue slot 31 (X2WMapPageBatch) into the middle of an XMem reservation needs a placeholder split. Where the region
 // query does not report placeholders (Wine), xmem probes whether a placeholder release refuses a plain reservation
 // and then offers reserved regions to the split (xmem placeholder_fallback).
-//   xmem_placeholder_split_check <xmem.dll>          split succeeds; a committed target still fails and stays intact
-//   xmem_placeholder_split_check <xmem.dll> control  the same checks, run with X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK=1
-//                                                    by CTest, which expects the split step to fail; exits 77 where
-//                                                    the OS reports the bit, because there the fallback is never used
+//   xmem_placeholder_split_check <xmem.dll>           split succeeds; a committed target still fails and stays intact
+//   xmem_placeholder_split_check <xmem.dll> control   the same checks in the test-controls build (X2W_XMEM_TEST_CONTROLS)
+//                                                     with X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK=1; CTest expects the
+//                                                     split step to fail
+//   xmem_placeholder_split_check <xmem.dll> deployed  the same checks in the deployed build with the same switch, which
+//                                                     that build ignores, so they pass
+// control and deployed exit 77 where the OS reports the bit, because there the fallback is never used. Each mode sets
+// or clears X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK itself, so an inherited value cannot change the result.
 #include <windows.h>
 #include "xmem_page_batch.h"
 #include <cstdio>
@@ -47,10 +51,13 @@ MEMORY_BASIC_INFORMATION query(const BYTE* pointer)
 int wmain(int argc, wchar_t** argv)
 {
     const bool control = argc == 3 && std::wcscmp(argv[2], L"control") == 0;
-    if (argc != 2 && !control) return 2;
+    const bool deployed = argc == 3 && std::wcscmp(argv[2], L"deployed") == 0;
+    if (argc != 2 && !control && !deployed) return 2;
+    // xmem reads the switch once, in its first placeholder probe; set it before loading xmem.dll.
+    SetEnvironmentVariableW(L"X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK", control || deployed ? L"1" : nullptr);
     const bool bit = os_reports_placeholder_bit();
     std::printf("placeholder bit reported=%d\n", bit);
-    if (control && bit) {
+    if ((control || deployed) && bit) {
         std::puts("SKIP: the OS reports the placeholder bit, so the fallback is never used");
         return 77;
     }
@@ -105,5 +112,6 @@ int wmain(int argc, wchar_t** argv)
     window[page_bytes] = 0x60;
     if (!require(pool[page_bytes] == 0x60, "a write through the destination reaches the pool page")) return 1;
     std::puts("slot31 split inside an XMem reservation matched; a committed target was refused and kept");
+    if (deployed) std::puts("deployed build: X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK=1 was ignored");
     return 0;
 }

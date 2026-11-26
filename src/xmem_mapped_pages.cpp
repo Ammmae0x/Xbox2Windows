@@ -387,12 +387,17 @@ bool exact_placeholder(void* target, SIZE_T bytes)
 // a map into the middle of a larger placeholder always fails, and under Wine every failed map is another
 // server round trip whose cost grows with the number of views (one 64 KiB page per call at startup).
 // The query and the split are not atomic, so if the split or the map after it fails, the map-first
-// path below runs as before. X2W_XMEM_TEST_MAP_FIRST=1 skips the split-first step (tests only).
+// path below runs as before. Test build only (X2W_XMEM_TEST_CONTROLS): X2W_XMEM_TEST_MAP_FIRST=1 skips the
+// split-first step; the deployed build ignores it.
 // Once a split succeeds, report the retry's result even if it fails for a different reason.
 template <class Map>
 bool map_split(void* target, SIZE_T bytes, Map map)
 {
+#ifdef X2W_XMEM_TEST_CONTROLS
     static const bool map_first = x2w_local::env_on("X2W_XMEM_TEST_MAP_FIRST");
+#else
+    constexpr bool map_first = false;
+#endif
     const auto address = reinterpret_cast<ULONG_PTR>(target);
     const auto reservation = owned_reservation(address);
     const bool owned = reservation != memory.reservations.end() &&
@@ -1328,10 +1333,16 @@ constexpr ULONG placeholder_reservation = 0x100;
 // Measured once: whether the region query reports placeholder_reservation for a fresh placeholder, and, when it does
 // not, whether VirtualFree(MEM_PRESERVE_PLACEHOLDER) refuses a plain reservation and leaves it whole. Windows reports
 // the bit. Wine (Proton Experimental, 2026-11) leaves Flags 0 for placeholders but refuses the plain case with
-// ERROR_INVALID_ADDRESS. X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK=1 skips the second probe (tests only).
+// ERROR_INVALID_ADDRESS. Test build only (X2W_XMEM_TEST_CONTROLS): X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK=1 skips the
+// second probe; the deployed build ignores it.
 bool placeholder_fallback()
 {
     static const bool fallback = [] {
+#ifdef X2W_XMEM_TEST_CONTROLS
+        const bool skip_probe = x2w_local::env_on("X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK");
+#else
+        constexpr bool skip_probe = false;
+#endif
         bool bit_reported = false, refuses_plain = false;
         if (void* probe = VirtualAlloc2(GetCurrentProcess(), nullptr, 2 * page_bytes,
                                         MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0)) {
@@ -1341,7 +1352,7 @@ bool placeholder_fallback()
                            (info.Flags & placeholder_reservation);
             VirtualFree(probe, 0, MEM_RELEASE);
         }
-        if (!bit_reported && !x2w_local::env_on("X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK")) {
+        if (!bit_reported && !skip_probe) {
             if (auto* plain = static_cast<BYTE*>(VirtualAlloc(nullptr, 2 * page_bytes, MEM_RESERVE, PAGE_NOACCESS))) {
                 MEMORY_BASIC_INFORMATION after{};
                 refuses_plain = !VirtualFree(plain + page_bytes, page_bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&

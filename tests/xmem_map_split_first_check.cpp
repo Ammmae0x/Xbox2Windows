@@ -1,10 +1,14 @@
 // XMemMapPhysicalPages into an owned XMem reservation: when the target is in the middle of a larger placeholder, xmem
 // splits first and maps once (one MapViewOfFile3 per page). Under Wine each failed map is a server round trip whose
 // cost grows with the number of views, and the title maps one 64 KiB page per call at startup.
-//   xmem_map_split_first_check <xmem.dll>          N single-page maps take N map attempts; an exact placeholder
-//                                                  (left by an unmap) is mapped without a split
-//   xmem_map_split_first_check <xmem.dll> control  run by CTest with X2W_XMEM_TEST_MAP_FIRST=1: the old order takes
-//                                                  2N map attempts and prints "map-first control: maps=2N"
+//   xmem_map_split_first_check <xmem.dll>           N single-page maps take N map attempts; an exact placeholder
+//                                                   (left by an unmap) is mapped without a split
+//   xmem_map_split_first_check <xmem.dll> control   test-controls build (X2W_XMEM_TEST_CONTROLS) with
+//                                                   X2W_XMEM_TEST_MAP_FIRST=1: the old order takes 2N map attempts and
+//                                                   prints "map-first control: maps=2N"
+//   xmem_map_split_first_check <xmem.dll> deployed  deployed build with X2W_XMEM_TEST_MAP_FIRST=1: the build ignores
+//                                                   the switch, so the checks of the first mode pass
+// Each mode sets or clears X2W_XMEM_TEST_MAP_FIRST itself, so an inherited value cannot change the result.
 #include <windows.h>
 #include <cstdio>
 #include <cwchar>
@@ -27,7 +31,10 @@ bool require(bool ok, const char* step)
 int wmain(int argc, wchar_t** argv)
 {
     const bool control = argc == 3 && std::wcscmp(argv[2], L"control") == 0;
-    if (argc != 2 && !control) return 2;
+    const bool deployed = argc == 3 && std::wcscmp(argv[2], L"deployed") == 0;
+    if (argc != 2 && !control && !deployed) return 2;
+    // xmem reads the switch on first use and keeps the value; set it before any map.
+    SetEnvironmentVariableW(L"X2W_XMEM_TEST_MAP_FIRST", control || deployed ? L"1" : nullptr);
     const HMODULE xmem = LoadLibraryW(argv[1]);
     if (!require(xmem != nullptr, "load xmem.dll")) return 1;
     const auto reserve = reinterpret_cast<Reserve>(GetProcAddress(xmem, "XMemVirtualAlloc"));
@@ -89,5 +96,6 @@ int wmain(int argc, wchar_t** argv)
         !require(first[0] == 0x40, "the remapped page reads its bytes"))
         return 1;
     std::puts("split-first: maps=N; exact placeholder mapped without a split");
+    if (deployed) std::puts("deployed build: X2W_XMEM_TEST_MAP_FIRST=1 was ignored");
     return 0;
 }
