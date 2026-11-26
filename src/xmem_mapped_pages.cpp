@@ -1931,14 +1931,24 @@ bool destination_writable(void* destination, SIZE_T capacity)
 // pages of both ranges are committed first, before any mutex: a fault under it is passed on (mapping_thread), not
 // served.
 // TRUE when the bytes were copied. FALSE with ERROR_NOACCESS when the destination is not writable (nothing is
-// written), ERROR_INVALID_ADDRESS when the copy faulted (a source page not readable; part of the destination may be
-// written), or ERROR_INVALID_PARAMETER for more bytes than capacity or null data.
+// written), ERROR_INVALID_ADDRESS when the copy faulted (a source page not readable, or a destination page that
+// stopped being writable during the copy; part of the destination may be written), or ERROR_INVALID_PARAMETER for
+// more bytes than capacity or null data.
+// Test build only: X2W_XMEM_TEST_COPY_ERROR=<code> fails every copy with that error before anything is written
+// (startup_dstorage_break_window_check outcomes: XCRDAPI's logged outcome per error).
 extern "C" BOOL WINAPI x2w_xmem_copy_to_destination(void* destination, SIZE_T capacity, const void* data, SIZE_T bytes)
 {
     if (bytes > capacity || (bytes && !data)) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+#ifdef X2W_XMEM_TEST_CONTROLS
+    char forced[16];
+    if (GetEnvironmentVariableA("X2W_XMEM_TEST_COPY_ERROR", forced, sizeof(forced)) && forced[0]) {
+        SetLastError(static_cast<DWORD>(std::strtoul(forced, nullptr, 10)));
+        return FALSE;
+    }
+#endif
     const auto start = reinterpret_cast<ULONG_PTR>(destination);
     if (capacity && destination && capacity <= ~ULONG_PTR{0} - start) x2w_xmem_commit_range(destination, capacity);
     if (bytes) x2w_xmem_commit_range(data, bytes);

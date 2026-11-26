@@ -136,7 +136,11 @@ add_test(NAME startup_dstorage_break_window_plain COMMAND startup_dstorage_break
          "$<TARGET_FILE:xmem_shim_test_controls>" "$<TARGET_FILE:startup_stub_xcrdapi>" plain)
 add_test(NAME startup_dstorage_break_window_views_off COMMAND startup_dstorage_break_window_check
          "$<TARGET_FILE:xmem_shim_test_controls>" "$<TARGET_FILE:startup_stub_xcrdapi>" views-off)
-set_tests_properties(startup_dstorage_break_window_plain startup_dstorage_break_window_views_off PROPERTIES TIMEOUT 60)
+# XCRDAPI's logged outcome for each copy error, forced by the test-controls build (X2W_XMEM_TEST_COPY_ERROR).
+add_test(NAME startup_dstorage_break_window_outcomes COMMAND startup_dstorage_break_window_check
+         "$<TARGET_FILE:xmem_shim_test_controls>" "$<TARGET_FILE:startup_stub_xcrdapi>" outcomes)
+set_tests_properties(startup_dstorage_break_window_plain startup_dstorage_break_window_views_off
+                     startup_dstorage_break_window_outcomes PROPERTIES TIMEOUT 60)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/startup_stubs/xcrdapi.cpp)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/startup_stubs/xcrdapi.cpp" xcrdapi_text)
 string(REPLACE "\"x2w_xmem_copy_to_destination\"" "\"x2w_xmem_copy_to_destination_control\"" xcrdapi_control_text

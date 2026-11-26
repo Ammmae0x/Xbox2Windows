@@ -6,7 +6,8 @@
 // surviving page reads as reserved. The xmem build with its test controls holds an unmap in that window
 // (X2W_XMEM_TEST_HOLD_WINDOW=<name>: it sets "<name>.unmapped" and waits up to five seconds for "<name>.release").
 //
-// usage: startup_dstorage_break_window_check <xmem.dll built with its test controls> <XCRDAPI.dll> [plain|views-off]
+// usage: startup_dstorage_break_window_check <xmem.dll built with its test controls> <XCRDAPI.dll>
+//        [plain|views-off|outcomes]
 // Cases, each against the real stand-in's queue with a memory source:
 // - no break: a request into a mapped page of the run lands;
 // - read-only destination: refused, nothing written (the writability check also runs on the xmem path);
@@ -18,6 +19,9 @@
 // `plain` and `views-off` instead check which copies take xmem's mapping mutex (x2w_xmem_copy_counts): with shared
 // views, a request into a VirtualAlloc destination copies without it and one into the run with it; with
 // X2W_XMEM_SHARED_VIEWS unset (`views-off`), a request into an XMem page copies without it as well.
+// `outcomes` forces each copy error in turn (the test-controls build's X2W_XMEM_TEST_COPY_ERROR) and checks the
+// outcome XCRDAPI logs for the request: the DLLs log to the standard error handle, which this mode points at a
+// temporary file.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -158,15 +162,79 @@ int copy_rows(HMODULE xmem, unsigned char* run_page, bool views_off)
     std::printf("dstorage copy paths: %s\n", views_off ? "views off: no mutex" : "the mutex only for the run");
     return 0;
 }
+
+// Waits up to two seconds for text to appear in the log file (the request's line follows its completion).
+bool logged(HANDLE log, const char* text)
+{
+    static char all[1 << 16];
+    for (int waited = 0; waited <= 2000; waited += 20) {
+        DWORD size = 0;
+        SetFilePointer(log, 0, nullptr, FILE_BEGIN);
+        if (ReadFile(log, all, sizeof(all) - 1, &size, nullptr)) {
+            all[size] = 0;
+            if (std::strstr(all, text)) return true;
+        }
+        Sleep(20);
+    }
+    return false;
+}
+
+int outcome_rows()
+{
+    char dir[MAX_PATH], path[MAX_PATH];
+    GetTempPathA(sizeof(dir), dir);
+    std::snprintf(path, sizeof(path), "%sx2w-dstorage-outcomes-%lu.log", dir, GetCurrentProcessId());
+    const HANDLE log = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    auto* plain = static_cast<unsigned char*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (log == INVALID_HANDLE_VALUE || !plain) {
+        std::printf("FAIL setup: log file or destination\n");
+        return 1;
+    }
+    const HANDLE saved = GetStdHandle(STD_ERROR_HANDLE);
+    SetStdHandle(STD_ERROR_HANDLE, log);
+    const struct {
+        DWORD error;
+        const char* text;
+    } rows[] = {
+        {ERROR_NOACCESS, "-> destination not writable"},
+        {ERROR_INVALID_ADDRESS, "-> copy faulted (part of the destination may be written)"},
+        {ERROR_INVALID_PARAMETER, "-> invalid copy request"},
+        {ERROR_GEN_FAILURE, "-> copy failed (error 31)"},
+    };
+    for (const auto& row : rows) {
+        char code[16];
+        std::snprintf(code, sizeof(code), "%lu", row.error);
+        SetEnvironmentVariableA("X2W_XMEM_TEST_COPY_ERROR", code);
+        std::memset(plain, 0xAA, bytes);
+        long hr = 0;
+        const bool done = completed_within(submit(plain, bytes, bytes), 5000, hr);
+        SetEnvironmentVariableA("X2W_XMEM_TEST_COPY_ERROR", nullptr);
+        const bool found = logged(log, row.text);
+        std::printf("error %lu: completed %d hr 0x%08lx, logged \"%s\" %d\n", row.error, done,
+                    static_cast<unsigned long>(hr), row.text, found);
+        if (!done || hr == 0) fail(row.text, "the request did not fail");
+        else if (!filled(plain, 0xAA, bytes)) fail(row.text, "bytes were written");
+        else if (!found) fail(row.text, "outcome not logged");
+        else std::printf("ok: error %lu logged %s\n", row.error, row.text);
+    }
+    SetStdHandle(STD_ERROR_HANDLE, saved);
+    CloseHandle(log);
+    VirtualFree(plain, 0, MEM_RELEASE);
+    if (failures) return 1;
+    std::printf("dstorage outcomes: one text per copy error\n");
+    return 0;
+}
 }  // namespace
 
 int main(int argc, char** argv)
 {
     const bool plain_mode = argc == 4 && std::strcmp(argv[3], "plain") == 0;
     const bool views_off = argc == 4 && std::strcmp(argv[3], "views-off") == 0;
-    if (argc != 3 && !plain_mode && !views_off) {
+    const bool outcomes = argc == 4 && std::strcmp(argv[3], "outcomes") == 0;
+    if (argc != 3 && !plain_mode && !views_off && !outcomes) {
         std::printf("usage: startup_dstorage_break_window_check <xmem.dll with test controls> <XCRDAPI.dll> "
-                    "[plain|views-off]\n");
+                    "[plain|views-off|outcomes]\n");
         return 2;
     }
     char hold_name[64];
@@ -204,6 +272,7 @@ int main(int argc, char** argv)
     status = static_cast<Object*>(status_pointer);
     queue = static_cast<Object*>(queue_pointer);
     for (unsigned i = 0; i < bytes; ++i) source[i] = static_cast<unsigned char>(i % 251 + 1);
+    if (outcomes) return outcome_rows();
 
     // Eight physical pages mapped as one run at the start of a startup reservation (as xmem_page_runs_check.py).
     auto* whole = static_cast<unsigned char*>(virtual_alloc(nullptr, SIZE_T{16} << 30, 0x20402000, 0x21, PAGE_READWRITE));

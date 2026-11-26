@@ -197,8 +197,8 @@ static bool destination_writable(const void* destination, std::size_t bytes)
 // either range overlaps one of its runs, so an XMem run break (the pages of a shared view unmapped and mapped again)
 // can neither make a mapped destination look reserved nor take it away during the copy. Without xmem.dll the check
 // and the copy run here.
-// ERROR_SUCCESS; ERROR_NOACCESS when the destination is not writable (nothing written); another error when the
-// copy faulted.
+// ERROR_SUCCESS; ERROR_NOACCESS when the destination is not writable (nothing written); ERROR_INVALID_ADDRESS when
+// the copy faulted (part of the destination may be written); ERROR_INVALID_PARAMETER for an invalid request.
 static DWORD copy_to_destination(void* destination, std::size_t capacity, const void* data, std::size_t bytes)
 {
     using CopyToDestination = BOOL(WINAPI*)(void*, SIZE_T, const void*, SIZE_T);
@@ -210,6 +210,19 @@ static DWORD copy_to_destination(void* destination, std::size_t capacity, const 
     if (!destination_writable(destination, capacity)) return ERROR_NOACCESS;
     std::memcpy(destination, data, bytes);
     return ERROR_SUCCESS;
+}
+
+// The outcome logged for a copy that copy_to_destination did not complete, by its error. text holds the last case.
+static const char* copy_outcome(DWORD error, char (&text)[40])
+{
+    switch (error) {
+    case ERROR_NOACCESS: return "destination not writable";
+    case ERROR_INVALID_ADDRESS: return "copy faulted (part of the destination may be written)";
+    case ERROR_INVALID_PARAMETER: return "invalid copy request";
+    default:
+        std::snprintf(text, sizeof(text), "copy failed (error %lu)", static_cast<unsigned long>(error));
+        return text;
+    }
 }
 
 // Return the exact queued requests that continue this stream in this submission, in queue order.
@@ -742,6 +755,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
     const u64 known = 1 | (0xFull << 1) | (1ull << 21) | 0x400000;
     const char* outcome = "done";
+    char copy_failure[40];  // copy_outcome's text for an error it does not name
     StorageFailure failure = StorageFailure::other;  // the heartbeat's cause, if the request fails
     std::vector<unsigned char> packed, output;
     const unsigned char* input = nullptr;
@@ -931,7 +945,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
                 // byte is written, so a refusal leaves every page untouched.
                 const DWORD copied = copy_to_destination(destination, destination_capacity, data, decode_length);
                 if (copied != ERROR_SUCCESS) {
-                    outcome = copied == ERROR_NOACCESS ? "destination not writable" : "copy faulted (source not readable)";
+                    outcome = copy_outcome(copied, copy_failure);
                     failure = copied == ERROR_NOACCESS ? StorageFailure::destination_not_writable : StorageFailure::other;
                     data = nullptr;
                     written = false;
