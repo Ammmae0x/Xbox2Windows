@@ -6,8 +6,9 @@
 // starts the reader under test on another thread, checks that it has not answered 300 ms later, releases the window
 // and then checks the reader's answer: the neighbour page is committed, mapped and holds its data.
 //
-// Cases (one window each): x2w_xmem_stable_call, XMemVirtualQuery, x2w_local::writable,
-// x2w_startup::measure_placed_buffer and x2w_startup::snapshot_samplers.
+// Cases (one window each): x2w_xmem_stable_call, XMemVirtualQuery, this program's VirtualQueryEx import (wrapped by
+// xmem.dll when it loads with the switch), x2w_local::writable, x2w_startup::measure_placed_buffer and
+// x2w_startup::snapshot_samplers.
 //
 // With `control` (the build whose local_log.h asks xmem.dll for a missing export, so the header readers run
 // directly) the three header readers answer inside the window: the check expects that, and fails if they wait.
@@ -120,7 +121,7 @@ int main(int argc, char** argv)
         std::printf("usage: xmem_run_break_readers_check <test-controls xmem.dll> [control]\n");
         return 2;
     }
-    // The mode is read by the first mapping call.
+    // The mode is read by the first mapping call; the VirtualQueryEx import is wrapped when xmem.dll loads.
     SetEnvironmentVariableA("X2W_XMEM_SHARED_VIEWS", "1");
     const HMODULE xmem = LoadLibraryA(argv[1]);
     if (!xmem) {
@@ -158,6 +159,10 @@ int main(int argc, char** argv)
             DWORD state = 0;
             if (shim.query(GetCurrentProcess(), target, buffer)) std::memcpy(&state, buffer + 0x20, sizeof(state));
             return state == MEM_COMMIT;
+        });
+        window_case(shim, at, index++, "VirtualQueryEx_import", true, [&](unsigned char* target) {
+            MEMORY_BASIC_INFORMATION info{};
+            return VirtualQueryEx(GetCurrentProcess(), target, &info, sizeof(info)) == sizeof(info) && info.State == MEM_COMMIT;
         });
     }
     // The header readers: waiting with the export, answering inside the window without it (control).

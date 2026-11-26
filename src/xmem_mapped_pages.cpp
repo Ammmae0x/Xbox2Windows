@@ -1849,6 +1849,44 @@ const bool lazy_commit_installed = [] {
     }
     return true;
 }();
+
+// With X2W_XMEM_SHARED_VIEWS=1 the main module's VirtualQueryEx imports answer outside run breaks
+// (x2w_xmem_stable_call): inside one, a page of the run being taken apart reads as reserved. A query of another
+// process runs the same way; it only costs the retry. The module is pinned once an import points into it (a main
+// module without the import leaves it unloadable, as before); if the pin is refused, the imports are restored.
+using VirtualQueryExFn = SIZE_T(WINAPI*)(HANDLE, LPCVOID, PMEMORY_BASIC_INFORMATION, SIZE_T);
+VirtualQueryExFn real_virtual_query_ex;
+
+SIZE_T WINAPI virtual_query_ex_stable(HANDLE process, LPCVOID address, PMEMORY_BASIC_INFORMATION info, SIZE_T bytes)
+{
+    struct Query {
+        HANDLE process;
+        LPCVOID address;
+        PMEMORY_BASIC_INFORMATION info;
+        SIZE_T bytes, result;
+    } query{process, address, info, bytes, 0};
+    x2w_xmem_stable_call([](void* context) {
+        auto& q = *static_cast<Query*>(context);
+        q.result = real_virtual_query_ex(q.process, q.address, q.info, q.bytes);
+    }, &query);
+    return query.result;
+}
+
+const int virtual_query_ex_wrapped = [] {
+    if (!x2w_local::env_on("X2W_XMEM_SHARED_VIEWS")) return 0;
+    real_virtual_query_ex = reinterpret_cast<VirtualQueryExFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "VirtualQueryEx"));
+    if (!real_virtual_query_ex) return 0;
+    int queries = patch_main_import("VirtualQueryEx", reinterpret_cast<const void*>(&virtual_query_ex_stable));
+    HMODULE self = nullptr;
+    if (queries && !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                       reinterpret_cast<LPCWSTR>(&virtual_query_ex_stable), &self)) {
+        patch_main_import("VirtualQueryEx", reinterpret_cast<const void*>(real_virtual_query_ex));
+        queries = 0;
+    }
+    x2w_local::logf("x2w-xmem shared views (X2W_XMEM_SHARED_VIEWS): %d VirtualQueryEx import(s) answer outside run breaks",
+                    queries);
+    return queries;
+}();
 }  // namespace
 
 // Experimental export: writes bytes into physical pages named by the title's
