@@ -11,12 +11,31 @@ All x87 values use a portable software 80-bit extended-precision representation
 
 Supported x87 environment and state instructions (docs/coverage/x64_zen2.tsv group x87):
   - FDECSTP        : TOP <- (TOP - 1) & 7 and clears FSW.C1; FTW and registers unchanged.
+                     Measured x64 status profile: preserves C0/C2/C3 (SDM leaves C0/C2/C3
+                     undefined).
   - FNSTENV [r8]   : Store 28-byte 32-bit protected-mode environment, then mask FCW[5:0].
+                     Leaves C0..C3 undefined for subsequent readers until re-initialized.
   - FSTENV [r8]    : WAIT immediately followed by FNSTENV [r8].
   - FLDENV [src]   : Restore 28-byte 32-bit protected-mode environment (FCW/FSW/FTW/FIP/FCS/FOP/FDP/FDS).
   - FNSAVE [r8]    : Store 28-byte env + logical ST(0)..ST(7) ((TOP+i)&7), then FNINIT.
   - FSAVE [r8]     : WAIT immediately followed by FNSAVE [r8].
   - FRSTOR [src]   : Restore 28-byte env + logical ST(0)..ST(7) ((TOP+i)&7).
+
+Metadata and safety profile (`preserved-metadata` / masked-exception):
+  - `preserved-metadata`: explicit FLDENV/FRSTOR -> FNSTENV/FNSAVE round-trips preserve
+    FIP/FCS/FOP/FDP/FDS (with FOP masked to 11 bits); masked non-control/stack ops
+    (FDECSTP, FLD, FLD1, FLDZ, FSTP) preserve the loaded/initialized FIP/FCS/FOP/FDP/FDS
+    (matching Intel SDM default fopcode compatibility mode; AMD/compat parts may update
+    FOP/FIP/FCS on masked non-control ops).
+  - FNINIT/FNSAVE sets FTW=0xFFFF without clearing physical register contents. FLDENV
+    with non-empty FTW bits on physical registers not defined in the current function
+    traps via x87_trap() (`__ud2()`).
+  - Masked-exception precondition: WAIT, FDECSTP, FLD*, and FSTP* trap via x87_trap()
+    when any exception is unmasked (FCW[5:0] != 0x3F) or SW.ES is set; FLDENV/FRSTOR
+    also trap if SW.ES or an unmasked pending exception is loaded.
+  - Uninitialized reads of FCW (FNSTCW before FNINIT/FLDCW/FLDENV/FRSTOR), FSW/env
+    (FNSTSW/FNSTENV/FNSAVE/FDECSTP before FNINIT/FLDENV/FRSTOR), and readers of
+    undefined C0..C3 after FNSTENV/FSTENV are statically rejected.
 
 Bounded leaf x87 stack/control/status glue:
   - fninit, fldcw m16, fnstcw m16, fnstsw ax, mov word ptr [r8], ax
@@ -26,7 +45,8 @@ Bounded leaf x87 stack/control/status glue:
 
 16-bit operand-size env/state forms (o16: 14/94-byte), standalone WAIT or WAIT
 before any instruction other than FNSTENV/FNSAVE, stack overflow/underflow,
-non-empty or unknown x87 stack at ret, XMM/YMM/ZMM/VEX/EVEX encodings, prefixes,
+non-empty or unknown x87 stack at ret, uninitialized CW/SW/env reads, FSW reads
+after FNSTENV/FSTENV before re-init, XMM/YMM/ZMM/VEX/EVEX encodings, prefixes,
 non-flat, displaced, or indexed memory, stores outside [r8], branches, undefined
 ax reads, missing ret, and trailing instructions after ret are rejected.
 """
@@ -110,8 +130,17 @@ PRELUDE = r"""#include <atomic>
 #include <cstdint>
 #include <cstring>
 #if defined(_MSC_VER)
+#include <intrin.h>
 #include <xmmintrin.h>
 #endif
+
+static inline void x87_trap() {
+#if defined(_MSC_VER)
+    __ud2();
+#else
+    __builtin_trap();
+#endif
+}
 
 #if defined(_MSC_VER)
 // Test-only host MXCSR accessors used by tests/cpu/x87_env_aot_check.py to
@@ -150,7 +179,7 @@ static constexpr std::uint16_t SW_C1 = 0x0200u;
 
 struct X87State {
     X87Val regs[8]{};
-    std::uint16_t cw = 0x037fu;
+    std::uint16_t cw = 0x027fu;
     std::uint16_t sw = 0x0000u;
     std::uint16_t tw = 0xffffu;
     std::uint32_t fip = 0u;
@@ -159,7 +188,20 @@ struct X87State {
     std::uint32_t fdp = 0u;
     std::uint16_t fds = 0u;
     unsigned top = 0u;
+    std::uint8_t regs_defined = 0u;
 };
+
+static inline void x87_check_mf(const X87State& st) {
+    // Masked-exception precondition: non-control ops and WAIT trap if any
+    // exception is unmasked (FCW[5:0] != 0x3F) or SW.ES (bit 7) is set.
+    if ((st.cw & 0x003fu) != 0x003fu || (st.sw & 0x0080u) != 0u || (st.sw & ~st.cw & 0x003fu) != 0u) {
+        x87_trap();
+    }
+}
+
+static inline void x87_wait(const X87State& st) {
+    x87_check_mf(st);
+}
 
 static inline std::uint16_t load16(word address) {
     std::atomic_signal_fence(std::memory_order_seq_cst);
@@ -284,13 +326,16 @@ static inline void x87_set_c1(std::uint16_t& sw, bool up) {
 }
 
 static inline void x87_push(X87State& st, X87Val v) {
+    x87_check_mf(st);
     st.top = (st.top - 1u) & 7u;
     st.regs[st.top] = v;
+    st.regs_defined |= static_cast<std::uint8_t>(1u << st.top);
     x87_set_tag(st.tw, st.top, x87_tag(v));
     x87_set_c1(st.sw, false);
 }
 
 static inline X87Val x87_pop(X87State& st) {
+    x87_check_mf(st);
     const X87Val v = st.regs[st.top];
     x87_set_tag(st.tw, st.top, 3u);
     st.top = (st.top + 1u) & 7u;
@@ -306,7 +351,7 @@ static inline std::uint16_t x87_status_word(const X87State& st) {
 }
 
 static inline void x87_fninit(X87State& st) {
-    for (unsigned i = 0u; i < 8u; ++i) st.regs[i] = X87_POS_ZERO;
+    // SDM: FNINIT sets FTW=0xFFFF without clearing physical register contents.
     st.cw = 0x037fu;
     st.sw = 0x0000u;
     st.tw = 0xffffu;
@@ -319,6 +364,7 @@ static inline void x87_fninit(X87State& st) {
 }
 
 static inline void x87_fdecstp(X87State& st) {
+    x87_check_mf(st);
     st.top = (st.top - 1u) & 7u;
     x87_set_c1(st.sw, false);
 }
@@ -373,6 +419,16 @@ static inline void x87_fnstenv(X87State& st, word addr) {
 
 static inline void x87_fldenv(X87State& st, word addr) {
     const std::uint16_t raw_tw = x87_load_env28(st, addr);
+    if ((st.sw & 0x0080u) != 0u || (st.sw & ~st.cw & 0x003fu) != 0u) {
+        x87_trap();
+    }
+    for (unsigned phys = 0u; phys < 8u; ++phys) {
+        const unsigned tag = (raw_tw >> (phys * 2u)) & 3u;
+        if (tag != 3u && (st.regs_defined & (1u << phys)) == 0u) {
+            // Physical register was not initialized in this function; FNINIT does not clear regs.
+            x87_trap();
+        }
+    }
     x87_recompute_tags(st, raw_tw);
 }
 
@@ -386,9 +442,13 @@ static inline void x87_fnsave(X87State& st, word addr) {
 
 static inline void x87_frstor(X87State& st, word addr) {
     const std::uint16_t raw_tw = x87_load_env28(st, addr);
+    if ((st.sw & 0x0080u) != 0u || (st.sw & ~st.cw & 0x003fu) != 0u) {
+        x87_trap();
+    }
     for (unsigned i = 0u; i < 8u; ++i) {
         x87_st(st, i) = load80(addr + 28ull + static_cast<word>(i) * 10ull);
     }
+    st.regs_defined = 0xffu;
     x87_recompute_tags(st, raw_tw);
 }
 
@@ -419,14 +479,17 @@ static inline X87Val x87_from_binary(std::uint64_t bits, int frac_bits, int exp_
 }
 
 static inline void x87_load_f32(X87State& st, word addr) {
+    x87_check_mf(st);
     x87_push(st, x87_from_binary(load32(addr), 23, 8, 127, st.sw));
 }
 
 static inline void x87_load_f64(X87State& st, word addr) {
+    x87_check_mf(st);
     x87_push(st, x87_from_binary(load64(addr), 52, 11, 1023, st.sw));
 }
 
 static inline void x87_load_m80(X87State& st, word addr) {
+    x87_check_mf(st);
     x87_push(st, load80(addr));
 }
 
@@ -560,6 +623,9 @@ def lift_code(name: str, start: int, raw: bytes) -> tuple[str, int]:
     known = True
     top = 0
     occupied = 0
+    cw_known = False
+    env_known = False
+    cc_known = False
     ax_defined = False
     used_ax = False
     statements: list[str] = []
@@ -631,9 +697,13 @@ def lift_code(name: str, start: int, raw: bytes) -> tuple[str, int]:
                 raise ValueError(
                     f"unsupported WAIT not immediately before FNSTENV/FNSAVE at RVA {ins.ip:#x}: {ins}"
                 )
-            # Masked exceptions cannot trigger #MF; WAIT is paired for FSTENV/FSAVE decoding.
+            statements.append("x87_wait(x87);")
 
         elif ins.code == Code.FDECSTP:
+            if not env_known:
+                raise ValueError(f"read of uninitialized x87 environment before fninit/fldenv/frstor at RVA {ins.ip:#x}: {ins}")
+            if not cc_known:
+                raise ValueError(f"undefined x87 condition codes after FNSTENV at RVA {ins.ip:#x}: {ins}")
             if known:
                 top = (top - 1) & 7
             statements.append("x87_fdecstp(x87);")
@@ -642,38 +712,66 @@ def lift_code(name: str, start: int, raw: bytes) -> tuple[str, int]:
             known = True
             top = 0
             occupied = 0
+            cw_known = True
+            env_known = True
+            cc_known = True
             statements.append("x87_fninit(x87);")
 
         elif ins.code == Code.FLDENV_M28BYTE:
             addr = flat_address(ins, width=28, store=False)
             known = False
+            cw_known = True
+            env_known = True
+            cc_known = True
             statements.append(f"x87_fldenv(x87, {addr});")
 
         elif ins.code == Code.FNSTENV_M28BYTE:
+            if not env_known:
+                raise ValueError(f"read of uninitialized x87 environment before fninit/fldenv/frstor at RVA {ins.ip:#x}: {ins}")
+            if not cc_known:
+                raise ValueError(f"undefined x87 condition codes after FNSTENV at RVA {ins.ip:#x}: {ins}")
             addr = flat_address(ins, width=28, store=True)
+            cc_known = False
             statements.append(f"x87_fnstenv(x87, {addr});")
 
         elif ins.code == Code.FRSTOR_M108BYTE:
             addr = flat_address(ins, width=108, store=False)
             known = False
+            cw_known = True
+            env_known = True
+            cc_known = True
             statements.append(f"x87_frstor(x87, {addr});")
 
         elif ins.code == Code.FNSAVE_M108BYTE:
+            if not env_known:
+                raise ValueError(f"read of uninitialized x87 environment before fninit/fldenv/frstor at RVA {ins.ip:#x}: {ins}")
+            if not cc_known:
+                raise ValueError(f"undefined x87 condition codes after FNSTENV at RVA {ins.ip:#x}: {ins}")
             addr = flat_address(ins, width=108, store=True)
             known = True
             top = 0
             occupied = 0
+            cw_known = True
+            env_known = True
+            cc_known = True
             statements.append(f"x87_fnsave(x87, {addr});")
 
         elif ins.code == Code.FLDCW_M2BYTE:
             addr = flat_address(ins, width=2, store=False)
+            cw_known = True
             statements.append(f"x87.cw = load16({addr});")
 
         elif ins.code == Code.FNSTCW_M2BYTE:
+            if not cw_known:
+                raise ValueError(f"read of uninitialized x87 control word at RVA {ins.ip:#x}: {ins}")
             addr = flat_address(ins, width=2, store=True)
             statements.append(f"store16({addr}, x87.cw);")
 
         elif ins.code == Code.FNSTSW_AX:
+            if not env_known:
+                raise ValueError(f"read of uninitialized x87 status word before fninit/fldenv/frstor at RVA {ins.ip:#x}: {ins}")
+            if not cc_known:
+                raise ValueError(f"undefined x87 condition codes after FNSTENV at RVA {ins.ip:#x}: {ins}")
             ax_defined = True
             used_ax = True
             statements.append("ax = x87_status_word(x87);")

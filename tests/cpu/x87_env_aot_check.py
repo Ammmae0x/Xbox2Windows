@@ -274,7 +274,7 @@ def check_translator():
         ("wait_at_eof", (fninit, wait), "unsupported WAIT not immediately before FNSTENV/FNSAVE"),
         # Stack overflow / underflow / non-empty at ret
         ("overflow_9", (*([fld1] * 9), *([fstp_st0] * 8), ret), "x87 stack overflow"),
-        ("overflow_8_then_fdecstp", (*([fld1] * 8), fdecstp, fld1, *([fstp_st0] * 8), ret), "x87 stack overflow"),
+        ("overflow_8_then_fdecstp", (fninit, *([fld1] * 8), fdecstp, fld1, *([fstp_st0] * 8), ret), "x87 stack overflow"),
         ("underflow_empty_fstp", (fninit, fstp_st0, ret), "x87 stack underflow"),
         ("underflow_fdecstp_fstp", (fninit, fld1, fdecstp, fstp_st0, ret), "x87 stack underflow"),
         ("nonempty_at_ret_fld1", (fninit, fld1, ret), "non-empty x87 stack at ret"),
@@ -305,10 +305,21 @@ def check_translator():
          "store outside output buffer r8"),
         ("fnsave_outside_r8_rdx", (fninit, Instruction.create_mem(Code.FNSAVE_M108BYTE, MemoryOperand(R.RDX)), ret),
          "store outside output buffer r8"),
-        ("fnstcw_outside_r8", (Instruction.create_mem(Code.FNSTCW_M2BYTE, MemoryOperand(R.RCX)), ret),
+        ("fnstcw_outside_r8", (fninit, Instruction.create_mem(Code.FNSTCW_M2BYTE, MemoryOperand(R.RCX)), ret),
          "store outside output buffer r8"),
         ("fstp_outside_r8", (fninit, fld1, Instruction.create_mem(Code.FSTP_M80FP, MemoryOperand(R.RCX)), ret),
          "store outside output buffer r8"),
+        # Uninitialized CW/SW/env reads & undefined condition codes after FNSTENV/FSTENV
+        ("fnstcw_before_init", (fnstcw_r8, ret), "read of uninitialized x87 control word"),
+        ("fnstsw_before_init", (fnstsw_ax, mov_r8_ax, ret), "read of uninitialized x87 status word"),
+        ("fnstenv_before_init", (fnstenv_r8, ret), "read of uninitialized x87 environment"),
+        ("fnsave_before_init", (fnsave_r8, ret), "read of uninitialized x87 environment"),
+        ("fdecstp_before_init", (fdecstp, ret), "read of uninitialized x87 environment"),
+        ("fnstsw_after_fldcw_only", (fldcw_rdx, fnstsw_ax, mov_r8_ax, ret), "read of uninitialized x87 status word"),
+        ("fnstenv_after_fldcw_only", (fldcw_rdx, fnstenv_r8, ret), "read of uninitialized x87 environment"),
+        ("fnstsw_after_fnstenv", (fninit, fnstenv_r8, fnstsw_ax, mov_r8_ax, ret), "undefined x87 condition codes after FNSTENV"),
+        ("fnstenv_after_fnstenv", (fninit, fnstenv_r8, fnstenv_r8, ret), "undefined x87 condition codes after FNSTENV"),
+        ("fnsave_after_fstenv", (fninit, wait, fnstenv_r8, fnsave_r8, ret), "undefined x87 condition codes after FNSTENV"),
         # SSE / VEX / EVEX / unsupported x87 / prefix / ax / control-flow
         ("sse_addps", (Instruction.create_reg_reg(Code.ADDPS_XMM_XMMM128, R.XMM0, R.XMM1), ret),
          "unsupported vector instruction"),
@@ -383,7 +394,7 @@ def assert_env28_deterministic(nat_raw, lif_raw, label, *, check_fip=True, check
     lif = unpack_env28(lif_raw)
     keys = ["cw", "r0", "sw", "r1", "tw", "r2", "r3"]
     if check_fdp_fop:
-        keys.extend(("fop", "fdp"))
+        keys.extend(("fcs", "fop", "fdp", "fds"))
     if check_fip:
         keys.append("fip")
     for key in keys:
@@ -423,24 +434,42 @@ def check_differential(native, lifted, altered, altered_lifted):
     assert nat_sw == lif_sw == 0x3800, (hex(nat_sw), hex(lif_sw))
     total += 1
 
-    # 2. FDECSTP via FLDENV across all 8 TOPs (0..7) with C1=1 set in FSW -> clears C1, wraps TOP, keeps FTW/FCW/FOP/FDP.
+    # 2. FDECSTP via FLDENV across all 8 TOPs (0..7) with C1=1 set in FSW.
+    #    Empty FTW (0xFFFF) avoids reading caller-left physical registers (FNINIT does not zero regs).
+    #    Native vs lifted checks architectural state strictly (cw/sw/tw/reserved); lifted strictly
+    #    checks the `preserved-metadata` profile (fip/fcs/fop/fdp/fds preserved across FDECSTP).
+    observed_fdecstp_profiles = set()
     for top in range(8):
         env_in = pack_env28(
             cw=0x037F,
             sw=(top << 11) | SW_C1 | 0x4501,
-            tw=0xFBFF,
+            tw=0xFFFF,
             fip=0x12345678, fcs=0, fop=0x03AB,
             fdp=0x9ABCDEF0, fds=0,
         )
         nat_env = call3(native["op_fdecstp_wrap_env"], env_in, dummy, b"\x5a" * 28)
         lif_env = call3(lifted["op_fdecstp_wrap_env"], env_in, dummy, b"\x5a" * 28)
-        assert_env28_deterministic(nat_env, lif_env, f"fdecstp_wrap_top_{top}", check_fip=False)
+        assert_env28_deterministic(
+            nat_env, lif_env, f"fdecstp_wrap_top_{top}", check_fip=False, check_fdp_fop=False
+        )
         parsed = unpack_env28(lif_env)
+        assert (parsed["fip"], parsed["fcs"], parsed["fop"], parsed["fdp"], parsed["fds"]) == (
+            0x12345678, 0, 0x03AB, 0x9ABCDEF0, 0
+        ), f"fdecstp_wrap_top_{top}: preserved-metadata mismatch {parsed}"
         assert parsed["top"] == ((top - 1) & 7)
         assert (parsed["sw"] & SW_C1) == 0
-        # Physical regs were zeroed by fninit, so non-empty slot 5 becomes tag 01 (0xF7FF).
-        assert parsed["tw"] == 0xF7FF
+        assert parsed["tw"] == 0xFFFF
+        nat_parsed = unpack_env28(nat_env)
+        assert nat_parsed["fdp"] == 0x9ABCDEF0 and nat_parsed["fds"] == 0
+        if nat_parsed["fop"] == 0x03AB and nat_parsed["fcs"] == 0:
+            observed_fdecstp_profiles.add("preserved")
+        elif nat_parsed["fop"] == 0x01F6:
+            observed_fdecstp_profiles.add(f"updated(fop=0x1f6,fcs={nat_parsed['fcs']:#x})")
+        else:
+            raise AssertionError(f"fdecstp_wrap_top_{top}: unexpected native FOP {nat_parsed['fop']:#x}")
         total += 1
+    assert len(observed_fdecstp_profiles) == 1, f"inconsistent host FDECSTP FOP behavior: {observed_fdecstp_profiles}"
+    native_fdecstp_profile = next(iter(observed_fdecstp_profiles))
 
     # 3. FNSTENV and FSTENV after pushed values (checks FTW Valid=00, Zero=01, Special=10, Empty=11, TOP=5, FCW).
     for cw in (0x037F, 0x027F, 0x077F, 0x0B7F, 0x0F7F):
@@ -539,9 +568,14 @@ def check_differential(native, lifted, altered, altered_lifted):
 
         nat_dec = call3(native["op_frstor_fdecstp_fnsave"], state_in, dummy, b"\x5a" * 108)
         lif_dec = call3(lifted["op_frstor_fdecstp_fnsave"], state_in, dummy, b"\x5a" * 108)
-        assert_env28_deterministic(nat_dec[:28], lif_dec[:28], f"frstor_fdecstp_top_{top}", check_fip=False)
+        assert_env28_deterministic(
+            nat_dec[:28], lif_dec[:28], f"frstor_fdecstp_top_{top}", check_fip=False, check_fdp_fop=False
+        )
         assert nat_dec[28:] == lif_dec[28:]
         dec_env, dec_regs = unpack_state108(lif_dec)
+        assert (dec_env["fip"], dec_env["fcs"], dec_env["fop"], dec_env["fdp"], dec_env["fds"]) == (
+            0x01020304, 0, 0x02A5, 0x05060708, 0
+        ), f"frstor_fdecstp_top_{top}: preserved-metadata mismatch {dec_env}"
         assert dec_env["top"] == ((top - 1) & 7)
         assert (dec_env["sw"] & SW_C1) == 0
         assert dec_env["tw"] == want_tw
@@ -588,7 +622,7 @@ def check_differential(native, lifted, altered, altered_lifted):
             assert alt_n == alt_l and alt_n != orig_n, f"altered mismatch on {name}"
         else:
             check_fip = name == "op_fldenv_fnstenv"
-            check_fdp = name not in ("op_fstenv_pushed", "op_fnsave_stack", "op_fsave_stack")
+            check_fdp = name == "op_fldenv_fnstenv"
             assert_env28_deterministic(alt_n[:28], alt_l[:28], f"alt_{name}", check_fip=check_fip, check_fdp_fop=check_fdp)
             if name == "op_frstor_fnsave":
                 assert alt_n[28:] == alt_l[28:]
@@ -597,7 +631,68 @@ def check_differential(native, lifted, altered, altered_lifted):
             assert alt_n[:10] != orig_n[:10], f"altered build did not diverge on {name}"
         total += 1
 
-    return total
+    # Verify FNINIT does not corrupt caller-left physical registers when followed by empty-FTW FLDENV.
+    leave_one = pack_env28(cw=0x037F, sw=0x0000, tw=0xCFFF) + b"".join(
+        pack80(POS_ONE if i == 6 else POS_ZERO) for i in range(8)
+    )
+    call3(native["op_frstor_fnsave"], leave_one, dummy, b"\x5a" * 108)
+    env_empty = pack_env28(cw=0x037F, sw=0x0000, tw=0xFFFF, fip=0x11112222, fop=0x0111)
+    nat_after = call3(native["op_fdecstp_wrap_env"], env_empty, dummy, b"\x5a" * 28)
+    lif_after = call3(lifted["op_fdecstp_wrap_env"], env_empty, dummy, b"\x5a" * 28)
+    assert_env28_deterministic(nat_after, lif_after, "fninit_after_phys_one", check_fip=False, check_fdp_fop=False)
+    total += 1
+
+    return total, native_fdecstp_profile
+
+
+def check_runtime_traps(lifted):
+    """Verify out-of-profile unmasked exceptions, SW.ES=1, and uninit-reg FLDENV trap cleanly via __ud2()."""
+    dummy = b"\x00" * 16
+    trap_cases = (
+        (
+            "unmasked_snan_fstenv",
+            "op_fstenv_pushed",
+            pack_f64(0x7FF0000000000001),
+            pack16(0x037E),
+            28,
+        ),
+        (
+            "unmasked_sw_es_frstor_fdecstp",
+            "op_frstor_fdecstp_fnsave",
+            pack_env28(cw=0x037E, sw=0x0081, tw=0xFFFF) + b"\x00" * 80,
+            dummy,
+            108,
+        ),
+        (
+            "sw_es_fldenv",
+            "op_fldenv_fnstenv",
+            pack_env28(cw=0x037F, sw=0x0081, tw=0xFFFF),
+            dummy,
+            28,
+        ),
+        (
+            "uninit_reg_fldenv_tw_cfff",
+            "op_fdecstp_wrap_env",
+            pack_env28(cw=0x037F, sw=0x0000, tw=0xCFFF),
+            dummy,
+            28,
+        ),
+    )
+    for label, name, a_b, b_b, out_len in trap_cases:
+        sentinel = b"\xcc" * out_len
+        buf_a, _, _, _, a_addr = alloc_guarded(a_b)
+        buf_b, _, _, _, b_addr = alloc_guarded(b_b)
+        buf_o, _, o_off, _, o_addr = alloc_guarded(sentinel)
+        try:
+            lifted[name](a_addr, b_addr, o_addr)
+        except OSError as exc:
+            if (getattr(exc, "winerror", 0) or 0) & 0xFFFFFFFF != 0xC000001D:
+                raise AssertionError(f"{label}: unexpected SEH {exc!r}") from exc
+        else:
+            raise AssertionError(f"{label}: lifted {name} returned instead of trapping")
+        assert buf_o.raw[o_off:o_off + out_len] == sentinel, f"{label}: wrote output before trapping"
+        _ = (buf_a, buf_b)
+    return len(trap_cases)
 
 
 def check_mxcsr_isolation(native, lifted, lifted_lib):
@@ -639,31 +734,109 @@ def check_mxcsr_isolation(native, lifted, lifted_lib):
     return checked
 
 
-def check_mutants(lifted):
+MUTANT_SPECS = (
+    ("mut_fdecstp_updates_fop_wrap", "op_fdecstp_wrap_env", "x87_fdecstp(x87);",
+     "x87_fdecstp(x87); x87.fop = 0x01f6u; x87.fcs = 0x0033u;"),
+    ("mut_fdecstp_updates_fop_frstor", "op_frstor_fdecstp_fnsave", "x87_fdecstp(x87);",
+     "x87_fdecstp(x87); x87.fop = 0x01f6u; x87.fcs = 0x0033u;"),
+    ("mut_fdecstp_no_wrap", "op_fdecstp_sw", "x87_fdecstp(x87);",
+     "x87_set_c1(x87.sw, false);"),
+    ("mut_fdecstp_keep_c1", "op_fdecstp_wrap_env", "x87_fdecstp(x87);",
+     "x87.top = (x87.top - 1u) & 7u;"),
+    ("mut_fnstenv_no_mask", "op_fnstenv_post_cw", "x87_fnstenv(x87, r8);",
+     "x87_store_env28(x87, r8);"),
+    ("mut_fnsave_phys_order", "op_frstor_fdecstp_fnsave", "x87_fnsave(x87, r8);",
+     "x87_store_env28(x87, r8); for (unsigned i = 0u; i < 8u; ++i) "
+     "store80(r8 + 28ull + static_cast<word>(i) * 10ull, x87.regs[i]); x87_fninit(x87);"),
+    ("mut_frstor_no_recompute", "op_frstor_fnsave", "x87_frstor(x87, rcx);",
+     "{ const std::uint16_t raw_tw = x87_load_env28(x87, rcx); "
+     "for (unsigned i = 0u; i < 8u; ++i) x87_st(x87, i) = load80(rcx + 28ull + static_cast<word>(i) * 10ull); "
+     "x87.regs_defined = 0xffu; x87.tw = raw_tw; }"),
+    ("mut_fnsave_no_fninit", "op_fnsave_post_cw", "x87_fnsave(x87, r8);",
+     "x87_store_env28(x87, r8); for (unsigned i = 0u; i < 8u; ++i) "
+     "store80(r8 + 28ull + static_cast<word>(i) * 10ull, x87_st(x87, i));"),
+)
+
+
+def emit_mutants(original_path, out_cpp):
+    """Emit compiled C++ mutation controls from translated functions."""
+    unique_exports = []
+    for _, src_name, _, _ in MUTANT_SPECS:
+        if src_name not in unique_exports:
+            unique_exports.append(src_name)
+    base_src, _ = cpu_x87_env_aot.translate(original_path, unique_exports)
+    chunks = [base_src]
+    with pefile.PE(str(original_path), fast_load=True) as pe:
+        by_name = {}
+        for name in unique_exports:
+            entry = export_rva(pe, name)
+            fn_src, _ = lift_code(name, entry, bounded_code(pe, entry))
+            by_name[name] = fn_src
+    for mut_name, src_name, needle, repl in MUTANT_SPECS:
+        src = by_name[src_name]
+        if needle not in src:
+            raise AssertionError(f"mutant {mut_name}: needle {needle!r} not found in {src_name}")
+        mutated = src.replace(f"lifted_{src_name}", mut_name, 1).replace(needle, repl, 1)
+        chunks.append(mutated)
+    cpu_x87_env_aot._write_atomic(out_cpp, "\n".join(chunks) + "\n")
+
+
+def check_mutants(mutants_path):
+    """Run compiled C++ mutation DLL exports and verify every mutant breaks its target invariant."""
+    lib = ctypes.CDLL(str(Path(mutants_path).resolve()))
+    mut = {}
+    for mut_name, _, _, _ in MUTANT_SPECS:
+        fn = getattr(lib, mut_name)
+        fn.argtypes = [ctypes.c_uint64] * 3
+        fn.restype = None
+        mut[mut_name] = fn
+
     dummy = b"\x00" * 16
     caught = 0
-    # 1. Ignoring FDECSTP TOP wrap (0 -> 7).
-    assert unpack16(call3(lifted["op_fdecstp_sw"], dummy, dummy, b"\x5a" * 2)) == 0x3800
+
+    # 1. Profile-distinguishing control: updating FOP/FCS on FDECSTP breaks preserved-metadata.
+    env_in = pack_env28(cw=0x037F, sw=(3 << 11) | SW_C1, tw=0xFFFF, fip=0x12345678, fcs=0, fop=0x03AB, fdp=0x9ABCDEF0, fds=0)
+    m_wrap = unpack_env28(call3(mut["mut_fdecstp_updates_fop_wrap"], env_in, dummy, b"\x5a" * 28))
+    assert m_wrap["fop"] == 0x01F6 and m_wrap["fcs"] == 0x0033 and m_wrap["fop"] != 0x03AB
     caught += 1
-    # 2. Not clearing FSW.C1 in FDECSTP.
-    env_c1 = pack_env28(cw=0x037F, sw=SW_C1, tw=0xFFFF)
-    got_env = unpack_env28(call3(lifted["op_fdecstp_wrap_env"], env_c1, dummy, b"\x5a" * 28))
-    assert (got_env["sw"] & SW_C1) == 0
-    caught += 1
-    # 3. Storing physical regs[0..7] instead of logical ST(0)..ST(7) in FNSAVE.
-    env_top3 = pack_env28(cw=0x037F, sw=(3 << 11), tw=0x1B4E)
+
+    # 2. Profile-distinguishing control on FRSTOR -> FDECSTP -> FNSAVE.
     regs_in = [pack80((J | i, 0x3FFF + i)) for i in range(8)]
-    st_in = env_top3 + b"".join(regs_in)
-    st_out = call3(lifted["op_frstor_fdecstp_fnsave"], st_in, dummy, b"\x5a" * 108)
-    assert unpack80(st_out[28:38]) == unpack80(regs_in[7])
+    st_in = pack_env28(cw=0x0B7F, sw=(3 << 11), tw=0x1B4E, fip=0x01020304, fcs=0, fop=0x02A5, fdp=0x05060708, fds=0) + b"".join(regs_in)
+    m_fr = unpack_env28(call3(mut["mut_fdecstp_updates_fop_frstor"], st_in, dummy, b"\x5a" * 108)[:28])
+    assert m_fr["fop"] == 0x01F6 and m_fr["fcs"] == 0x0033 and m_fr["fop"] != 0x02A5
     caught += 1
-    # 4. Failing to mask FCW[5:0] after FNSTENV.
-    post_cw = unpack16(call3(lifted["op_fnstenv_post_cw"], pack16(0x0340), dummy, b"\x5a" * 28)[:2])
-    assert post_cw == 0x037F
+
+    # 3. Ignoring FDECSTP TOP wrap (0 -> 7).
+    assert unpack16(call3(mut["mut_fdecstp_no_wrap"], dummy, dummy, b"\x5a" * 2)) == 0x0000
     caught += 1
-    # 5. Failing to re-initialize FCW/FSW after FNSAVE.
-    assert unpack16(call3(lifted["op_fnsave_post_cw"], pack80(POS_ONE), pack16(0x027F), b"\x5a" * 108)[:2]) == 0x037F
+
+    # 4. Not clearing FSW.C1 in FDECSTP.
+    got_env = unpack_env28(call3(mut["mut_fdecstp_keep_c1"], env_in, dummy, b"\x5a" * 28))
+    assert (got_env["sw"] & SW_C1) != 0
     caught += 1
+
+    # 5. Storing physical regs[0..7] instead of logical ST(0)..ST(7) in FNSAVE.
+    # At top=3 -> FDECSTP -> top=2, unmutated ST(0) is regs[2]=regs_in[7] while physical regs[0]=regs_in[5].
+    st_out = call3(mut["mut_fnsave_phys_order"], st_in, dummy, b"\x5a" * 108)
+    got_st0 = unpack80(st_out[28:38])
+    assert got_st0 == unpack80(regs_in[5]) and got_st0 != unpack80(regs_in[7])
+    caught += 1
+
+    # 6. Skipping FTW recompute on FRSTOR.
+    bad_tw_in = pack_env28(cw=0x037F, sw=0, tw=0x5555) + b"".join(pack80(POS_ONE) for _ in range(8))
+    m_tw = unpack_env28(call3(mut["mut_frstor_no_recompute"], bad_tw_in, dummy, b"\x5a" * 108)[:28])
+    assert m_tw["tw"] == 0x5555 and m_tw["tw"] != 0x0000
+    caught += 1
+
+    # 7. Failing to re-initialize FCW/FSW after FNSAVE.
+    assert unpack16(call3(mut["mut_fnsave_no_fninit"], pack80(POS_ONE), pack16(0x027F), b"\x5a" * 108)[:2]) == 0x027F
+    caught += 1
+
+    # 8. Failing to mask FCW[5:0] after FNSTENV.
+    assert unpack16(call3(mut["mut_fnstenv_no_mask"], pack16(0x0340), dummy, b"\x5a" * 28)[:2]) == 0x0340
+    caught += 1
+
     return caught
 
 
@@ -692,10 +865,16 @@ def record_covered_forms(original_path):
 
 
 def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "emit-mutants":
+        emit_mutants(Path(sys.argv[2]), Path(sys.argv[3]))
+        return
+
     if os.environ.get("FORM_COVERAGE_RECORD"):
         Path(os.environ["FORM_COVERAGE_RECORD"]).unlink(missing_ok=True)
 
-    original_path, lifted_path, altered_path, altered_lifted_path = (Path(p) for p in sys.argv[1:5])
+    original_path, lifted_path, altered_path, altered_lifted_path, mutants_path = (
+        Path(p) for p in sys.argv[1:6]
+    )
 
     accepted, rejected = check_translator()
     print(f"{accepted} x87 env sequences accepted; {rejected} rejection controls passed")
@@ -707,14 +886,16 @@ def main():
     _, altered = bind(altered_path, "")
     _, altered_lifted = bind(altered_lifted_path, "lifted_")
 
-    diff_total = check_differential(native, lifted, altered, altered_lifted)
+    diff_total, fdecstp_profile = check_differential(native, lifted, altered, altered_lifted)
+    trap_count = check_runtime_traps(lifted)
     mxcsr_total = check_mxcsr_isolation(native, lifted, lifted_lib)
-    mutant_count = check_mutants(lifted)
+    mutant_count = check_mutants(mutants_path)
 
     print(
-        f"{diff_total} differential/state/roundtrip/altered cases matched; "
+        f"{diff_total} differential/state/roundtrip/altered cases matched (native FDECSTP FOP={fdecstp_profile}); "
+        f"{trap_count} runtime trap controls passed; "
         f"{mxcsr_total} MXCSR DAZ/FTZ isolation checks passed; "
-        f"{mutant_count} mutant controls + {len(ALTERED_EXPORTS)} altered-build controls caught"
+        f"{mutant_count} compiled C++ mutant controls + {len(ALTERED_EXPORTS)} altered-build controls caught"
     )
     record_covered_forms(original_path)
 

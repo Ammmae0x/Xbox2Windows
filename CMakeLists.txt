@@ -8295,12 +8295,19 @@ if(EXISTS "${INTAKE_PYTHON}")
         cpu_translation(cpu_x87_env_aot_${variant} cpu_x87_env_aot "${cpu_x87_env_aot_exports}")
     endforeach()
     target_compile_definitions(cpu_x87_env_aot_altered PRIVATE ALTER_X87_ENV)
+    set(cpu_x87_env_aot_mutants_cpp "${CMAKE_CURRENT_BINARY_DIR}/cpu_x87_env_aot_mutants.cpp")
+    add_custom_command(OUTPUT "${cpu_x87_env_aot_mutants_cpp}"
+        COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/cpu/x87_env_aot_check.py"
+            emit-mutants "$<TARGET_FILE:cpu_x87_env_aot_original>" "${cpu_x87_env_aot_mutants_cpp}"
+        DEPENDS cpu_x87_env_aot_original tests/cpu/x87_env_aot_check.py tools/cpu_x87_env_aot.py tools/cpu_leaf_aot.py VERBATIM)
+    add_library(cpu_x87_env_aot_mutants SHARED "${cpu_x87_env_aot_mutants_cpp}")
     add_test(NAME cpu_aot_x87_env COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/cpu/x87_env_aot_check.py"
         "$<TARGET_FILE:cpu_x87_env_aot_original>"
         "$<TARGET_FILE:cpu_x87_env_aot_original_lifted>"
         "$<TARGET_FILE:cpu_x87_env_aot_altered>"
-        "$<TARGET_FILE:cpu_x87_env_aot_altered_lifted>")
+        "$<TARGET_FILE:cpu_x87_env_aot_altered_lifted>"
+        "$<TARGET_FILE:cpu_x87_env_aot_mutants>")
     set_tests_properties(cpu_aot_x87_env PROPERTIES
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_x87_env.txt")
     cpu_asm_fixture(cpu_create create_context)
