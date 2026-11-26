@@ -352,8 +352,13 @@ add_test(NAME xmem_run_break_readers_next_break_control COMMAND xmem_run_break_r
 # the readers' output buffer in a mapped slot not yet committed.
 add_test(NAME xmem_run_break_readers_default COMMAND xmem_run_break_readers_check "$<TARGET_FILE:xmem_shim_test_controls>" default)
 add_test(NAME xmem_run_break_readers_lazy COMMAND xmem_run_break_readers_check "$<TARGET_FILE:xmem_shim_test_controls>" lazy)
+# A fault handler that reads the breaks after a later break on another run has begun: a second unmap on a disjoint
+# run, and one permissive call that joins the CPU run and then its GPU mirror run (X2W_XMEM_GPU_MIRROR).
+add_test(NAME xmem_run_break_readers_two_runs COMMAND xmem_run_break_readers_check "$<TARGET_FILE:xmem_shim_test_controls>" two-runs)
+add_test(NAME xmem_run_break_readers_mirror COMMAND xmem_run_break_readers_check "$<TARGET_FILE:xmem_shim_test_controls>" mirror)
 set_tests_properties(xmem_run_break_readers xmem_run_break_readers_control xmem_run_break_readers_next_break_control
-                     xmem_run_break_readers_default xmem_run_break_readers_lazy PROPERTIES TIMEOUT 60)
+                     xmem_run_break_readers_default xmem_run_break_readers_lazy xmem_run_break_readers_two_runs
+                     xmem_run_break_readers_mirror PROPERTIES TIMEOUT 60)
 set_tests_properties(xmem_run_break_readers_default PROPERTIES
     PASS_REGULAR_EXPRESSION "default mode: readers answer inside an unmap" FAIL_REGULAR_EXPRESSION "check_failed")
 # Cross-call merge of shared views (merge_with_previous): single-page calls on consecutive slots join one view, and

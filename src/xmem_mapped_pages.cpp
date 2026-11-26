@@ -481,13 +481,36 @@ void coalesce_unused(const Pages& batch)
     }
 }
 
-// Unmapping a page inside a run unmaps the whole run and maps its other pages again (map_pages).
-// A thread that touches one of those pages in between faults. The break records the address
-// ranges of the runs it takes apart and a generation that is odd while it is in progress.
+// Unmapping a page inside a run unmaps the whole run and maps its other pages again (map_pages), and so does a
+// cross-call merge (merge_with_previous) for the run it joins. A thread that touches one of those pages in between
+// faults. Each break records the address ranges of the runs it takes apart, and a generation that is odd while it
+// is in progress; the break's id is that odd value. The last `kept` breaks stay recorded, so that a fault handler
+// that runs late, after later breaks on other runs have begun (a merge of the CPU view and then of its GPU mirror
+// in one call, or the next call's merge), still finds the break its fault came from.
 struct RemapWindow {
+    static constexpr std::size_t kept = 64;
+    struct Break {
+        ULONG64 id = 0;  // 0: no break recorded in this slot yet
+        std::vector<std::pair<ULONG_PTR, SIZE_T>> ranges;
+    };
     SRWLOCK lock = SRWLOCK_INIT;
-    std::vector<std::pair<ULONG_PTR, SIZE_T>> ranges;  // the runs of the break in progress, or of the last one
+    Break recent[kept];  // break id i in recent[(i / 2) % kept]
     ULONG64 generation = 0;
+
+    // The newest recorded break whose ranges hold address, or 0. Caller holds lock (shared).
+    ULONG64 newest_holding(ULONG_PTR address) const
+    {
+        ULONG64 found = 0;
+        for (const Break& b : recent) {
+            if (b.id <= found) continue;
+            for (const auto& [base, size] : b.ranges)
+                if (address - base < size) {
+                    found = b.id;
+                    break;
+                }
+        }
+        return found;
+    }
 };
 RemapWindow remap_window;
 // Set once shared views are on (FaultRetry::ready). Breaks also begin without them (every unmap counts in the
@@ -499,8 +522,10 @@ void begin_break(const std::map<ULONG_PTR, SIZE_T>& broken)
 {
     std::vector<std::pair<ULONG_PTR, SIZE_T>> ranges(broken.begin(), broken.end());
     AcquireSRWLockExclusive(&remap_window.lock);
-    remap_window.ranges.swap(ranges);
-    ++remap_window.generation;
+    const ULONG64 id = ++remap_window.generation;
+    auto& slot = remap_window.recent[(id / 2) % RemapWindow::kept];
+    slot.id = id;
+    slot.ranges.swap(ranges);  // the old slot's ranges are freed after the lock
     ReleaseSRWLockExclusive(&remap_window.lock);
 }
 void end_break()
@@ -536,11 +561,11 @@ void hold_retry()
 void hold_retry() {}
 #endif
 
-// Retries an access violation only when all of this holds: the address is inside a run that the
-// break in progress, or the last finished one, took apart; after that break has finished (the
-// mutex) the page is recorded and covered by a view; and this thread has not already retried this
-// page for this break. Everything else is passed on, so a fault that is not the transient one is
-// reported after at most one retry.
+// Retries an access violation only when all of this holds: the address is inside a run that one of the recorded
+// breaks (the one in progress or the last RemapWindow::kept) took apart; after that break has finished (the mutex)
+// the page is recorded and covered by a view; and this thread has not already retried this page for the newest
+// such break. Everything else is passed on, so a fault that is not the transient one is reported after at most one
+// retry per break.
 LONG CALLBACK retry_remapped_page(EXCEPTION_POINTERS* e)
 {
     const EXCEPTION_RECORD* record = e->ExceptionRecord;
@@ -549,16 +574,12 @@ LONG CALLBACK retry_remapped_page(EXCEPTION_POINTERS* e)
     const ULONG_PTR address = record->ExceptionInformation[1];
     const ULONG_PTR page = address & ~(ULONG_PTR{page_bytes} - 1);
     hold_retry();
-    bool inside = false;
     AcquireSRWLockShared(&remap_window.lock);
-    const ULONG64 seen = remap_window.generation;
-    for (const auto& [base, size] : remap_window.ranges)
-        inside |= address - base < size;
+    // The newest break that took the page apart, in progress or finished; a later break on another run does not
+    // hide it. A fault in a later break of the same page names that break, so it is retried again.
+    const ULONG64 break_id = remap_window.newest_holding(address);
     ReleaseSRWLockShared(&remap_window.lock);
-    if (!inside || seen == 0) return EXCEPTION_CONTINUE_SEARCH;
-    // The break in progress (odd), or the one that just finished (even: the one before). Not seen | 1, which for an
-    // even generation names the next break, so that a fault in it, on the same page, would not be retried.
-    const ULONG64 break_id = (seen - 1) | 1;
+    if (!break_id) return EXCEPTION_CONTINUE_SEARCH;
     thread_local ULONG_PTR retried_page = 0;
     thread_local ULONG64 retried_break = 0;
     if (retried_page == page && retried_break == break_id) return EXCEPTION_CONTINUE_SEARCH;
@@ -662,8 +683,8 @@ struct TestFault {
 };
 #endif
 
-// Test build only: X2W_XMEM_TEST_HOLD_WINDOW=<name> keeps an unmap in the window where the run is
-// unmapped and not yet mapped again. It sets the event "<name>.unmapped", then waits up to
+// Test build only: X2W_XMEM_TEST_HOLD_WINDOW=<name> keeps an unmap, or a cross-call merge (merge_with_previous), in the
+// window where the run is unmapped and not yet mapped again. It sets the event "<name>.unmapped", then waits up to
 // five seconds for "<name>.release", so that a reader thread can reach the window every time.
 #ifdef X2W_XMEM_TEST_CONTROLS
 void hold_window()

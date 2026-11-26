@@ -20,6 +20,10 @@
 // `next-break-control` the handler is not held, so it reads break A while A is open: that order passes even when
 // the handler names the breaks wrongly, which shows the hold is what this case depends on.
 //
+// A fault whose handler reads the breaks only after a later break on another run has begun (two_runs: break B on a
+// disjoint run; mirror: one permissive XMemMapPhysicalPages call that joins the CPU run and then its GPU mirror run)
+// must be retried as well: the handler keeps the ranges of the recent breaks, not only of the last one.
+//
 // A break that begins while x2w_xmem_stable_call's fn runs (break_during_fn): fn itself starts the unmap, waits until
 // the window is open and queries a page of the run (reserved). stable_call must see the generation change and run fn
 // again under memory.mutex: 2 calls, the last one committed.
@@ -29,7 +33,10 @@
 // `lazy` (X2W_XMEM_SHARED_VIEWS=1, X2W_XMEM_LAZY_COMMIT=1): XMemVirtualQuery and VirtualQueryEx wait for a break
 // with their output buffer in a mapped slot that is not committed yet; the answer reaches it after the break.
 //
-// Usage: xmem_run_break_readers_check <xmem.dll built with its test controls> [control|next-break-control|default|lazy]
+// `two-runs` and `mirror` run those two cases alone (an access violation there ends the process).
+//
+// Usage: xmem_run_break_readers_check <xmem.dll built with its test controls>
+//        [control|next-break-control|default|lazy|two-runs|mirror]
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -376,16 +383,140 @@ void next_break_case(const Shim& shim, unsigned char* base, bool hold_retry)
     CloseHandle(second_read);
     if (!hold_retry) std::printf("next-break control: the handler read break A while it was open\n");
 }
+// Break A takes apart run 1, break B (begun after A ended) run 2, a disjoint run. The handler for a fault in A is held
+// (X2W_XMEM_TEST_HOLD_RETRY) until B is held open, so it reads the breaks while B is in progress: it must still find
+// A and retry the fault. A handler that knew only the last break's ranges passes the fault on, and the process ends
+// with an access violation.
+void two_runs_case(const Shim& shim, unsigned char* base)
+{
+    const char* const name = "two_runs";
+    unsigned char* const run1 = base;
+    unsigned char* const run2 = base + 16 * page;
+    SIZE_T count = 2 * pages, tokens[2 * pages] = {};
+    if (!shim.allocate(0x20400000, &count, tokens) || count != 2 * pages || shim.map(run1, pages, tokens) != run1 ||
+        shim.map(run2, pages, tokens + pages) != run2) {
+        check(false, "map_runs", name);
+        return;
+    }
+    for (SIZE_T i = 0; i < pages; ++i) {
+        *reinterpret_cast<std::uint32_t*>(run1 + i * page) = 0x54000000u + static_cast<std::uint32_t>(i);
+        *reinterpret_cast<std::uint32_t*>(run2 + i * page) = 0x54100000u + static_cast<std::uint32_t>(i);
+    }
+    unsigned char* const target = run1 + 2 * page;
+    Events window_a("two-a", "unmapped", "release"), window_b("two-b", "unmapped", "release"), retry("two-retry", "faulted", "go");
+    std::atomic<int> reads{0};
+    std::uint32_t value = 0;
+
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", window_a.name);
+    std::thread unmap_a([&] { shim.map(run1 + 7 * page, 1, nullptr); });
+    check(WaitForSingleObject(window_a.first, 10000) == WAIT_OBJECT_0 && raw_state(target) != MEM_COMMIT,
+          "break_a_held_on_run_1", name);
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_RETRY", retry.name);
+    std::thread reader([&] {
+        value = *reinterpret_cast<volatile std::uint32_t*>(target);  // faults in break A
+        ++reads;
+    });
+    check(WaitForSingleObject(retry.first, 10000) == WAIT_OBJECT_0, "handler_held_before_reading_the_breaks", name);
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_RETRY", nullptr);
+    SetEvent(window_a.second);
+    unmap_a.join();
+    check(raw_state(target) == MEM_COMMIT, "break_a_ended", name);
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", window_b.name);
+    std::thread unmap_b([&] { shim.map(run2 + 7 * page, 1, nullptr); });
+    check(WaitForSingleObject(window_b.first, 10000) == WAIT_OBJECT_0 && raw_state(run2 + 2 * page) != MEM_COMMIT,
+          "break_b_held_on_run_2", name);
+    SetEvent(retry.second);  // the handler reads the breaks now, with B in progress
+    Sleep(100);
+    SetEvent(window_b.second);
+    unmap_b.join();
+    reader.join();
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", nullptr);
+    check(reads.load() == 1 && value == 0x54000002u, "fault_in_break_a_retried_during_break_b", name);
+    check(*reinterpret_cast<std::uint32_t*>(run2 + 2 * page) == 0x54100002u, "run_2_data_kept", name);
+    shim.map(run1, 7, nullptr);
+    shim.map(run2, 7, nullptr);
+    shim.release(2 * pages, tokens);
+}
+
+// The owner's configuration (X2W_XMEM_PERMISSIVE=1, X2W_XMEM_GPU_MIRROR=1): one XMemMapPhysicalPages call joins the
+// CPU run, then the same pages' GPU mirror run, under one memory.mutex hold; the two breaks follow each other at once.
+// A fault on the CPU run in the first break, whose handler is held until the GPU break is held open, must be retried.
+// The release event is auto-reset, so each of the call's two holds waits for a release of its own.
+void mirror_case(const Shim& shim, unsigned char* cpu)
+{
+    const char* const name = "mirror";
+    SetEnvironmentVariableA("X2W_XMEM_PERMISSIVE", "1");
+    SetEnvironmentVariableA("X2W_XMEM_GPU_MIRROR", "1");
+    auto* const gpu_view = static_cast<unsigned char*>(shim.virtual_alloc(nullptr, SIZE_T{16} << 30, 0x20402000, 3, 0x800 | PAGE_NOACCESS));
+    SetEnvironmentVariableA("X2W_XMEM_GPU_MIRROR", nullptr);
+    unsigned char* const at = cpu + page;
+    SIZE_T count = pages + 1, tokens[pages + 1] = {};
+    if (!check(gpu_view != nullptr, "gpu_reservation", name) ||
+        !check(shim.allocate(0x280, &count, tokens) && count == pages + 1 && shim.map(at, pages, tokens) == at, "map_run", name)) {
+        SetEnvironmentVariableA("X2W_XMEM_PERMISSIVE", nullptr);
+        if (gpu_view) VirtualFree(gpu_view, 0, MEM_RELEASE);
+        return;
+    }
+    unsigned char* const twin = at - cpu + gpu_view;
+    for (SIZE_T i = 0; i < pages; ++i) *reinterpret_cast<std::uint32_t*>(at + i * page) = 0x55000000u + static_cast<std::uint32_t>(i);
+    check(*reinterpret_cast<std::uint32_t*>(twin + 2 * page) == 0x55000002u, "gpu_twin_shows_the_cpu_page", name);
+    unsigned char* const target = at + 2 * page;
+    char hold[64], event_name[96];
+    std::snprintf(hold, sizeof(hold), "x2w-run-break-mirror-%lu", GetCurrentProcessId());
+    std::snprintf(event_name, sizeof(event_name), "%s.unmapped", hold);
+    HANDLE unmapped = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    std::snprintf(event_name, sizeof(event_name), "%s.release", hold);
+    HANDLE release = CreateEventA(nullptr, FALSE, FALSE, event_name);
+    Events retry("mirror-retry", "faulted", "go");
+    std::atomic<int> reads{0};
+    std::uint32_t value = 0;
+    bool mapped = false;
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", hold);
+    std::thread mapper([&] { mapped = shim.map(at + pages * page, 1, &tokens[pages]) == at + pages * page; });
+    check(WaitForSingleObject(unmapped, 10000) == WAIT_OBJECT_0 && raw_state(target) != MEM_COMMIT, "cpu_merge_held", name);
+    ResetEvent(unmapped);
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_RETRY", retry.name);
+    std::thread reader([&] {
+        value = *reinterpret_cast<volatile std::uint32_t*>(target);  // faults in the CPU merge's break
+        ++reads;
+    });
+    check(WaitForSingleObject(retry.first, 10000) == WAIT_OBJECT_0, "handler_held_before_reading_the_breaks", name);
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_RETRY", nullptr);
+    SetEvent(release);  // the CPU merge ends; the GPU merge begins and holds
+    check(WaitForSingleObject(unmapped, 10000) == WAIT_OBJECT_0 && raw_state(twin + 2 * page) != MEM_COMMIT &&
+          raw_state(target) == MEM_COMMIT, "gpu_merge_held_after_the_cpu_merge", name);
+    SetEvent(retry.second);  // the handler reads the breaks now, with the GPU merge in progress
+    Sleep(100);
+    SetEvent(release);
+    mapper.join();
+    reader.join();
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", nullptr);
+    check(mapped, "mapping_call_succeeded", name);
+    check(reads.load() == 1 && value == 0x55000002u, "fault_in_the_cpu_merge_retried_during_the_gpu_merge", name);
+    MEMORY_BASIC_INFORMATION info{};
+    check(VirtualQuery(at, &info, sizeof(info)) && info.RegionSize == (pages + 1) * page &&
+          VirtualQuery(twin, &info, sizeof(info)) && info.RegionSize == (pages + 1) * page, "both_views_joined", name);
+    shim.map(at, pages + 1, nullptr);
+    shim.release(pages + 1, tokens);
+    SetEnvironmentVariableA("X2W_XMEM_PERMISSIVE", nullptr);
+    VirtualFree(gpu_view, 0, MEM_RELEASE);
+    CloseHandle(unmapped);
+    CloseHandle(release);
+}
 }  // namespace
 
 int main(int argc, char** argv)
 {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // a case that ends the process with an access violation keeps its lines
     const bool control = argc > 2 && std::strcmp(argv[2], "control") == 0;
     const bool next_break_control = argc > 2 && std::strcmp(argv[2], "next-break-control") == 0;
     const bool default_mode = argc > 2 && std::strcmp(argv[2], "default") == 0;
     const bool lazy = argc > 2 && std::strcmp(argv[2], "lazy") == 0;
-    if (argc < 2 || (argc > 2 && !control && !next_break_control && !default_mode && !lazy)) {
-        std::printf("usage: xmem_run_break_readers_check <test-controls xmem.dll> [control|next-break-control|default|lazy]\n");
+    const bool two_runs = argc > 2 && std::strcmp(argv[2], "two-runs") == 0;
+    const bool mirror = argc > 2 && std::strcmp(argv[2], "mirror") == 0;
+    if (argc < 2 || (argc > 2 && !control && !next_break_control && !default_mode && !lazy && !two_runs && !mirror)) {
+        std::printf("usage: xmem_run_break_readers_check <test-controls xmem.dll> "
+                    "[control|next-break-control|default|lazy|two-runs|mirror]\n");
         return 2;
     }
     // The mode is read by the first mapping call; the VirtualQueryEx import is wrapped when xmem.dll loads.
@@ -412,10 +543,12 @@ int main(int argc, char** argv)
         return 1;
     }
     unsigned char* const at = base + page;
-    if (next_break_control || default_mode || lazy) {
+    if (next_break_control || default_mode || lazy || two_runs || mirror) {
         if (next_break_control) next_break_case(shim, at, false);
         if (default_mode) default_case(shim, at);
         if (lazy) lazy_case(shim, at);
+        if (two_runs) two_runs_case(shim, at);
+        if (mirror) mirror_case(shim, base);
         VirtualFree(base, 0, MEM_RELEASE);
         std::printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
         return failures ? 1 : 0;
