@@ -25,6 +25,9 @@
 // disjoint run; mirror: one permissive XMemMapPhysicalPages call that joins the CPU run and then its GPU mirror run)
 // must be retried as well: the handler keeps the ranges of the recent breaks, not only of the last one.
 //
+// The ring's edge (ring_edge): a held fault in break A whose handler reads the breaks after 63 later breaks is retried;
+// after 64 later breaks, A is no longer recorded and the fault is passed on (the reader's own __except catches it).
+//
 // A break that begins while x2w_xmem_stable_call's fn runs (break_during_fn): fn itself starts the unmap, waits until
 // the window is open and queries a page of the run (reserved). stable_call must see the generation change and run fn
 // again under memory.mutex: 2 calls, the last one committed.
@@ -35,10 +38,11 @@
 // with their output buffer in a mapped slot that is not committed yet; the answer reaches it after the break. Then a
 // ReadFile into another such slot, with no break: the lazy-commit ReadFile wrapper still runs inside the run-break one.
 //
-// `two-runs` and `mirror` run those two cases alone (an access violation there ends the process).
+// `two-runs` and `mirror` run those two cases alone (an access violation there ends the process); `ring-edge` runs
+// ring_edge with 63 and then 64 later breaks.
 //
 // Usage: xmem_run_break_readers_check <xmem.dll built with its test controls>
-//        [control|next-break-control|default|lazy|two-runs|mirror]
+//        [control|next-break-control|default|lazy|two-runs|mirror|ring-edge]
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -624,6 +628,73 @@ void mirror_case(const Shim& shim, unsigned char* cpu)
     CloseHandle(unmapped);
     CloseHandle(release);
 }
+
+// Reads *address into value; false when the access violation reaches this frame (the handler passed it on). No C++
+// objects in the __try frame, and not inlined: inlined into the reader's lambda (clang-cl, under Wine), the code after
+// the __except wrote through a null pointer.
+__declspec(noinline) bool guarded_read(const volatile std::uint32_t* address, std::uint32_t* value)
+{
+    __try {
+        *value = *address;
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
+// The edge of the ring of recorded breaks (RemapWindow::kept, 64). Break A takes apart run 1; a fault in it is held
+// before its handler reads the breaks (X2W_XMEM_TEST_HOLD_RETRY). A ends, then `later` breaks follow, each the unmap
+// of a lone page mapped by a call of its own (one break per unmap call; the lone page joins no run). The k-th break
+// after A is recorded in A's slot when k is a multiple of 64. With 63 later breaks A is still recorded and the fault
+// is retried (the reader reads its page); with 64, A's slot holds the newest break, no recorded break holds the
+// address, and the handler passes the fault on, which the reader's own __except catches.
+void ring_edge_case(const Shim& shim, unsigned char* run1, SIZE_T later, bool retried)
+{
+    char name[32], stem[32];
+    std::snprintf(name, sizeof(name), "ring_edge_%zu", later);
+    std::snprintf(stem, sizeof(stem), "ring-%zu", later);
+    unsigned char* const lone = run1 + 32 * page;
+    SIZE_T count = pages + 1, tokens[pages + 1] = {};
+    if (!shim.allocate(0x20400000, &count, tokens) || count != pages + 1 || shim.map(run1, pages, tokens) != run1) {
+        check(false, "map_run", name);
+        return;
+    }
+    for (SIZE_T i = 0; i < pages; ++i) *reinterpret_cast<std::uint32_t*>(run1 + i * page) = 0x56000000u + static_cast<std::uint32_t>(i);
+    unsigned char* const target = run1 + 2 * page;
+    Events window(stem, "unmapped", "release"), retry(stem, "faulted", "go");
+    std::atomic<int> outcome{0};  // 0: the reader has not finished; 1: it read its page; 2: the fault was passed on
+    std::uint32_t value = 0;
+
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", window.name);
+    std::thread unmap_a([&] { shim.map(run1 + 7 * page, 1, nullptr); });
+    check(WaitForSingleObject(window.first, 10000) == WAIT_OBJECT_0 && raw_state(target) != MEM_COMMIT, "break_a_held", name);
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_RETRY", retry.name);
+    std::thread reader([&] { outcome = guarded_read(reinterpret_cast<volatile std::uint32_t*>(target), &value) ? 1 : 2; });
+    check(WaitForSingleObject(retry.first, 10000) == WAIT_OBJECT_0, "handler_held_before_reading_the_breaks", name);
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_RETRY", nullptr);
+    SetEvent(window.second);
+    unmap_a.join();
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", nullptr);
+    check(raw_state(target) == MEM_COMMIT, "break_a_ended", name);
+    // The handler waits at most five seconds for "go" (hold_retry): the later breaks must all end inside that wait.
+    const ULONGLONG started = GetTickCount64();
+    SIZE_T made = 0;
+    for (SIZE_T k = 0; k < later; ++k) {
+        if (shim.map(lone, 1, &tokens[pages]) != lone || raw_state(lone) != MEM_COMMIT) break;
+        if (shim.map(lone, 1, nullptr) != lone || raw_state(lone) == MEM_COMMIT) break;
+        ++made;
+    }
+    check(made == later, "later_breaks_made", name);
+    check(outcome.load() == 0 && GetTickCount64() - started < 4000, "handler_still_held_after_the_later_breaks", name);
+    SetEvent(retry.second);  // the handler reads the breaks now
+    reader.join();
+    if (retried)
+        check(outcome.load() == 1 && value == 0x56000002u, "fault_retried_with_break_a_still_recorded", name);
+    else
+        check(outcome.load() == 2, "fault_passed_on_with_break_a_evicted", name);
+    shim.map(run1, 7, nullptr);
+    shim.release(pages + 1, tokens);
+}
 }  // namespace
 
 int main(int argc, char** argv)
@@ -635,9 +706,11 @@ int main(int argc, char** argv)
     const bool lazy = argc > 2 && std::strcmp(argv[2], "lazy") == 0;
     const bool two_runs = argc > 2 && std::strcmp(argv[2], "two-runs") == 0;
     const bool mirror = argc > 2 && std::strcmp(argv[2], "mirror") == 0;
-    if (argc < 2 || (argc > 2 && !control && !next_break_control && !default_mode && !lazy && !two_runs && !mirror)) {
+    const bool ring_edge = argc > 2 && std::strcmp(argv[2], "ring-edge") == 0;
+    if (argc < 2 || (argc > 2 && !control && !next_break_control && !default_mode && !lazy && !two_runs && !mirror &&
+                     !ring_edge)) {
         std::printf("usage: xmem_run_break_readers_check <test-controls xmem.dll> "
-                    "[control|next-break-control|default|lazy|two-runs|mirror]\n");
+                    "[control|next-break-control|default|lazy|two-runs|mirror|ring-edge]\n");
         return 2;
     }
     // The mode is read by the first mapping call; the VirtualQueryEx import is wrapped when xmem.dll loads.
@@ -664,7 +737,7 @@ int main(int argc, char** argv)
         return 1;
     }
     unsigned char* const at = base + page;
-    if (next_break_control || default_mode || lazy || two_runs || mirror) {
+    if (next_break_control || default_mode || lazy || two_runs || mirror || ring_edge) {
         if (next_break_control) next_break_case(shim, at, false);
         if (default_mode) default_case(shim, at);
         if (lazy) {
@@ -673,6 +746,10 @@ int main(int argc, char** argv)
         }
         if (two_runs) two_runs_case(shim, at);
         if (mirror) mirror_case(shim, base);
+        if (ring_edge) {
+            ring_edge_case(shim, at, 63, true);
+            ring_edge_case(shim, at + 64 * page, 64, false);
+        }
         VirtualFree(base, 0, MEM_RELEASE);
         // The default mode's pass line, at the end and only with no failed check (ctest matches it).
         if (default_mode && !failures) std::printf("default mode: readers answer inside an unmap\n");

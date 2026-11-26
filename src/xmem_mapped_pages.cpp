@@ -796,8 +796,10 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failu
 // the caller maps the new pages on their own. lost: R could not be mapped again; the pages that have
 // no view are forgotten, as in an unmap. X2W_XMEM_TEST_NO_MERGE=1 turns the merge off (tests only).
 // A joined run stops at max_merged_run_pages: a page that would make R longer starts a run of its own, which the
-// next pages join. An unmap inside a run takes the whole run apart and maps its other pages again, so the cap bounds
-// the work of every later break of the run as well as of each join.
+// next pages join. The cap bounds the runs that joining builds: the work of each join, and of a later break of such a
+// run (an unmap inside a run takes the whole run apart and maps its other pages again). A run mapped by one call
+// (map_run in map_pages_locked) is not capped, and neither are the survivors map_recorded maps again after an unmap
+// inside such a run; both are as long as they were before the cap.
 enum class Merge { joined, separate, lost };
 
 constexpr SIZE_T max_merged_run_pages = 64;
