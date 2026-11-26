@@ -356,7 +356,8 @@ struct Pool {
         if (!XMemAllocatePhysicalPages(0x20400000, &got, out.tokens.data()) || got != pages) return false;
         if (!split_last_page) return XMemMapPhysicalPages(out.cpu, pages, out.tokens.data()) == out.cpu;
 
-        // Map the upper page first so neither call can join across the boundary inside the buffer.
+        // Map the upper page first so that, with X2W_XMEM_JOIN_CALLS=1, neither call can join across the boundary
+        // inside the buffer.
         auto* const last_page = out.cpu + (pages - 1) * page;
         return XMemMapPhysicalPages(last_page, 1, &out.tokens.back()) == last_page &&
                XMemMapPhysicalPages(out.cpu, pages - 1, out.tokens.data()) == out.cpu;
@@ -1767,6 +1768,7 @@ int main(int argc, char** argv)
     SetEnvironmentVariableW(L"X2W_D3D12_LIST_NOOP", L"1");
     SetEnvironmentVariableW(L"X2W_D3D12_RENDER", L"1");
     SetEnvironmentVariableW(L"X2W_XMEM_SHARED_VIEWS", L"1");
+    SetEnvironmentVariableW(L"X2W_XMEM_JOIN_CALLS", nullptr);  // no joins across mapping calls (the default)
     SetEnvironmentVariableW(L"X2W_D3D12_LINEAR_BUFFERS", path == Path::default_backing ? nullptr
                                                          : path == Path::copy || path == Path::untracked || path == Path::stale || path == Path::contention ||
                                                                  path == Path::lease ? L"copy" : L"1");

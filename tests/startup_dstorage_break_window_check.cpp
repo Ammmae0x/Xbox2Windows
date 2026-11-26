@@ -126,6 +126,7 @@ int main(int argc, char** argv)
     char hold_name[64];
     std::snprintf(hold_name, sizeof(hold_name), "x2w-dstorage-break-window-%lu", GetCurrentProcessId());
     SetEnvironmentVariableA("X2W_XMEM_SHARED_VIEWS", "1");
+    SetEnvironmentVariableA("X2W_XMEM_JOIN_CALLS", nullptr);  // the run is mapped by one call; no join is needed
     SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", hold_name);
 
     // xmem first: XCRDAPI finds it by module name (GetModuleHandleW(L"xmem.dll")).

@@ -2,8 +2,10 @@
 // Adjacent pages of one mapping call share a view, so a buffer can lie inside one view or across
 // two: two mapping calls next to each other, the boundary between two backing sections inside one
 // call, or pages that each have a view of their own. The device wrapper's placed-resource entry
-// (slot 133) must accept all of them alike and leave the memory as it was.
-// usage: xmem_page_runs_device_check warp|hardware
+// (slot 133) must accept all of them alike and leave the memory as it was. With `join`, X2W_XMEM_JOIN_CALLS=1 as
+// well: a mapping call may then join the view that ends at its address, and the mapping order below keeps every
+// boundary in place all the same. Without it the switch is cleared.
+// usage: xmem_page_runs_device_check warp|hardware [join]
 #include "xmem_test_device.h"
 
 #include <cstring>
@@ -76,11 +78,13 @@ void place(const char* name, ID3D12Device* wrapper, unsigned char* boundary, int
 
 int main(int argc, char** argv)
 {
-    if (argc != 2) return 1;
+    if (argc != 2 && !(argc == 3 && std::strcmp(argv[2], "join") == 0)) return 1;
     const bool warp = std::strcmp(argv[1], "warp") == 0;
+    const bool join = argc == 3;
     bool unmatched = false;
     SetEnvironmentVariableW(L"X2W_D3D12_PERMISSIVE", L"1");
     SetEnvironmentVariableW(L"X2W_XMEM_SHARED_VIEWS", L"1");  // the mode under test; read by the first mapping call
+    SetEnvironmentVariableW(L"X2W_XMEM_JOIN_CALLS", join ? L"1" : nullptr);
     auto wrapper = create_device(warp, unmatched, create_wrapper);
     if (!wrapper) return warp || unmatched ? 1 : 77;
 
@@ -88,8 +92,9 @@ int main(int argc, char** argv)
     if (!whole) return 1;
     unsigned char* const first = whole + page;
 
-    // Two mapping calls next to each other: two views that meet at first + 8 pages. The upper one is mapped first: a
-    // call joins only a view that ends at its address (merge_with_previous), never one that starts after it.
+    // Two mapping calls next to each other: two views that meet at first + 8 pages. The upper one is mapped first: with
+    // X2W_XMEM_JOIN_CALLS=1 a call joins only a view that ends at its address (merge_with_previous), never one that
+    // starts after it.
     const auto a = pages(8), b = pages(8);
     if (a.empty() || b.empty() || XMemMapPhysicalPages(first + 8 * page, 8, b.data()) != first + 8 * page ||
         XMemMapPhysicalPages(first, 8, a.data()) != first) {
@@ -110,8 +115,9 @@ int main(int argc, char** argv)
     }
     place("across two backing sections", wrapper.Get(), second + info.RegionSize, 2);
 
-    // Map the single pages from high to low addresses. Each call then has no adjacent view below it to join,
-    // regardless of the order in which the allocator assigned the backing slots.
+    // Pages mapped one call at a time get a view each. They are mapped from high to low addresses: with
+    // X2W_XMEM_JOIN_CALLS=1 no call then has an adjacent view below it to join, regardless of the order in which the
+    // allocator assigned the backing slots.
     unsigned char* const third = second + 8192 * page;
     const auto single = pages(8);
     if (single.empty()) {

@@ -1,17 +1,21 @@
-// Cross-call merge of shared views (X2W_XMEM_SHARED_VIEWS=1, src/xmem_mapped_pages.cpp, merge_with_previous). A run
-// mapped by a call of its own joins the recorded run that ends at its address when its first page is the next slot of
-// the section behind that run's last page and both lie in one reservation of the shim. What a view is, is measured
-// with VirtualQuery: inside a view AllocationBase is the view's base and RegionSize the bytes to the view's end.
+// Cross-call merge of shared views (X2W_XMEM_SHARED_VIEWS=1 and X2W_XMEM_JOIN_CALLS=1, src/xmem_mapped_pages.cpp,
+// merge_with_previous). A run mapped by a call of its own joins the recorded run that ends at its address when its
+// first page is the next slot of the section behind that run's last page and both lie in one reservation of the shim.
+// What a view is, is measured with VirtualQuery: inside a view AllocationBase is the view's base and RegionSize the
+// bytes to the view's end.
 //
-// Modes:
+// Modes (each sets X2W_XMEM_SHARED_VIEWS and X2W_XMEM_JOIN_CALLS itself; JOIN_CALLS=1 in every mode but no-join):
 //   check     (test-controls xmem.dll) every case below.
 //   control   (test-controls xmem.dll, X2W_XMEM_TEST_NO_MERGE=1) single-page calls keep a view each: the layout
 //             before the merge. Prints "no-merge control: 32 views".
 //   deployed  (deployed xmem.dll, X2W_XMEM_TEST_NO_MERGE=1) the deployed shim ignores the test switch and merges.
-//   default   (deployed xmem.dll, X2W_XMEM_SHARED_VIEWS unset) every page keeps a view of its own.
+//   default   (deployed xmem.dll, X2W_XMEM_SHARED_VIEWS unset) every page keeps a view of its own; the join
+//             switch alone does nothing.
+//   no-join   (deployed xmem.dll, X2W_XMEM_JOIN_CALLS unset) single-page calls keep a view each: joins are opt-in.
+//             Prints "no-join: 32 views".
 //   timing    (test-controls xmem.dll; not a ctest case) ms of a join, of a break and of an own-view map against the
 //             run length R (X2W_XMEM_TEST_MERGE_CAP): a table of "timing:" lines, one row per R from 16 to 4096.
-// The pass line of control, deployed and default is printed at the end of main, only when no check failed.
+// The pass line of control, deployed, default and no-join is printed at the end of main, only when no check failed.
 //
 // Cases of `check`:
 //   joined      32 single-page calls on consecutive slots: one view of 32 pages; each page keeps the mark written
@@ -414,13 +418,14 @@ int main(int argc, char** argv)
     const char* const mode = argc == 3 ? argv[2] : "";
     const bool all = std::strcmp(mode, "check") == 0, control = std::strcmp(mode, "control") == 0,
                deployed = std::strcmp(mode, "deployed") == 0, plain = std::strcmp(mode, "default") == 0,
-               timed = std::strcmp(mode, "timing") == 0;
-    if (!all && !control && !deployed && !plain && !timed) {
-        std::printf("usage: xmem_cross_call_merge_check <xmem.dll> check|control|deployed|default|timing\n");
+               timed = std::strcmp(mode, "timing") == 0, no_join = std::strcmp(mode, "no-join") == 0;
+    if (!all && !control && !deployed && !plain && !timed && !no_join) {
+        std::printf("usage: xmem_cross_call_merge_check <xmem.dll> check|control|deployed|default|no-join|timing\n");
         return 2;
     }
     // The mode is read by the first mapping call.
     SetEnvironmentVariableA("X2W_XMEM_SHARED_VIEWS", plain ? nullptr : "1");
+    SetEnvironmentVariableA("X2W_XMEM_JOIN_CALLS", no_join ? nullptr : "1");
     const HMODULE xmem = LoadLibraryA(argv[1]);
     if (!xmem) {
         std::printf("check_failed: load (error %lu)\n", GetLastError());
@@ -449,6 +454,7 @@ int main(int argc, char** argv)
         return failures ? 1 : 0;
     }
     single_page_calls(shim, base, all || deployed, all);
+    if (no_join && token) token = "no-join: 32 views";
     if (all) {
         reversed(shim, base + 64 * page, base + 128 * page);
         window(shim, base + 192 * page);

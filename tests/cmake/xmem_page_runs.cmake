@@ -29,7 +29,8 @@ add_test(NAME xmem_run_break_readers_next_break_control COMMAND xmem_run_break_r
 add_test(NAME xmem_run_break_readers_default COMMAND xmem_run_break_readers_check "$<TARGET_FILE:xmem_shim_test_controls>" default)
 add_test(NAME xmem_run_break_readers_lazy COMMAND xmem_run_break_readers_check "$<TARGET_FILE:xmem_shim_test_controls>" lazy)
 # A fault handler that reads the breaks after a later break on another run has begun: a second unmap on a disjoint
-# run, and one permissive call that joins the CPU run and then its GPU mirror run (X2W_XMEM_GPU_MIRROR).
+# run, and one permissive call that joins the CPU run and then its GPU mirror run (X2W_XMEM_GPU_MIRROR; the program
+# sets X2W_XMEM_JOIN_CALLS=1 for `mirror` only).
 # ring-edge: a held fault whose break has 63 later breaks is retried; with 64 its break is no longer recorded
 # (RemapWindow::kept) and the fault is passed on.
 add_test(NAME xmem_run_break_readers_two_runs COMMAND xmem_run_break_readers_check "$<TARGET_FILE:xmem_shim_test_controls>" two-runs)
@@ -40,10 +41,11 @@ set_tests_properties(xmem_run_break_readers xmem_run_break_readers_control xmem_
                      xmem_run_break_readers_mirror xmem_run_break_readers_ring_edge PROPERTIES TIMEOUT 60)
 set_tests_properties(xmem_run_break_readers_default PROPERTIES
     PASS_REGULAR_EXPRESSION "default mode: readers answer inside an unmap" FAIL_REGULAR_EXPRESSION "check_failed")
-# Cross-call merge of shared views (merge_with_previous): single-page calls on consecutive slots join one view, and
-# the steps around it (an unmap inside, slots out of order, a reader inside the held window, refused steps, two
-# reservations). The control keeps one view per call (X2W_XMEM_TEST_NO_MERGE=1, test build only); the deployed shim
-# ignores that switch; without X2W_XMEM_SHARED_VIEWS every page keeps a view of its own.
+# Cross-call merge of shared views (merge_with_previous, X2W_XMEM_JOIN_CALLS=1 set by the program): single-page calls
+# on consecutive slots join one view, and the steps around it (an unmap inside, slots out of order, a reader inside the
+# held window, refused steps, two reservations). The control keeps one view per call (X2W_XMEM_TEST_NO_MERGE=1, test
+# build only); the deployed shim ignores that switch; without X2W_XMEM_SHARED_VIEWS every page keeps a view of its
+# own. no_join: the deployed shim with shared views and without X2W_XMEM_JOIN_CALLS keeps a view per call.
 add_executable(xmem_cross_call_merge_check tests/xmem_cross_call_merge_check.cpp)
 target_compile_features(xmem_cross_call_merge_check PRIVATE cxx_std_17)
 add_dependencies(xmem_cross_call_merge_check xmem_shim xmem_shim_test_controls)
@@ -51,14 +53,26 @@ add_test(NAME xmem_cross_call_merge COMMAND xmem_cross_call_merge_check "$<TARGE
 add_test(NAME xmem_cross_call_merge_control COMMAND xmem_cross_call_merge_check "$<TARGET_FILE:xmem_shim_test_controls>" control)
 add_test(NAME xmem_cross_call_merge_deployed COMMAND xmem_cross_call_merge_check "$<TARGET_FILE:xmem_shim>" deployed)
 add_test(NAME xmem_cross_call_merge_default COMMAND xmem_cross_call_merge_check "$<TARGET_FILE:xmem_shim>" default)
+add_test(NAME xmem_cross_call_merge_no_join COMMAND xmem_cross_call_merge_check "$<TARGET_FILE:xmem_shim>" no-join)
 set_tests_properties(xmem_cross_call_merge xmem_cross_call_merge_control xmem_cross_call_merge_deployed
-                     xmem_cross_call_merge_default PROPERTIES TIMEOUT 60)
+                     xmem_cross_call_merge_default xmem_cross_call_merge_no_join PROPERTIES TIMEOUT 60)
 set_tests_properties(xmem_cross_call_merge_control PROPERTIES ENVIRONMENT "X2W_XMEM_TEST_NO_MERGE=1"
     PASS_REGULAR_EXPRESSION "no-merge control: 32 views" FAIL_REGULAR_EXPRESSION "check_failed")
 set_tests_properties(xmem_cross_call_merge_deployed PROPERTIES ENVIRONMENT "X2W_XMEM_TEST_NO_MERGE=1"
     PASS_REGULAR_EXPRESSION "merge: 1 view of 32 pages" FAIL_REGULAR_EXPRESSION "check_failed")
 set_tests_properties(xmem_cross_call_merge_default PROPERTIES
     PASS_REGULAR_EXPRESSION "no-merge control: 32 views" FAIL_REGULAR_EXPRESSION "check_failed")
+set_tests_properties(xmem_cross_call_merge_no_join PROPERTIES
+    PASS_REGULAR_EXPRESSION "no-join: 32 views" FAIL_REGULAR_EXPRESSION "check_failed")
+# Placed buffers at view boundaries (tests/xmem_page_runs_device_check.cpp, registered in CMakeLists.txt) with joins
+# across mapping calls on: the order of the mapping calls keeps every boundary.
+add_test(NAME xmem_page_runs_device_join_warp COMMAND xmem_page_runs_device_check warp join)
+set_tests_properties(xmem_page_runs_device_join_warp PROPERTIES TIMEOUT 120)
+# tests/xmem_page_runs_check.py expects one view per mapping call: an X2W_XMEM_JOIN_CALLS=1 inherited from the
+# caller's environment must not reach it.
+if(TEST xmem_shim_page_runs)
+    set_property(TEST xmem_shim_page_runs APPEND PROPERTY ENVIRONMENT "X2W_XMEM_JOIN_CALLS=")
+endif()
 
 # Slot 31 placeholder split inside an XMem reservation. The control disables the fallback used where the OS does
 # not report placeholders (Wine), so the split fails there; where the OS reports them, the control skips (77).

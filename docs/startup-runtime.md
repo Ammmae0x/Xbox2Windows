@@ -1466,6 +1466,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
 | `X2W_XMEM_LAZY_COMMIT=1` | experimental ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): a fresh physical-page slot is committed on its first CPU access instead of when its page is mapped. A vectored exception handler commits the slot. Writers that cannot fault one in (the main module's `ReadFile`, slot 133 placement, stand-in writes behind a commit check) call `x2w_xmem_commit_range` first. See [Mapped pages committed on first touch](experiments.md#mapped-pages-committed-on-first-touch) |
 | `X2W_XMEM_LAZY_STARTUP=1` (`run.ps1 -LazyMemory`, which also sets `X2W_XMEM_LAZY_COMMIT=1` and `X2W_XMEM_SHARED_VIEWS=1`) | experimental, with `X2W_XMEM_LAZY_COMMIT=1` ([#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)): the [startup commit profile](experiments.md#reserve-and-commit-startup-blocks) only reserves blocks of 32 MiB and up, and the same handler commits them 256 KiB at a time on first touch. Slot 133 commits a whole block (`x2w_xmem_commit_block`) before a GPU resource is placed in it. The main module's `VirtualFree` import drops released blocks. Blocks of 32 MiB and up placed below 2^40 by `X2W_XMEM_STARTUP_BELOW_40` are also reserved lazily. See [Startup blocks committed on first touch](experiments.md#startup-blocks-committed-on-first-touch) |
+| `X2W_XMEM_JOIN_CALLS=1` (with `X2W_XMEM_SHARED_VIEWS=1`; `tools/startup/run.sh` sets both, `run.ps1 -LazyMemory` only `X2W_XMEM_SHARED_VIEWS`) | experimental: a mapping call whose pages continue the shared view that ends at its address joins that view instead of mapping a view of its own ([Physical pages in shared sections](#physical-pages-in-shared-sections)). Read once, with `X2W_XMEM_SHARED_VIEWS`, by the first mapping call; without shared views it does nothing |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking; on a runtime without shader model 6.6 (in-box Windows 10), root signatures with the heap-indexing flags (`0xC00`) are serialized again without them, and the copy kept for shader translation gets that call's bits back when `CreateRootSignature` receives the returned blob's own buffer (a copy of the bytes keeps the desktop flags; `d3d12_xs_shim_heap_indexing`). The retry runs only on runtimes that refuse the flags (before shader model 6.6); where the runtime accepts them, `d3d12_xs_shim_heap_indexing` reports a capability skip (77) |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
@@ -3161,7 +3162,8 @@ slow for a start-up batch of about 100,000 pages (measured under Wine: 42.9 s fo
 82 ms with shared sections and views).
 
 Start-up maps nearly every page with a call of its own, and under Wine each map costs more the
-more views the process has. So a mapping call whose pages all continue the view that ends at its
+more views the process has. With `X2W_XMEM_JOIN_CALLS=1` as well (off by default; `tools/startup/run.sh`
+sets it, `run.ps1 -LazyMemory` does not), a mapping call whose pages all continue the view that ends at its
 address, on the next slots of the same section and inside the same reservation of the shim, joins
 that view: the view is unmapped, its placeholder is joined with the new pages' placeholder, and one
 view is mapped over both. It is taken apart the same way as in an unmap (below), and if a step is
@@ -3208,7 +3210,7 @@ cut short after part of the copy, and I/O from other modules are not covered.
 
 | | Default | `X2W_XMEM_SHARED_VIEWS=1` |
 |---|---|---|
-| Views | one per page | one per run of adjacent pages |
+| Views | one per page | one per run of adjacent pages of one call; with `X2W_XMEM_JOIN_CALLS=1` a call can also join the view that ends at its address |
 | Fault handler | none | registered by the first mapping call, never removed |
 | `FreeLibrary` | unloads `xmem.dll` | module is pinned and stays until the process ends (at load when the main module imports `VirtualQueryEx`, `ReadFile` or `WriteFile`, else at the first mapping call) |
 

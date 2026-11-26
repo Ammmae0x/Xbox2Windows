@@ -23,7 +23,8 @@
 //
 // A fault whose handler reads the breaks only after a later break on another run has begun (two_runs: break B on a
 // disjoint run; mirror: one permissive XMemMapPhysicalPages call that joins the CPU run and then its GPU mirror run)
-// must be retried as well: the handler keeps the ranges of the recent breaks, not only of the last one.
+// must be retried as well: the handler keeps the ranges of the recent breaks, not only of the last one. Joins across
+// calls need X2W_XMEM_JOIN_CALLS=1: main sets it for `mirror` and clears it for every other mode.
 //
 // The ring's edge (ring_edge): a held fault in break A whose handler reads the breaks after 63 later breaks is retried;
 // after 64 later breaks, A is no longer recorded and the fault is passed on (the reader's own __except catches it).
@@ -563,10 +564,11 @@ void two_runs_case(const Shim& shim, unsigned char* base)
     shim.release(2 * pages, tokens);
 }
 
-// The owner's configuration (X2W_XMEM_PERMISSIVE=1, X2W_XMEM_GPU_MIRROR=1): one XMemMapPhysicalPages call joins the
-// CPU run, then the same pages' GPU mirror run, under one memory.mutex hold; the two breaks follow each other at once.
-// A fault on the CPU run in the first break, whose handler is held until the GPU break is held open, must be retried.
-// The release event is auto-reset, so each of the call's two holds waits for a release of its own.
+// The owner's configuration (X2W_XMEM_PERMISSIVE=1, X2W_XMEM_GPU_MIRROR=1, X2W_XMEM_JOIN_CALLS=1 from main): one
+// XMemMapPhysicalPages call joins the CPU run, then the same pages' GPU mirror run, under one memory.mutex hold; the
+// two breaks follow each other at once. A fault on the CPU run in the first break, whose handler is held until the GPU
+// break is held open, must be retried. The release event is auto-reset, so each of the call's two holds waits for a
+// release of its own.
 void mirror_case(const Shim& shim, unsigned char* cpu)
 {
     const char* const name = "mirror";
@@ -715,6 +717,7 @@ int main(int argc, char** argv)
     }
     // The mode is read by the first mapping call; the VirtualQueryEx import is wrapped when xmem.dll loads.
     SetEnvironmentVariableA("X2W_XMEM_SHARED_VIEWS", default_mode ? nullptr : "1");
+    SetEnvironmentVariableA("X2W_XMEM_JOIN_CALLS", mirror ? "1" : nullptr);  // only `mirror` joins across calls
     if (lazy) SetEnvironmentVariableA("X2W_XMEM_LAZY_COMMIT", "1");
     const HMODULE xmem = LoadLibraryA(argv[1]);
     if (!xmem) {

@@ -517,6 +517,9 @@ RemapWindow remap_window;
 // generation), but then a page has a view of its own and no break takes a neighbour away, so x2w_xmem_stable_call
 // does not wait for them.
 std::atomic<bool> shared_views_on{false};
+// Set once, with shared views, when X2W_XMEM_JOIN_CALLS=1 is set as well (FaultRetry::ready): only then does a run
+// mapped by a call of its own join the recorded run that ends at its address (merge_with_previous).
+std::atomic<bool> joins_on{false};
 
 void begin_break(const std::map<ULONG_PTR, SIZE_T>& broken)
 {
@@ -611,6 +614,9 @@ struct MappingThread {
 // place until the process ends, also across a host's FreeLibrary and LoadLibrary. Nothing is
 // waited for or torn down at DLL detach. If the handler cannot be registered or the module cannot
 // be pinned, the opt-in is refused and pages get a view each.
+//
+// X2W_XMEM_JOIN_CALLS=1 is read at the same time and only counts with shared views on: a mapping call may then join
+// the run that ends at its address (merge_with_previous). Without it every call maps views of its own.
 struct FaultRetry {
     SRWLOCK lock = SRWLOCK_INIT;
     bool tried = false;
@@ -625,6 +631,7 @@ struct FaultRetry {
             // Test build only: shared views without the handler, to show that a reader then faults.
             if (x2w_local::env_on("X2W_XMEM_NO_FAULT_RETRY")) {
                 guaranteed = true;
+                joins_on.store(x2w_local::env_on("X2W_XMEM_JOIN_CALLS"), std::memory_order_release);
                 ReleaseSRWLockExclusive(&lock);
                 return true;
             }
@@ -637,6 +644,10 @@ struct FaultRetry {
                 AddVectoredExceptionHandler(1, retry_remapped_page)) {
                 guaranteed = true;
                 x2w_local::logf("x2w-xmem shared views are on (X2W_XMEM_SHARED_VIEWS): xmem.dll stays loaded until the process ends");
+                if (x2w_local::env_on("X2W_XMEM_JOIN_CALLS")) {
+                    joins_on.store(true, std::memory_order_release);
+                    x2w_local::logf("x2w-xmem joins across mapping calls are on (X2W_XMEM_JOIN_CALLS)");
+                }
             } else
                 x2w_local::logf("x2w-xmem shared views are off: the fault handler could not be set up (error %lu)", GetLastError());
         }
@@ -785,16 +796,16 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failu
     return lost;
 }
 
-// Shared views only. Startup maps nearly every page with a call of its own, and under Wine each map
-// costs more the more views the process has. A run mapped by a call of its own therefore joins the
-// recorded run R that ends at its address, when its first page is the next slot of the section behind
-// R's last page and R and the new pages lie in one reservation of the shim: the new pages' range is
-// split to a placeholder of its own, R is unmapped, the two placeholders are joined and one view is
-// mapped over both. R is taken apart as in an unmap (begin_break), so a thread that touches R in
-// between is retried and x2w_xmem_stable_call readers wait. On a refused step before R is unmapped
-// nothing changed; after it, R is mapped again as it was (map_recorded). Both return separate, and
-// the caller maps the new pages on their own. lost: R could not be mapped again; the pages that have
-// no view are forgotten, as in an unmap. X2W_XMEM_TEST_NO_MERGE=1 turns the merge off (tests only).
+// Shared views with X2W_XMEM_JOIN_CALLS=1 only (joins_on). Startup maps nearly every page with a call of its own,
+// and under Wine each map costs more the more views the process has. With the switch, a run mapped by a call of its
+// own therefore joins the recorded run R that ends at its address, when its first page is the next slot of the
+// section behind R's last page and R and the new pages lie in one reservation of the shim: the new pages' range is
+// split to a placeholder of its own, R is unmapped, the two placeholders are joined and one view is mapped over
+// both. R is taken apart as in an unmap (begin_break), so a thread that touches R in between is retried and
+// x2w_xmem_stable_call readers wait. On a refused step before R is unmapped nothing changed; after it, R is mapped
+// again as it was (map_recorded). Both return separate, and the caller maps the new pages on their own. lost: R
+// could not be mapped again; the pages that have no view are forgotten, as in an unmap. X2W_XMEM_TEST_NO_MERGE=1
+// turns the merge off (tests only).
 // A joined run stops at max_merged_run_pages: a page that would make R longer starts a run of its own, which the
 // next pages join. The cap bounds the runs that joining builds: the work of each join, and of a later break of such a
 // run (an unmap inside a run takes the whole run apart and maps its other pages again). A run mapped by one call
@@ -905,9 +916,10 @@ BOOL map_pages_locked(ULONG_PTR count, const ULONG_PTR* tokens, const AddressAt&
                     const Backing& b = memory.backings.at(last->second);
                     if (last->first != first->first + bytes || b.section != head.section || b.offset != head.offset + bytes) break;
                 }
-                // Only a run that is the whole batch joins an earlier one: a later run of the batch that
-                // fails unmaps everything in made, which a joined run is not.
-                const Merge merge = share_views && first == batch.begin() && last == batch.end()
+                // Only with X2W_XMEM_JOIN_CALLS, and only a run that is the whole batch joins an earlier one: a
+                // later run of the batch that fails unmaps everything in made, which a joined run is not.
+                const bool whole_batch = first == batch.begin() && last == batch.end();
+                const Merge merge = share_views && joins_on.load(std::memory_order_acquire) && whole_batch
                                         ? merge_with_previous(first->first, head, bytes, failure)
                                         : Merge::separate;
                 if (merge == Merge::lost) {
