@@ -3165,7 +3165,13 @@ more views the process has. So a mapping call whose pages all continue the view 
 address, on the next slots of the same section and inside the same reservation of the shim, joins
 that view: the view is unmapped, its placeholder is joined with the new pages' placeholder, and one
 view is mapped over both. It is taken apart the same way as in an unmap (below), and if a step is
-refused the view is mapped again as it was and the new pages get a view of their own.
+refused the view is mapped again as it was and the new pages get a view of their own. A joined
+view stops at 64 pages (`max_merged_run_pages`): a page that would make it longer starts a view of
+its own, which the next pages join. Every later unmap inside a view takes the whole view apart, so
+the cap bounds that work too. Measured under Wine with every byte of the view written
+(`xmem_cross_call_merge_check timing`): an unmap inside a view of 64 pages took 0.28 ms, of 512
+pages 2.1 ms and of 4096 pages 13 ms; joining a page to a view of 63 took 1.5 ms, about what a page
+mapped on its own costs (1.4 ms).
 
 Unmapping a page inside a shared view unmaps that view and maps its other pages again. A thread
 that touches one of those pages in between takes an access violation. A vectored handler retries

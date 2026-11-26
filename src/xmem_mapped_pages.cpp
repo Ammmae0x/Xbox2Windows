@@ -774,7 +774,23 @@ ULONG_PTR map_recorded(ULONG_PTR base, SIZE_T size, bool fail, MapFailure* failu
 // nothing changed; after it, R is mapped again as it was (map_recorded). Both return separate, and
 // the caller maps the new pages on their own. lost: R could not be mapped again; the pages that have
 // no view are forgotten, as in an unmap. X2W_XMEM_TEST_NO_MERGE=1 turns the merge off (tests only).
+// A joined run stops at max_merged_run_pages: a page that would make R longer starts a run of its own, which the
+// next pages join. An unmap inside a run takes the whole run apart and maps its other pages again, so the cap bounds
+// the work of every later break of the run as well as of each join.
 enum class Merge { joined, separate, lost };
+
+constexpr SIZE_T max_merged_run_pages = 64;
+
+// Test build only: X2W_XMEM_TEST_MERGE_CAP=<pages> replaces the cap (xmem_cross_call_merge_check's timing mode).
+SIZE_T merged_run_cap()
+{
+#ifdef X2W_XMEM_TEST_CONTROLS
+    char text[24];
+    if (GetEnvironmentVariableA("X2W_XMEM_TEST_MERGE_CAP", text, sizeof(text)))
+        if (const auto pages = std::strtoull(text, nullptr, 10)) return static_cast<SIZE_T>(pages);
+#endif
+    return max_merged_run_pages;
+}
 
 Merge merge_with_previous(ULONG_PTR address, const Backing& head, SIZE_T bytes, MapFailure* failure)
 {
@@ -785,6 +801,7 @@ Merge merge_with_previous(ULONG_PTR address, const Backing& head, SIZE_T bytes, 
     if (next == memory.runs.begin()) return Merge::separate;
     const auto [base, size] = *std::prev(next);
     if (base + size != address) return Merge::separate;
+    if ((size + bytes) / page_bytes > merged_run_cap()) return Merge::separate;
     const auto tail = memory.views.find(address - page_bytes);
     if (tail == memory.views.end()) return Merge::separate;
     const Backing& previous = memory.backings.at(tail->second);

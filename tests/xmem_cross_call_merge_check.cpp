@@ -9,6 +9,9 @@
 //             before the merge. Prints "no-merge control: 32 views".
 //   deployed  (deployed xmem.dll, X2W_XMEM_TEST_NO_MERGE=1) the deployed shim ignores the test switch and merges.
 //   default   (deployed xmem.dll, X2W_XMEM_SHARED_VIEWS unset) every page keeps a view of its own.
+//   timing    (test-controls xmem.dll; not a ctest case) ms of a join, of a break and of an own-view map against the
+//             run length R (X2W_XMEM_TEST_MERGE_CAP), for the cap's table in the review notes.
+// The pass line of control, deployed and default is printed at the end of main, only when no check failed.
 //
 // Cases of `check`:
 //   joined      32 single-page calls on consecutive slots: one view of 32 pages; each page keeps the mark written
@@ -24,12 +27,15 @@
 //               the pages unmap and release, and the live page count returns to where it was.
 //   two-reservations  a caller placeholder split in two pieces, each recorded with XMemVirtualAlloc (permissive
 //               replace-placeholder call): a page at the start of the second piece does not join the first's run.
+//   capped      192 single-page calls make three runs of 64 pages (max_merged_run_pages); an unmap held in its window
+//               inside the middle run takes apart at most 64 pages, and the outer runs stay mapped.
 //
-// Usage: xmem_cross_call_merge_check <xmem.dll> check|control|deployed|default
+// Usage: xmem_cross_call_merge_check <xmem.dll> check|control|deployed|default|timing
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -50,6 +56,7 @@ constexpr SIZE_T page = SIZE_T{64} << 10;
 constexpr SIZE_T count = 32;
 
 int failures = 0;
+const char* token = nullptr;  // the mode's pass line; main prints it at its end, and only with no failure
 
 bool check(bool ok, const char* name, const char* detail = "")
 {
@@ -134,13 +141,13 @@ void single_page_calls(const Shim& shim, unsigned char* base, bool merges, bool 
     if (!check(tokens.size() == count, "allocate 32 pages")) return;
     if (!check(map_one_by_one(shim, base, tokens, 0x61000000u, [](SIZE_T i) { return i; }), "32 single-page calls")) return;
     if (merges) {
-        check(view_is(base, base, base + count * page) && view_is(base + (count - 1) * page, base, base + count * page),
-              "joined: one view of 32 pages");
-        std::printf("merge: 1 view of 32 pages\n");
+        if (check(view_is(base, base, base + count * page) && view_is(base + (count - 1) * page, base, base + count * page),
+                  "joined: one view of 32 pages"))
+            token = "merge: 1 view of 32 pages";
     } else {
         bool each = true;
         for (SIZE_T i = 0; i < count; ++i) each &= view_is(base + i * page, base + i * page, base + (i + 1) * page);
-        if (check(each, "one view per call")) std::printf("no-merge control: 32 views\n");
+        if (check(each, "one view per call")) token = "no-merge control: 32 views";
     }
     check(marked(base, count, 0x61000000u), "joined: marks kept");
     if (middle) {
@@ -256,6 +263,125 @@ void refused(const Shim& shim, unsigned char* base, const char* stage, const cha
     check(shim.live() == live_before, name, "live page count back where it was");
 }
 
+// Named events for X2W_XMEM_TEST_HOLD_WINDOW: "<name>.unmapped" (set by the held call) and "<name>.release".
+struct Hold {
+    char name[64];
+    HANDLE unmapped, release;
+    explicit Hold(const char* stem)
+    {
+        std::snprintf(name, sizeof(name), "x2w-cross-call-merge-%s-%lu", stem, GetCurrentProcessId());
+        char event_name[96];
+        std::snprintf(event_name, sizeof(event_name), "%s.unmapped", name);
+        unmapped = CreateEventA(nullptr, TRUE, FALSE, event_name);
+        std::snprintf(event_name, sizeof(event_name), "%s.release", name);
+        release = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    }
+    ~Hold()
+    {
+        CloseHandle(unmapped);
+        CloseHandle(release);
+    }
+};
+
+// capped: 3 * cap single-page calls make three runs of cap pages (the cap of the shim, 64), not one. The unmap of a
+// page in the middle run is held in its window: the pages that read as not committed there are the pages the break
+// took apart, at most one run of cap pages; the runs before and after it stay mapped.
+void capped(const Shim& shim, unsigned char* base)
+{
+    constexpr SIZE_T cap = 64, n = 3 * cap, hole = cap + cap / 2;
+    auto tokens = shim.pages(n);
+    if (!check(tokens.size() == n, "capped: allocate 192 pages")) return;
+    if (!check(map_one_by_one(shim, base, tokens, 0x65000000u, [](SIZE_T i) { return i; }), "capped: 192 single-page calls"))
+        return;
+    bool runs = true;
+    for (SIZE_T r = 0; r < 3; ++r)
+        runs &= view_is(base + r * cap * page, base + r * cap * page, base + (r + 1) * cap * page) &&
+                view_is(base + ((r + 1) * cap - 1) * page, base + r * cap * page, base + (r + 1) * cap * page);
+    check(runs, "capped: three views of 64 pages");
+    Hold hold("capped");
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", hold.name);
+    bool unmapped_call = false;
+    std::thread unmapper([&] { unmapped_call = shim.map(base + hole * page, 1, nullptr) == base + hole * page; });
+    const bool opened = WaitForSingleObject(hold.unmapped, 10000) == WAIT_OBJECT_0;
+    SIZE_T taken_apart = 0;
+    bool outer_mapped = true;
+    for (SIZE_T i = 0; opened && i < n; ++i) {
+        const bool committed = region(base + i * page).state == MEM_COMMIT;
+        taken_apart += !committed;
+        if (i < cap || i >= 2 * cap) outer_mapped &= committed;
+    }
+    SetEvent(hold.release);
+    unmapper.join();
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", nullptr);
+    char detail[64];
+    std::snprintf(detail, sizeof(detail), "(%zu pages)", static_cast<std::size_t>(taken_apart));
+    check(opened, "capped: the unmap held the window");
+    check(opened && taken_apart <= cap, "capped: the break took apart at most 64 pages", detail);
+    check(opened && outer_mapped, "capped: the runs before and after stay mapped in the window");
+    check(unmapped_call, "capped: the unmap succeeded");
+    check(view_is(base + cap * page, base + cap * page, base + hole * page) &&
+          view_is(base + (hole + 1) * page, base + (hole + 1) * page, base + 2 * cap * page), "capped: views [64, 96) and [97, 128)");
+    check(marked(base, n, 0x65000000u, hole), "capped: marks kept");
+    check(shim.map(base, hole, nullptr) == base && shim.map(base + (hole + 1) * page, n - hole - 1, nullptr) == base + (hole + 1) * page &&
+          shim.release(n, tokens.data()), "capped: unmap and release");
+}
+
+// timing (not a ctest case; ready.md's table): for a run of R pages, the ms of the call that joins page R to a run of
+// R - 1 (X2W_XMEM_TEST_MERGE_CAP=R), of the unmap of page R/2 (one break of the whole run) and, for comparison, of a
+// single-page call that maps a view of its own (X2W_XMEM_TEST_NO_MERGE=1). Every byte of the run is written before
+// the join and before the break, as a title's use of the pages would (a run that is mostly untouched unmaps much
+// faster). Median of 5 (3 from 1024 pages). This process has a few
+// views; a title process has tens of thousands, and under Wine each map costs more the more views there are.
+double ms_since(const LARGE_INTEGER& from)
+{
+    LARGE_INTEGER now, frequency;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    return 1000.0 * static_cast<double>(now.QuadPart - from.QuadPart) / static_cast<double>(frequency.QuadPart);
+}
+
+double median(std::vector<double> v)
+{
+    std::sort(v.begin(), v.end());
+    return v.empty() ? 0.0 : v[v.size() / 2];
+}
+
+void timing(const Shim& shim, unsigned char* base)
+{
+    std::printf("timing: R pages | join ms | break ms | own-view map ms (median of 5)\n");
+    for (const SIZE_T r : {SIZE_T{16}, SIZE_T{32}, SIZE_T{64}, SIZE_T{128}, SIZE_T{256}, SIZE_T{512}, SIZE_T{1024},
+                           SIZE_T{2048}, SIZE_T{4096}}) {
+        std::vector<double> join, unmap, own;
+        char cap[24];
+        std::snprintf(cap, sizeof(cap), "%zu", static_cast<std::size_t>(r));
+        for (int rep = 0; rep < (r >= 1024 ? 3 : 5); ++rep) {
+            auto tokens = shim.pages(r + 1);
+            if (!check(tokens.size() == r + 1 && shim.map(base, r - 1, tokens.data()) == base, "timing: map R - 1 pages")) return;
+            std::memset(base, 0x5a, (r - 1) * page);
+            SetEnvironmentVariableA("X2W_XMEM_TEST_MERGE_CAP", cap);
+            LARGE_INTEGER t;
+            QueryPerformanceCounter(&t);
+            const bool joined = shim.map(base + (r - 1) * page, 1, &tokens[r - 1]) == base + (r - 1) * page;
+            join.push_back(ms_since(t));
+            SetEnvironmentVariableA("X2W_XMEM_TEST_MERGE_CAP", nullptr);
+            check(joined && view_is(base, base, base + r * page), "timing: joined run of R pages");
+            std::memset(base, 0x5b, r * page);
+            QueryPerformanceCounter(&t);
+            check(shim.map(base + (r / 2) * page, 1, nullptr) == base + (r / 2) * page, "timing: unmap page R/2");
+            unmap.push_back(ms_since(t));
+            SetEnvironmentVariableA("X2W_XMEM_TEST_NO_MERGE", "1");
+            QueryPerformanceCounter(&t);
+            const bool alone = shim.map(base + r * page, 1, &tokens[r]) == base + r * page;
+            own.push_back(ms_since(t));
+            SetEnvironmentVariableA("X2W_XMEM_TEST_NO_MERGE", nullptr);
+            check(alone && view_is(base + r * page, base + r * page, base + (r + 1) * page), "timing: own view");
+            check(shim.map(base, r / 2, nullptr) == base && shim.map(base + (r / 2 + 1) * page, r / 2, nullptr) &&
+                  shim.release(r + 1, tokens.data()), "timing: unmap and release");
+        }
+        std::printf("timing: %4zu | %7.3f | %7.3f | %7.3f\n", static_cast<std::size_t>(r), median(join), median(unmap), median(own));
+    }
+}
+
 void two_reservations(const Shim& shim)
 {
     const auto virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(
@@ -287,9 +413,10 @@ int main(int argc, char** argv)
 {
     const char* const mode = argc == 3 ? argv[2] : "";
     const bool all = std::strcmp(mode, "check") == 0, control = std::strcmp(mode, "control") == 0,
-               deployed = std::strcmp(mode, "deployed") == 0, plain = std::strcmp(mode, "default") == 0;
-    if (!all && !control && !deployed && !plain) {
-        std::printf("usage: xmem_cross_call_merge_check <xmem.dll> check|control|deployed|default\n");
+               deployed = std::strcmp(mode, "deployed") == 0, plain = std::strcmp(mode, "default") == 0,
+               timed = std::strcmp(mode, "timing") == 0;
+    if (!all && !control && !deployed && !plain && !timed) {
+        std::printf("usage: xmem_cross_call_merge_check <xmem.dll> check|control|deployed|default|timing\n");
         return 2;
     }
     // The mode is read by the first mapping call.
@@ -315,6 +442,12 @@ int main(int argc, char** argv)
         return 1;
     }
     unsigned char* const base = whole + page;
+    if (timed) {
+        timing(shim, base);
+        VirtualFree(whole, 0, MEM_RELEASE);
+        std::printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
+        return failures ? 1 : 0;
+    }
     single_page_calls(shim, base, all || deployed, all);
     if (all) {
         reversed(shim, base + 64 * page, base + 128 * page);
@@ -322,8 +455,10 @@ int main(int argc, char** argv)
         refused(shim, base + 256 * page, "4:0", "refused-4");
         refused(shim, base + 320 * page, "5:0", "refused-5");
         two_reservations(shim);
+        capped(shim, base + 512 * page);
     }
     VirtualFree(whole, 0, MEM_RELEASE);
+    if (!failures && token) std::printf("%s\n", token);
     std::printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
     return failures ? 1 : 0;
 }
