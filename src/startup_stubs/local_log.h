@@ -6,6 +6,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <type_traits>
 
 namespace x2w_local {
 
@@ -107,6 +108,27 @@ inline void commit_lazy_block(const void* pointer) noexcept
     if (commit_block) commit_block(pointer);
 }
 
+// Runs f() outside xmem's run breaks (x2w_xmem_stable_call, X2W_XMEM_SHARED_VIEWS): inside a break the pages of
+// the run being taken apart read as reserved to a VirtualQuery and make ReadProcessMemory fail, although a touch of
+// them would be retried. f must be a query, or a copy into the caller's memory, that can run again; it may run
+// twice. Without xmem.dll, or with one that lacks the export, f runs once, directly.
+using StableCall = BOOL(WINAPI*)(void (*)(void*), void*);
+inline StableCall stable_call_export() noexcept
+{
+    static const StableCall stable_call = [] {
+        const HMODULE xmem = GetModuleHandleW(L"xmem.dll");
+        return xmem ? reinterpret_cast<StableCall>(GetProcAddress(xmem, "x2w_xmem_stable_call")) : nullptr;
+    }();
+    return stable_call;
+}
+template <typename F>
+inline void outside_run_breaks(F&& f) noexcept
+{
+    const StableCall stable_call = stable_call_export();
+    using Call = std::remove_reference_t<F>;
+    if (!stable_call || !stable_call([](void* context) { (*static_cast<Call*>(context))(); }, &f)) f();
+}
+
 // Readability by probing (see probe_readable); writability by one VirtualQuery (rare callers).
 inline bool accessible(const void* pointer, std::size_t bytes, bool write) noexcept
 {
@@ -115,7 +137,9 @@ inline bool accessible(const void* pointer, std::size_t bytes, bool write) noexc
     if (!write) return probe_readable(start, bytes) == bytes;
     commit_lazy(pointer, bytes);
     MEMORY_BASIC_INFORMATION info{};
-    if (!VirtualQuery(pointer, &info, sizeof(info)) || info.State != MEM_COMMIT) return false;
+    SIZE_T queried = 0;
+    outside_run_breaks([&] { queried = VirtualQuery(pointer, &info, sizeof(info)); });
+    if (!queried || info.State != MEM_COMMIT) return false;
     const DWORD protect = info.Protect & 0xFF;
     if ((info.Protect & PAGE_GUARD) || protect == PAGE_NOACCESS || protect == 0) return false;
     const bool writable = protect == PAGE_READWRITE || protect == PAGE_EXECUTE_READWRITE || protect == PAGE_WRITECOPY ||

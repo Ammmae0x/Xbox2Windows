@@ -324,6 +324,29 @@ set_tests_properties(xmem_lazy_imports PROPERTIES TIMEOUT 60)
 add_test(NAME xmem_lazy_handler_failure COMMAND xmem_lazy_imports_check
     "$<TARGET_FILE:xmem_shim_test_controls>" handler-failure)
 set_tests_properties(xmem_lazy_handler_failure PROPERTIES TIMEOUT 60)
+# Readers that do not fault, inside a run break held open by the test-controls build: x2w_xmem_stable_call,
+# XMemVirtualQuery, the VirtualQueryEx import wrapper and the stand-in readers that go through
+# x2w_local::outside_run_breaks must answer after the break. Control: a copy of local_log.h that asks xmem.dll for
+# a missing export, so the stand-in readers run directly and answer inside the window.
+foreach(variant check control)
+    add_executable(xmem_run_break_readers_${variant} tests/xmem_run_break_readers_check.cpp)
+    target_compile_features(xmem_run_break_readers_${variant} PRIVATE cxx_std_17)
+    add_dependencies(xmem_run_break_readers_${variant} xmem_shim_test_controls)
+endforeach()
+target_include_directories(xmem_run_break_readers_check PRIVATE src)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/startup_stubs/local_log.h" local_log_text)
+string(REPLACE "\"x2w_xmem_stable_call\"" "\"x2w_xmem_stable_call_control\"" local_log_control_text "${local_log_text}")
+if(local_log_control_text STREQUAL local_log_text)
+    message(FATAL_ERROR "local_log.h lost the anchor used by xmem_run_break_readers_control")
+endif()
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/run_break_readers_control/startup_stubs/local_log.h" "${local_log_control_text}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/startup_stubs/local_log.h)
+target_include_directories(xmem_run_break_readers_control BEFORE PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/run_break_readers_control")
+target_include_directories(xmem_run_break_readers_control PRIVATE src)
+add_test(NAME xmem_run_break_readers COMMAND xmem_run_break_readers_check "$<TARGET_FILE:xmem_shim_test_controls>")
+add_test(NAME xmem_run_break_readers_control COMMAND xmem_run_break_readers_control
+         "$<TARGET_FILE:xmem_shim_test_controls>" control)
+set_tests_properties(xmem_run_break_readers xmem_run_break_readers_control PROPERTIES TIMEOUT 60)
 add_executable(xmem_section_lease_check tests/xmem_section_lease_check.cpp tests/desktop_gpu.cpp)
 target_include_directories(xmem_section_lease_check PRIVATE src)
 target_compile_features(xmem_section_lease_check PRIVATE cxx_std_17)

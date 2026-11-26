@@ -1581,6 +1581,42 @@ extern "C" BOOL WINAPI x2w_xmem_page_stats(ULONGLONG* live_sections)
     return TRUE;
 }
 
+// Runs fn(context) so that its answer does not come from inside a run break: the moment, under memory.mutex,
+// when a run of shared views is unmapped and its surviving pages are mapped again (map_pages_locked,
+// remap_alias_pages). A thread that touches such a page faults and retry_remapped_page retries it, but a region
+// query (VirtualQuery) or a kernel copy (ReadProcessMemory) does not fault: inside the break it reports the pages
+// as reserved, or fails. fn must be a query, or a copy into the caller's memory, that can simply run again, and
+// must not take memory.mutex or call the mapping exports.
+// fn runs once when no break begins or ends around it (the break generation is even before and unchanged
+// after): every call without X2W_XMEM_SHARED_VIEWS, where no break ever begins, and nearly every call with it.
+// Otherwise it runs again under memory.mutex, so after the break. A thread that holds memory.mutex runs it directly.
+extern "C" BOOL WINAPI x2w_xmem_stable_call(void (*fn)(void*), void* context)
+{
+    if (!fn) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (mapping_thread) {
+        fn(context);
+        return TRUE;
+    }
+    const auto generation = [] {
+        AcquireSRWLockShared(&remap_window.lock);
+        const ULONG64 value = remap_window.generation;
+        ReleaseSRWLockShared(&remap_window.lock);
+        return value;
+    };
+    const ULONG64 before = generation();
+    if (!(before & 1)) {
+        fn(context);
+        if (generation() == before) return TRUE;
+    }
+    const MappingThread marker;
+    const std::lock_guard guard(memory.mutex);
+    fn(context);
+    return TRUE;
+}
+
 // Experimental export: the slab accounting behind those pages (#1199): slabs open, slots in use and slots free
 // in the open slabs. A slab is reserved when it is created, its slots are committed on first use, and empty slabs
 // are closed when all of their slots are freed and unpinned.

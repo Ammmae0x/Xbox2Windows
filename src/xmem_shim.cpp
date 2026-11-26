@@ -104,9 +104,23 @@ extern "C" void XMemFree(void* allocation, ULONGLONG attributes)
     era_heap::release_with_attributes(allocation, attributes);
 }
 
+extern "C" BOOL WINAPI x2w_xmem_stable_call(void (*fn)(void*), void* context);
+
+// The answer for a page of a shared-view run is taken outside a run break (x2w_xmem_stable_call): inside one the
+// page would read as reserved.
 extern "C" BOOL XMemVirtualQuery(HANDLE process, LPCVOID address, void* buffer)
 {
-    return era_query::query(process, address, buffer, query_buffer_bytes) != 0;
+    struct Query {
+        HANDLE process;
+        LPCVOID address;
+        void* buffer;
+        std::size_t result;
+    } query{process, address, buffer, 0};
+    x2w_xmem_stable_call([](void* context) {
+        auto& q = *static_cast<Query*>(context);
+        q.result = era_query::query(q.process, q.address, q.buffer, query_buffer_bytes);
+    }, &query);
+    return query.result != 0;
 }
 
 // Desktop policy (docs/experiments.md): writes only +8, with this process's GPU memory in bytes;
