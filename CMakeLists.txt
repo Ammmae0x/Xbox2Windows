@@ -10494,6 +10494,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/pe_inventory_cli_check.py")
     add_test(NAME call_evidence_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/call_evidence_check.py")
+    add_test(NAME pe_call_evidence_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/call_evidence_cli_check.py")
+    set_tests_properties(pe_call_evidence_cli_check PROPERTIES TIMEOUT 60)
     add_test(NAME pe_run_package_invalid_pe COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/pe_run_package_invalid_check.py")
     add_test(NAME pe_run_package_plan_check COMMAND "${INTAKE_PYTHON}" -B
