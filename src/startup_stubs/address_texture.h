@@ -29,7 +29,9 @@ inline bool console_address_texture(const D3D12_RESOURCE_DESC& r)
                                        static_cast<UINT>(D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
     if (!gfx10::supports(r) || r.SampleDesc.Quality || (static_cast<UINT>(r.Flags) & incompatible_flags) ||
         r.DepthOrArraySize > D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION ||
-        !((std::max)(r.Width, UINT64{r.Height}) >> (r.MipLevels - 1)) ||
+        // The largest side, depth included for a volume, must allow the mip count.
+        !((std::max)({r.Width, UINT64{r.Height},
+                      UINT64{r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? r.DepthOrArraySize : 1u}}) >> (r.MipLevels - 1)) ||
         (r.Alignment && r.Alignment != D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT &&
          r.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) ||
         address_depth_format(r.Format))
