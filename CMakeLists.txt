@@ -7215,6 +7215,41 @@ if(EXISTS "${INTAKE_PYTHON}")
         check "$<TARGET_FILE:cpu_avx_cvt_cmp_test>" "$<TARGET_FILE:cpu_avx_cvt_cmp_test_lifted>")
     set_tests_properties(cpu_aot_avx_cvt_cmp_test PROPERTIES SKIP_RETURN_CODE 77)
 
+    # cpu_aot_avx_cmp
+    set(cpu_avx_cmp_aot_exports)
+    foreach(mnem IN ITEMS vcmpps_ymm vcmppd_ymm vcmpss vcmpsd)
+        foreach(hi IN ITEMS 0 1)
+            foreach(lo IN ITEMS 0 1 2 3 4 5 6 7 8 9 a b c d e f)
+                list(APPEND cpu_avx_cmp_aot_exports "op_${mnem}_p${hi}${lo}")
+            endforeach()
+        endforeach()
+    endforeach()
+    list(APPEND cpu_avx_cmp_aot_exports
+        op_vcmpps_xmm_reg op_vcmppd_xmm_reg op_vcmpps_xmm_mem op_vcmppd_xmm_mem
+        op_vcmpps_ymm_mem_rcx op_vcmpps_ymm_mem_rdx op_vcmpps_ymm_mem_r8
+        op_vcmppd_ymm_mem_rcx op_vcmppd_ymm_mem_rdx op_vcmppd_ymm_mem_r8
+        op_vcmpss_mem_rcx op_vcmpss_mem_rdx op_vcmpss_mem_r8
+        op_vcmpsd_mem_rcx op_vcmpsd_mem_rdx op_vcmpsd_mem_r8
+        op_vcmpps_imm_highbits
+        op_vcmpps_alias_dst_src1 op_vcmppd_alias_dst_src2 op_vcmpps_alias_src1_src2 op_vcmpsd_alias_all
+        op_vmovss_mem_glue op_vmovsd_mem_glue op_vmovss_reg_merge_glue op_vmovsd_reg_merge_glue
+        op_vmov_aligned_glue)
+    string(JOIN "," cpu_avx_cmp_aot_exports_csv ${cpu_avx_cmp_aot_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_avx_cmp_aot_${variant} avx_cmp_aot)
+        cpu_translation(cpu_avx_cmp_aot_${variant} cpu_avx_cmp_aot "${cpu_avx_cmp_aot_exports_csv}")
+    endforeach()
+    target_compile_definitions(cpu_avx_cmp_aot_altered PRIVATE ALTER_AVX_CMP)
+    add_test(NAME cpu_aot_avx_cmp COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/avx_cmp_aot_check.py"
+        "$<TARGET_FILE:cpu_avx_cmp_aot_original>"
+        "$<TARGET_FILE:cpu_avx_cmp_aot_original_lifted>"
+        "$<TARGET_FILE:cpu_avx_cmp_aot_altered>"
+        "$<TARGET_FILE:cpu_avx_cmp_aot_altered_lifted>")
+    set_tests_properties(cpu_aot_avx_cmp PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_avx_cmp.txt")
+
     cpu_asm_fixture(cpu_avx_scalar_fp avx_scalar_fp)
     set(avx_scalar_fp_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_avx_scalar_fp_lifted.cpp")
     add_custom_command(OUTPUT "${avx_scalar_fp_fixture}"
