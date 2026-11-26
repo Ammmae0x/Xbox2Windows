@@ -6739,6 +6739,30 @@ if(EXISTS "${INTAKE_PYTHON}")
         SKIP_RETURN_CODE 77
         ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_bmi1_bit.txt")
 
+    # cpu_aot_bmi1_logic
+    set(cpu_bmi1_logic_aot_exports
+        "op_andn32,op_andn64,op_bextr32,op_bextr64,op_tzcnt32,op_tzcnt64,"
+        "op_andn32_mem,op_andn64_mem,op_bextr32_mem,op_bextr64_mem,op_tzcnt32_mem,op_tzcnt64_mem,"
+        "op_andn32_flags,op_andn64_flags,op_bextr32_flags,op_bextr64_flags,"
+        "op_tzcnt32_flags,op_tzcnt64_flags,op_bextr64_mem_flags,op_tzcnt64_mem_flags,"
+        "op_r8_source_then_store,op_dst_alias_src,op_bmi1_logic_discarded_read")
+    string(CONCAT cpu_bmi1_logic_aot_exports ${cpu_bmi1_logic_aot_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_bmi1_logic_aot_${variant} bmi1_logic_aot)
+        cpu_translation(cpu_bmi1_logic_aot_${variant} cpu_bmi1_logic_aot "${cpu_bmi1_logic_aot_exports}")
+    endforeach()
+    target_compile_definitions(cpu_bmi1_logic_aot_altered PRIVATE ALTER_BMI1_LOGIC)
+    add_test(NAME cpu_aot_bmi1_logic COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/bmi1_logic_aot_check.py"
+        "$<TARGET_FILE:cpu_bmi1_logic_aot_original>"
+        "$<TARGET_FILE:cpu_bmi1_logic_aot_original_lifted>"
+        "$<TARGET_FILE:cpu_bmi1_logic_aot_altered>"
+        "$<TARGET_FILE:cpu_bmi1_logic_aot_altered_lifted>"
+        "${CMAKE_CXX_COMPILER}")
+    set_tests_properties(cpu_aot_bmi1_logic PROPERTIES
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/cpu_aot_bmi1_logic.txt")
+
     cpu_asm_fixture(cpu_sse2_packed_cvt sse2_packed_cvt)
     target_sources(cpu_sse2_packed_cvt PRIVATE tests/cpu/sse2_mxcsr_test.asm)
     set(sse2_packed_cvt_fixture "${CMAKE_CURRENT_BINARY_DIR}/cpu_sse2_packed_cvt_lifted.cpp")
