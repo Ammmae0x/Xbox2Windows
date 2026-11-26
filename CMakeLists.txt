@@ -348,8 +348,14 @@ add_test(NAME xmem_run_break_readers_control COMMAND xmem_run_break_readers_cont
          "$<TARGET_FILE:xmem_shim_test_controls>" control)
 add_test(NAME xmem_run_break_readers_next_break_control COMMAND xmem_run_break_readers_check
          "$<TARGET_FILE:xmem_shim_test_controls>" next-break-control)
+# Default mode (no X2W_XMEM_SHARED_VIEWS): readers that overlap an unmap answer inside it, as before. Lazy commit:
+# the readers' output buffer in a mapped slot not yet committed.
+add_test(NAME xmem_run_break_readers_default COMMAND xmem_run_break_readers_check "$<TARGET_FILE:xmem_shim_test_controls>" default)
+add_test(NAME xmem_run_break_readers_lazy COMMAND xmem_run_break_readers_check "$<TARGET_FILE:xmem_shim_test_controls>" lazy)
 set_tests_properties(xmem_run_break_readers xmem_run_break_readers_control xmem_run_break_readers_next_break_control
-                     PROPERTIES TIMEOUT 60)
+                     xmem_run_break_readers_default xmem_run_break_readers_lazy PROPERTIES TIMEOUT 60)
+set_tests_properties(xmem_run_break_readers_default PROPERTIES
+    PASS_REGULAR_EXPRESSION "default mode: readers answer inside an unmap" FAIL_REGULAR_EXPRESSION "check_failed")
 add_executable(xmem_section_lease_check tests/xmem_section_lease_check.cpp tests/desktop_gpu.cpp)
 target_include_directories(xmem_section_lease_check PRIVATE src)
 target_compile_features(xmem_section_lease_check PRIVATE cxx_std_17)

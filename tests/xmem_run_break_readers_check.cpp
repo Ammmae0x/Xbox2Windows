@@ -20,7 +20,16 @@
 // `next-break-control` the handler is not held, so it reads break A while A is open: that order passes even when
 // the handler names the breaks wrongly, which shows the hold is what this case depends on.
 //
-// Usage: xmem_run_break_readers_check <xmem.dll built with its test controls> [control|next-break-control]
+// A break that begins while x2w_xmem_stable_call's fn runs (break_during_fn): fn itself starts the unmap, waits until
+// the window is open and queries a page of the run (reserved). stable_call must see the generation change and run fn
+// again under memory.mutex: 2 calls, the last one committed.
+//
+// `default` (X2W_XMEM_SHARED_VIEWS unset): every page has a view of its own, and readers that overlap an unmap
+// answer inside it, without waiting for memory.mutex, as before x2w_xmem_stable_call.
+// `lazy` (X2W_XMEM_SHARED_VIEWS=1, X2W_XMEM_LAZY_COMMIT=1): XMemVirtualQuery and VirtualQueryEx wait for a break
+// with their output buffer in a mapped slot that is not committed yet; the answer reaches it after the break.
+//
+// Usage: xmem_run_break_readers_check <xmem.dll built with its test controls> [control|next-break-control|default|lazy]
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -52,10 +61,11 @@ constexpr SIZE_T neighbour = 2;     // a surviving page of that run, unmapped wh
 
 int failures = 0;
 
-void check(bool ok, const char* name, const char* reader)
+bool check(bool ok, const char* name, const char* reader)
 {
     std::printf("%s: %s %s\n", ok ? "ok" : "check_failed", reader, name);
     if (!ok) ++failures;
+    return ok;
 }
 
 DWORD raw_state(const void* address)
@@ -98,12 +108,14 @@ void window_case(const Shim& shim, unsigned char* base, int index, const char* n
     check(opened, "window_reached", name);
     unsigned char* const target = base + neighbour * page;
     if (opened) check(raw_state(target) != MEM_COMMIT, "window_open_raw_query_not_committed", name);
-    std::atomic<bool> answered{false};
+    std::atomic<bool> started{false}, answered{false};
     bool answer = false;
     std::thread reading([&] {
+        started = true;
         answer = reader(target);
         answered = true;
     });
+    for (int i = 0; i < 10000 && !started.load(); ++i) Sleep(1);  // the 300 ms count from the reader's start
     Sleep(300);
     const bool early = answered.load();
     check(waits ? !early : early, waits ? "reader_waits_for_the_break" : "reader_answers_inside_the_window", name);
@@ -119,6 +131,173 @@ void window_case(const Shim& shim, unsigned char* base, int index, const char* n
     CloseHandle(unmapped);
     CloseHandle(release);
 }
+// fn starts the unmap and waits for the window inside x2w_xmem_stable_call.
+void break_during_fn(const Shim& shim, unsigned char* base)
+{
+    const char* const name = "break_during_fn";
+    SIZE_T count = pages, tokens[pages] = {};
+    if (!shim.allocate(0x20400000, &count, tokens) || count != pages || shim.map(base, pages, tokens) != base) {
+        check(false, "map_run", name);
+        return;
+    }
+    struct Context {
+        const Shim* shim;
+        unsigned char* base;
+        char hold[64];
+        HANDLE unmapped, release;
+        std::thread unmapper, releaser;
+        int calls = 0;
+        DWORD first = 0, last = 0;
+        bool opened = false;
+    } c{&shim, base, {}, nullptr, nullptr};
+    std::snprintf(c.hold, sizeof(c.hold), "x2w-run-break-during-fn-%lu", GetCurrentProcessId());
+    char event_name[96];
+    std::snprintf(event_name, sizeof(event_name), "%s.unmapped", c.hold);
+    c.unmapped = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    std::snprintf(event_name, sizeof(event_name), "%s.release", c.hold);
+    c.release = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    shim.stable_call([](void* context) {
+        auto& c = *static_cast<Context*>(context);
+        if (++c.calls == 1) {
+            SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", c.hold);
+            c.unmapper = std::thread([&c] { c.shim->map(c.base + broken_page * page, 1, nullptr); });
+            c.opened = WaitForSingleObject(c.unmapped, 10000) == WAIT_OBJECT_0;
+            c.first = raw_state(c.base + neighbour * page);
+            c.releaser = std::thread([&c] {  // stable_call waits for memory.mutex until the window is released
+                Sleep(100);
+                SetEvent(c.release);
+            });
+        }
+        c.last = raw_state(c.base + neighbour * page);
+    }, &c);
+    c.unmapper.join();
+    c.releaser.join();
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", nullptr);
+    check(c.opened, "window_reached", name);
+    check(c.first != MEM_COMMIT, "first_call_inside_the_window_not_committed", name);
+    check(c.calls == 2, "fn_ran_again_after_the_break", name);
+    check(c.last == MEM_COMMIT, "answer_after_the_break_committed", name);
+    shim.map(base, broken_page, nullptr);
+    shim.map(base + (broken_page + 1) * page, pages - broken_page - 1, nullptr);
+    shim.release(pages, tokens);
+    CloseHandle(c.unmapped);
+    CloseHandle(c.release);
+}
+
+// Default mode: eight single-page views; the unmap of page 5 is held open while readers query page 2.
+void default_case(const Shim& shim, unsigned char* base)
+{
+    const char* const name = "default";
+    SIZE_T count = pages, tokens[pages] = {};
+    if (!shim.allocate(0x20400000, &count, tokens) || count != pages || shim.map(base, pages, tokens) != base) {
+        check(false, "map", name);
+        return;
+    }
+    unsigned char* const target = base + neighbour * page;
+    MEMORY_BASIC_INFORMATION info{};
+    check(VirtualQuery(target, &info, sizeof(info)) && info.RegionSize == page, "one_view_per_page", name);
+    char hold[64], event_name[96];
+    std::snprintf(hold, sizeof(hold), "x2w-run-break-default-%lu", GetCurrentProcessId());
+    std::snprintf(event_name, sizeof(event_name), "%s.unmapped", hold);
+    HANDLE unmapped = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    std::snprintf(event_name, sizeof(event_name), "%s.release", hold);
+    HANDLE release = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", hold);
+    std::thread unmapper([&] { shim.map(base + broken_page * page, 1, nullptr); });
+    check(WaitForSingleObject(unmapped, 10000) == WAIT_OBJECT_0, "window_reached", name);
+    std::atomic<int> answered{0};
+    DWORD stable = 0, xmem = 0;
+    bool writable = false;
+    std::thread reading([&] {
+        struct Query { unsigned char* target; DWORD state; } query{target, 0};
+        shim.stable_call([](void* context) {
+            auto& q = *static_cast<Query*>(context);
+            q.state = raw_state(q.target);
+        }, &query);
+        stable = query.state;
+        unsigned char buffer[64] = {};
+        if (shim.query(GetCurrentProcess(), target, buffer)) std::memcpy(&xmem, buffer + 0x20, sizeof(xmem));
+        writable = x2w_local::writable(target, 64);
+        answered = 1;
+    });
+    for (int i = 0; i < 300 && !answered.load(); ++i) Sleep(10);
+    check(answered.load() == 1, "readers_answer_inside_the_unmap", name);
+    check(stable == MEM_COMMIT && xmem == MEM_COMMIT && writable, "answers_committed", name);
+    SetEvent(release);
+    reading.join();
+    unmapper.join();
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", nullptr);
+    shim.map(base, broken_page, nullptr);
+    shim.map(base + (broken_page + 1) * page, pages - broken_page - 1, nullptr);
+    shim.release(pages, tokens);
+    CloseHandle(unmapped);
+    CloseHandle(release);
+    std::printf("default mode: readers answer inside an unmap\n");
+}
+
+// Lazy commit: the output buffers lie in a mapped page whose slot is not committed until it is touched.
+void lazy_case(const Shim& shim, unsigned char* base)
+{
+    const char* const name = "lazy";
+    SIZE_T count = pages, tokens[pages] = {}, out_count = 1, out_token = 0;
+    unsigned char* const out = base + 32 * page;
+    if (!shim.allocate(0x20400000, &count, tokens) || count != pages || shim.map(base, pages, tokens) != base ||
+        !shim.allocate(0x20400000, &out_count, &out_token) || shim.map(out, 1, &out_token) != out) {
+        check(false, "map", name);
+        return;
+    }
+    for (SIZE_T i = 0; i < pages; ++i) *reinterpret_cast<std::uint32_t*>(base + i * page) = 0x53000000u + static_cast<std::uint32_t>(i);
+    if (!check(raw_state(out) != MEM_COMMIT, "output_slot_not_committed_yet", name)) return;
+    char hold[64], event_name[96];
+    std::snprintf(hold, sizeof(hold), "x2w-run-break-lazy-%lu", GetCurrentProcessId());
+    std::snprintf(event_name, sizeof(event_name), "%s.unmapped", hold);
+    HANDLE unmapped = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    std::snprintf(event_name, sizeof(event_name), "%s.release", hold);
+    HANDLE release = CreateEventA(nullptr, TRUE, FALSE, event_name);
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", hold);
+    std::thread unmapper([&] { shim.map(base + broken_page * page, 1, nullptr); });
+    check(WaitForSingleObject(unmapped, 10000) == WAIT_OBJECT_0, "window_reached", name);
+    unsigned char* const target = base + neighbour * page;
+    BOOL xmem_ok = FALSE;
+    SIZE_T ex_bytes = 0;
+    auto* const ex_info = reinterpret_cast<MEMORY_BASIC_INFORMATION*>(out + 0x100);
+    std::atomic<int> answered{0};
+    std::thread xmem_reader([&] {
+        xmem_ok = shim.query(GetCurrentProcess(), target, out);
+        ++answered;
+    });
+    std::thread ex_reader([&] {
+        ex_bytes = VirtualQueryEx(GetCurrentProcess(), target, ex_info, sizeof(*ex_info));
+        ++answered;
+    });
+    Sleep(300);
+    check(answered.load() == 0, "readers_wait_for_the_break", name);
+    SetEvent(release);
+    xmem_reader.join();
+    ex_reader.join();
+    unmapper.join();
+    SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_WINDOW", nullptr);
+    // The answers are the state after the break, read back from the slot they were written to. Measured under Wine: a
+    // slot committed lazily (through the slab) still reads as reserved in the title's view, and so does a page of the
+    // view mapped again after the break (its bytes are kept), so compare with a raw query taken now.
+    const DWORD after = raw_state(target);
+    DWORD xmem_state = 0;
+    std::memcpy(&xmem_state, out + 0x20, sizeof(xmem_state));
+    std::printf("lazy: target 0x%lx after the break; XMemVirtualQuery %d 0x%lx; VirtualQueryEx %zu 0x%lx\n",
+                static_cast<unsigned long>(after), xmem_ok, static_cast<unsigned long>(xmem_state),
+                static_cast<std::size_t>(ex_bytes), static_cast<unsigned long>(ex_info->State));
+    check(xmem_ok && xmem_state == after, "XMemVirtualQuery_answer_after_the_break_in_the_lazy_slot", name);
+    check(ex_bytes == sizeof(*ex_info) && ex_info->State == after, "VirtualQueryEx_answer_after_the_break_in_the_lazy_slot", name);
+    check(*reinterpret_cast<std::uint32_t*>(target) == 0x53000000u + neighbour, "neighbour_data_kept", name);
+    shim.map(out, 1, nullptr);
+    shim.release(1, &out_token);
+    shim.map(base, broken_page, nullptr);
+    shim.map(base + (broken_page + 1) * page, pages - broken_page - 1, nullptr);
+    shim.release(pages, tokens);
+    CloseHandle(unmapped);
+    CloseHandle(release);
+}
+
 struct Events {
     char name[64];
     HANDLE first, second;
@@ -203,12 +382,15 @@ int main(int argc, char** argv)
 {
     const bool control = argc > 2 && std::strcmp(argv[2], "control") == 0;
     const bool next_break_control = argc > 2 && std::strcmp(argv[2], "next-break-control") == 0;
-    if (argc < 2 || (argc > 2 && !control && !next_break_control)) {
-        std::printf("usage: xmem_run_break_readers_check <test-controls xmem.dll> [control|next-break-control]\n");
+    const bool default_mode = argc > 2 && std::strcmp(argv[2], "default") == 0;
+    const bool lazy = argc > 2 && std::strcmp(argv[2], "lazy") == 0;
+    if (argc < 2 || (argc > 2 && !control && !next_break_control && !default_mode && !lazy)) {
+        std::printf("usage: xmem_run_break_readers_check <test-controls xmem.dll> [control|next-break-control|default|lazy]\n");
         return 2;
     }
     // The mode is read by the first mapping call; the VirtualQueryEx import is wrapped when xmem.dll loads.
-    SetEnvironmentVariableA("X2W_XMEM_SHARED_VIEWS", "1");
+    SetEnvironmentVariableA("X2W_XMEM_SHARED_VIEWS", default_mode ? nullptr : "1");
+    if (lazy) SetEnvironmentVariableA("X2W_XMEM_LAZY_COMMIT", "1");
     const HMODULE xmem = LoadLibraryA(argv[1]);
     if (!xmem) {
         std::printf("check_failed: load (error %lu)\n", GetLastError());
@@ -230,8 +412,10 @@ int main(int argc, char** argv)
         return 1;
     }
     unsigned char* const at = base + page;
-    if (next_break_control) {
-        next_break_case(shim, at, false);
+    if (next_break_control || default_mode || lazy) {
+        if (next_break_control) next_break_case(shim, at, false);
+        if (default_mode) default_case(shim, at);
+        if (lazy) lazy_case(shim, at);
         VirtualFree(base, 0, MEM_RELEASE);
         std::printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
         return failures ? 1 : 0;
@@ -270,7 +454,10 @@ int main(int argc, char** argv)
         const auto snapshot = x2w_startup::snapshot_samplers({reinterpret_cast<std::uintptr_t>(target), 4}, false);
         return snapshot.count == 4 && snapshot.readable.count() == 4 && snapshot.words[0][0] == 0x51000000u + neighbour;
     });
-    if (!control) next_break_case(shim, at, true);
+    if (!control) {
+        next_break_case(shim, at, true);
+        break_during_fn(shim, at);
+    }
     VirtualFree(base, 0, MEM_RELEASE);
     std::printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
     return failures ? 1 : 0;

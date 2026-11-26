@@ -107,19 +107,24 @@ extern "C" void XMemFree(void* allocation, ULONGLONG attributes)
 extern "C" BOOL WINAPI x2w_xmem_stable_call(void (*fn)(void*), void* context);
 
 // The answer for a page of a shared-view run is taken outside a run break (x2w_xmem_stable_call): inside one the
-// page would read as reserved.
+// page would read as reserved. era_query writes a copy of the caller's buffer, which goes back after the call: on
+// stable_call's mutex path the lazy-commit handler passes faults on, so an uncommitted mapped slot is not written
+// there.
 extern "C" BOOL XMemVirtualQuery(HANDLE process, LPCVOID address, void* buffer)
 {
     struct Query {
         HANDLE process;
         LPCVOID address;
-        void* buffer;
+        unsigned char* buffer;
+        unsigned char copy[query_buffer_bytes];
         std::size_t result;
-    } query{process, address, buffer, 0};
+    } query{process, address, static_cast<unsigned char*>(buffer), {}, 0};
+    if (query.buffer) std::memcpy(query.copy, query.buffer, query_buffer_bytes);
     x2w_xmem_stable_call([](void* context) {
         auto& q = *static_cast<Query*>(context);
-        q.result = era_query::query(q.process, q.address, q.buffer, query_buffer_bytes);
+        q.result = era_query::query(q.process, q.address, q.buffer ? q.copy : nullptr, query_buffer_bytes);
     }, &query);
+    if (query.buffer) std::memcpy(query.buffer, query.copy, query_buffer_bytes);
     return query.result != 0;
 }
 

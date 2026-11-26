@@ -128,7 +128,12 @@ inline bool measure_placed_buffer(const void* address, std::uint64_t width, Plac
                                   PlacedProof proof = PlacedProof::exact)
 {
     bool committed = false;
-    x2w_local::outside_run_breaks([&] { committed = placed_detail::measure_once(address, width, out, proof); });
+    unsigned queries = 0;  // over every pass: a pass run again after a break replaces out
+    x2w_local::outside_run_breaks([&] {
+        committed = placed_detail::measure_once(address, width, out, proof);
+        queries += out.queries;
+    });
+    out.queries = queries;
     return committed;
 }
 

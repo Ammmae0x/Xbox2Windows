@@ -490,6 +490,10 @@ struct RemapWindow {
     ULONG64 generation = 0;
 };
 RemapWindow remap_window;
+// Set once shared views are on (FaultRetry::ready). Breaks also begin without them (every unmap counts in the
+// generation), but then a page has a view of its own and no break takes a neighbour away, so x2w_xmem_stable_call
+// does not wait for them.
+std::atomic<bool> shared_views_on{false};
 
 void begin_break(const std::map<ULONG_PTR, SIZE_T>& broken)
 {
@@ -576,7 +580,9 @@ struct MappingThread {
 
 // Shared views are opt-in: X2W_XMEM_SHARED_VIEWS=1, read once by the first mapping call. Without
 // it every page has a view of its own, as before: unmapping a page never takes a neighbour away,
-// no handler is registered, and the module unloads like any DLL.
+// no handler is registered, and the module unloads like any DLL. The switch is also read once when
+// xmem.dll loads (virtual_query_ex_wrapped): with it set then, the main module's VirtualQueryEx imports
+// are wrapped, and the module is pinned at load when one is.
 //
 // With it, the first mapping call registers the handler and pins the module. The handler is
 // process-wide and Windows offers no way to remove one that also waits for every dispatch already
@@ -614,6 +620,7 @@ struct FaultRetry {
                 x2w_local::logf("x2w-xmem shared views are off: the fault handler could not be set up (error %lu)", GetLastError());
         }
         const bool result = guaranteed;
+        if (result) shared_views_on.store(true, std::memory_order_release);
         ReleaseSRWLockExclusive(&lock);
         return result;
     }
@@ -1614,16 +1621,17 @@ extern "C" BOOL WINAPI x2w_xmem_page_stats(ULONGLONG* live_sections)
 // query (VirtualQuery) or a kernel copy (ReadProcessMemory) does not fault: inside the break it reports the pages
 // as reserved, or fails. fn must be a query, or a copy into the caller's memory, that can simply run again, and
 // must not take memory.mutex or call the mapping exports.
-// fn runs once when no break begins or ends around it (the break generation is even before and unchanged
-// after): every call without X2W_XMEM_SHARED_VIEWS, where no break ever begins, and nearly every call with it.
-// Otherwise it runs again under memory.mutex, so after the break. A thread that holds memory.mutex runs it directly.
+// Without shared views (X2W_XMEM_SHARED_VIEWS unset, or no mapping call yet) fn runs once, directly: every page has
+// a view of its own, so no break takes a page away from a reader. With them fn runs once when no break begins or
+// ends around it (the break generation is even before and unchanged after), which is nearly every call; otherwise
+// it runs again under memory.mutex, so after the break. A thread that holds memory.mutex runs it directly.
 extern "C" BOOL WINAPI x2w_xmem_stable_call(void (*fn)(void*), void* context)
 {
     if (!fn) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    if (mapping_thread) {
+    if (mapping_thread || !shared_views_on.load(std::memory_order_acquire)) {
         fn(context);
         return TRUE;
     }
@@ -1884,18 +1892,26 @@ const bool lazy_commit_installed = [] {
 using VirtualQueryExFn = SIZE_T(WINAPI*)(HANDLE, LPCVOID, PMEMORY_BASIC_INFORMATION, SIZE_T);
 VirtualQueryExFn real_virtual_query_ex;
 
+// The answer goes to a local buffer and is copied to the caller's after x2w_xmem_stable_call: on its mutex path the
+// lazy-commit handler passes faults on (MappingThread), so a write into an uncommitted mapped slot would not be
+// committed there.
 SIZE_T WINAPI virtual_query_ex_stable(HANDLE process, LPCVOID address, PMEMORY_BASIC_INFORMATION info, SIZE_T bytes)
 {
+    if (!info || bytes < sizeof(MEMORY_BASIC_INFORMATION)) return real_virtual_query_ex(process, address, info, bytes);
     struct Query {
         HANDLE process;
         LPCVOID address;
-        PMEMORY_BASIC_INFORMATION info;
-        SIZE_T bytes, result;
-    } query{process, address, info, bytes, 0};
+        MEMORY_BASIC_INFORMATION info;
+        SIZE_T result;
+        DWORD error;
+    } query{process, address, {}, 0, ERROR_SUCCESS};
     x2w_xmem_stable_call([](void* context) {
         auto& q = *static_cast<Query*>(context);
-        q.result = real_virtual_query_ex(q.process, q.address, q.info, q.bytes);
+        q.result = real_virtual_query_ex(q.process, q.address, &q.info, sizeof(q.info));
+        q.error = GetLastError();
     }, &query);
+    if (query.result) std::memcpy(info, &query.info, query.result);
+    SetLastError(query.error);
     return query.result;
 }
 
@@ -1907,7 +1923,10 @@ const int virtual_query_ex_wrapped = [] {
     HMODULE self = nullptr;
     if (queries && !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                                        reinterpret_cast<LPCWSTR>(&virtual_query_ex_stable), &self)) {
-        patch_main_import("VirtualQueryEx", reinterpret_cast<const void*>(real_virtual_query_ex));
+        const DWORD error = GetLastError();
+        const int restored = patch_main_import("VirtualQueryEx", reinterpret_cast<const void*>(real_virtual_query_ex));
+        x2w_local::logf("x2w-xmem shared views (X2W_XMEM_SHARED_VIEWS): xmem.dll could not be pinned (error %lu); "
+                        "%d of %d VirtualQueryEx import(s) restored", static_cast<unsigned long>(error), restored, queries);
         queries = 0;
     }
     x2w_local::logf("x2w-xmem shared views (X2W_XMEM_SHARED_VIEWS): %d VirtualQueryEx import(s) answer outside run breaks",
