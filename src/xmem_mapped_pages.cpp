@@ -1131,19 +1131,61 @@ struct AliasEdit {
 using AliasPlan = std::map<ULONG_PTR, AliasEdit>;
 using ViewRuns = std::map<ULONG_PTR, SIZE_T>;
 
+// The region query exposes the placeholder reservation flag in Flags even though the SDK does not name that bit.
+constexpr ULONG placeholder_reservation = 0x100;
+
+// Measured once: whether the region query reports placeholder_reservation for a fresh placeholder, and, when it does
+// not, whether VirtualFree(MEM_PRESERVE_PLACEHOLDER) refuses a plain reservation and leaves it whole. Windows reports
+// the bit. Wine (Proton Experimental, 2026-11) leaves Flags 0 for placeholders but refuses the plain case with
+// ERROR_INVALID_ADDRESS. X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK=1 skips the second probe (tests only).
+bool placeholder_fallback()
+{
+    static const bool fallback = [] {
+        bool bit_reported = false, refuses_plain = false;
+        if (void* probe = VirtualAlloc2(GetCurrentProcess(), nullptr, 2 * page_bytes,
+                                        MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0)) {
+            WIN32_MEMORY_REGION_INFORMATION info{};
+            bit_reported = QueryVirtualMemoryInformation(GetCurrentProcess(), probe, MemoryRegionInfo, &info,
+                                                         sizeof(info), nullptr) &&
+                           (info.Flags & placeholder_reservation);
+            VirtualFree(probe, 0, MEM_RELEASE);
+        }
+        if (!bit_reported && !x2w_local::env_on("X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK")) {
+            if (auto* plain = static_cast<BYTE*>(VirtualAlloc(nullptr, 2 * page_bytes, MEM_RESERVE, PAGE_NOACCESS))) {
+                MEMORY_BASIC_INFORMATION after{};
+                refuses_plain = !VirtualFree(plain + page_bytes, page_bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
+                                VirtualQuery(plain, &after, sizeof(after)) == sizeof(after) &&
+                                after.State == MEM_RESERVE && after.AllocationBase == plain &&
+                                after.RegionSize == 2 * page_bytes;
+                VirtualFree(plain, 0, MEM_RELEASE);
+            }
+        }
+        x2w_local::logf("x2w-xmem placeholder bit reported=%d, plain reservation kept by a placeholder release=%d",
+                        bit_reported, refuses_plain);
+        return !bit_reported && refuses_plain;
+    }();
+    return fallback;
+}
+
 bool alias_placeholders(ULONG_PTR address, SIZE_T bytes)
 {
-    // The region query exposes the placeholder reservation flag in Flags even though the
-    // SDK does not name that bit. VirtualQuery alone cannot distinguish a reserved private
-    // allocation from a placeholder. PRESERVE_PLACEHOLDER can silently release that allocation.
-    constexpr ULONG placeholder_reservation = 0x100;
+    // VirtualQuery alone cannot distinguish a reserved private allocation from a placeholder, and on Windows
+    // PRESERVE_PLACEHOLDER can silently release that allocation. Where the region query does not report the bit
+    // and the OS refuses that release (placeholder_fallback), any reserved region may be offered: a plain one
+    // fails the split instead of being released.
+    const bool fallback = placeholder_fallback();
     const auto end = address + bytes;
     while (address < end) {
         WIN32_MEMORY_REGION_INFORMATION info{};
         if (!QueryVirtualMemoryInformation(GetCurrentProcess(), reinterpret_cast<void*>(address),
-                                           MemoryRegionInfo, &info, sizeof(info), nullptr) ||
-            !(info.Flags & placeholder_reservation))
+                                           MemoryRegionInfo, &info, sizeof(info), nullptr))
             return false;
+        if (!(info.Flags & placeholder_reservation)) {
+            MEMORY_BASIC_INFORMATION region{};
+            if (!fallback || VirtualQuery(reinterpret_cast<void*>(address), &region, sizeof(region)) != sizeof(region) ||
+                region.State != MEM_RESERVE)
+                return false;
+        }
         const auto base = reinterpret_cast<ULONG_PTR>(info.AllocationBase);
         if (address - base >= info.RegionSize) return false;
         address += info.RegionSize - (address - base);
