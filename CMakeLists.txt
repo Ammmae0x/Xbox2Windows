@@ -339,6 +339,21 @@ foreach(adapter warp hardware)
   add_test(NAME xmem_section_lease_vertex_${adapter} COMMAND xmem_section_lease_check ${adapter} "$<TARGET_FILE:xmem_shim>" vertex)
   set_tests_properties(xmem_section_lease_vertex_${adapter} xmem_section_lease_mesh_${adapter} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 endforeach()
+# Slot 31 placeholder split inside an XMem reservation. The control disables the fallback used where the OS does
+# not report placeholders (Wine), so the split fails there; where the OS reports them, the control skips (77).
+add_executable(xmem_placeholder_split_check tests/xmem_placeholder_split_check.cpp)
+target_include_directories(xmem_placeholder_split_check PRIVATE src)
+target_compile_features(xmem_placeholder_split_check PRIVATE cxx_std_17)
+target_link_libraries(xmem_placeholder_split_check PRIVATE OneCore)
+add_dependencies(xmem_placeholder_split_check xmem_shim)
+set(xmem_placeholder_env "X2W_XMEM_PERMISSIVE=1;X2W_XMEM_GPU_MIRROR=0;X2W_XMEM_LAZY_COMMIT=0;X2W_XMEM_SHARED_VIEWS=0")
+add_test(NAME xmem_placeholder_split COMMAND xmem_placeholder_split_check "$<TARGET_FILE:xmem_shim>")
+set_tests_properties(xmem_placeholder_split PROPERTIES TIMEOUT 60 ENVIRONMENT "${xmem_placeholder_env}")
+# The control passes only when the split itself fails, not on an earlier setup failure.
+add_test(NAME xmem_placeholder_split_control COMMAND xmem_placeholder_split_check "$<TARGET_FILE:xmem_shim>" control)
+set_tests_properties(xmem_placeholder_split_control PROPERTIES
+    ENVIRONMENT "${xmem_placeholder_env};X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK=1"
+    PASS_REGULAR_EXPRESSION "FAIL: map two pool pages into the middle of the reservation" SKIP_RETURN_CODE 77 TIMEOUT 60)
 add_executable(xmem_startup_below_40_check tests/xmem_startup_below_40_check.cpp)
 target_link_libraries(xmem_startup_below_40_check PRIVATE OneCore)
 target_compile_features(xmem_startup_below_40_check PRIVATE cxx_std_17)
