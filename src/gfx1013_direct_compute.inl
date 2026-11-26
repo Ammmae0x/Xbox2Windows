@@ -1,0 +1,1779 @@
+// Lower the shared decoded CFG to DXIL operations. A scalar register holds one
+// 32-bit word per wave. Vector destinations retain their old value on inactive lanes.
+struct DirectCompute {
+    Emit &analysis;
+    DxilModule ir;
+    std::set<unsigned> allocated;
+    string lane, lane_bit, half_index, upper_half, exchange_base;
+    unsigned exchange_words = 0;
+    bool uses_exchange = false;
+    bool wave64 = false;
+    std::vector<bool> scc_live;
+    unsigned label_number = 0;
+    bool pixel_stage = false;
+    // Straight-line graphics stages keep exact SSA definitions; a missing
+    // entry value is resolved through the container's stage signature.
+    std::function<string(unsigned)> graphics_input;
+    std::function<void(unsigned)> after_graphics_write;
+    std::map<unsigned, string> graphics_registers;
+    string graphics_predicate;
+    unsigned graphics_pc = 0;
+    bool perspective_center_pair = false;
+    bool exact_pixel_entry = false;
+    bool helper_result_unobserved = false;
+    unsigned pixel_entry_vgprs = 0;
+    std::function<bool(unsigned)> untouched_pixel_register;
+    // P1/P2 consume the entry IJ pair symbolically. After an exact-mask
+    // write, covered lanes can use the replacement. Materialize the entry
+    // barycentric only when an observer can also see the unmodified lanes.
+    std::map<unsigned, std::pair<string, string>> guarded_ij;
+    string materialize_ij(unsigned r) {
+        auto [predicate, updated] = guarded_ij.at(r);
+        auto value = select(predicate, updated, graphics_input(r));
+        graphics_registers[r] = value;
+        guarded_ij.erase(r);
+        return value;
+    }
+    string address(unsigned r) {
+        const auto name = "%r" + to_string(r);
+        if (allocated.insert(r).second)
+            ir.setup << "  " << name << " = alloca i32, align 4\n";
+        return name;
+    }
+    string read(unsigned r) {
+        if (graphics_input) {
+            auto guarded = guarded_ij.find(r);
+            if (guarded != guarded_ij.end())
+                return guarded->second.first == graphics_predicate ? guarded->second.second : materialize_ij(r);
+            auto found = graphics_registers.find(r);
+            if (found != graphics_registers.end()) {
+                if (found->second.empty())
+                    refuse(graphics_pc, "graphics register undefined on an incoming path: " + to_string(r));
+                return found->second;
+            }
+            auto value = graphics_input(r);
+            graphics_registers.emplace(r, value);
+            return value;
+        }
+        return ir.value("load i32, i32* " + address(r) + ", align 4");
+    }
+    void write(unsigned r, const string &value) {
+        if (graphics_input) {
+            guarded_ij.erase(r);
+            graphics_registers[r] = value;
+            after_graphics_write(r);
+            return;
+        }
+        const auto ptr = address(r);
+        ir.body << "  store i32 " << value << ", i32* " << ptr << ", align 4\n";
+    }
+    string cmp(const string &predicate, const string &a, const string &b) {
+        return ir.value("icmp " + predicate + " i32 " + a + ", " + b);
+    }
+    string select(const string &predicate, const string &yes, const string &no) {
+        return ir.value("select i1 " + predicate + ", i32 " + yes + ", i32 " + no);
+    }
+    string active() {
+        if (graphics_input)
+            return "true";
+        return cmp("ne", ir.binary("and", wave64 ? select(upper_half, read(127), read(126)) : read(126), lane_bit), "0");
+    }
+    void vector_write(unsigned r, const string &value) {
+        if (graphics_input && graphics_predicate.empty())
+            write(r, value);
+        else if (perspective_center_pair && (r == 256 || r == 257) &&
+                 (!graphics_registers.count(r) || (guarded_ij.count(r) && guarded_ij.at(r).first == graphics_predicate))) {
+            write(r, {});
+            guarded_ij.emplace(r, std::make_pair(graphics_predicate, value));
+        } else if (exact_pixel_entry && helper_result_unobserved && pixel_entry_vgprs && r >= 256 + pixel_entry_vgprs &&
+                   !graphics_registers.count(r) && untouched_pixel_register(r)) {
+            // Only covered lanes can observe this result. In particular no
+            // subsequent implicit LOD or quad operation can inspect helpers.
+            write(r, value);
+        } else
+            write(r, select(graphics_input ? graphics_predicate : active(), value, read(r)));
+    }
+    string operand32(const Inst &i, unsigned n) {
+        if (graphics_input && n == 106)
+            refuse(i.pc, "graphics instruction consumes a full wave mask");
+        if (n <= 106 || n == 126 || n == 127 || (wave64 && n == 107) || (n >= 256 && n < 512)) {
+            analysis.require_numeric(i, n);
+            return read(n);
+        }
+        if (n == 253)
+            return read(128); // internal slot for SCC
+        if (n == 255)
+            return to_string(i.literal);
+        if (n >= 128 && n <= 192)
+            return to_string(n - 128);
+        if (n >= 193 && n <= 208)
+            return to_string(Word(192) - n);
+        constexpr Word floats[]{0x3f000000, 0xbf000000, 0x3f800000, 0xbf800000, 0x40000000,
+                                0xc0000000, 0x40800000, 0xc0800000, 0x3e22f983};
+        if (n >= 240 && n <= 248)
+            return to_string(floats[n - 240]);
+        refuse(i.pc, "direct DXIL operand encoding");
+    }
+    string ballot(const string &pred) {
+        ir.uses_wave = true;
+        auto b = ir.invoke("%dx.types.fouri32", "waveActiveBallot", 116, {{"i1", pred}}, "nounwind");
+        return ir.value("extractvalue %dx.types.fouri32 " + b + ", 0");
+    }
+    string group_intrinsic(const string &name, unsigned opcode, unsigned axis) {
+        return ir.invoke("i32", name, opcode, {{"i32", to_string(axis)}}, "nounwind readnone");
+    }
+    string shared_address(const string &name, unsigned words, const string &index) {
+        const string type = "[" + to_string(words) + " x i32]";
+        return ir.value("getelementptr " + type + ", " + type + " addrspace(3)* @" + name + ", i32 0, i32 " + index);
+    }
+    void barrier(unsigned mode = 9) {
+        ir.invoke("void", "barrier", 80, {{"i32", to_string(mode)}}, "nounwind noduplicate");
+    }
+    // Each guest wave owns two scratch words. Multi-wave groups that use
+    // exchange must reach these workgroup barriers in the same order.
+    std::array<string, 2> exchange_halves(const string &word) {
+        const auto tag = to_string(label_number++);
+        if (!uses_exchange) {
+            ir.globals << "@waveExchange = internal addrspace(3) global [" << exchange_words << " x i32] undef, align 4\n";
+            uses_exchange = true;
+        }
+        auto ptr = shared_address("waveExchange", exchange_words, half_index);
+        auto first = cmp("eq", lane, "0");
+        ir.body << "  br i1 " << first << ", label %publish" << tag << ", label %published" << tag
+                << "\npublish" << tag << ":\n  store i32 " << word << ", i32 addrspace(3)* " << ptr
+                << ", align 4\n  br label %published" << tag << "\npublished" << tag << ":\n";
+        barrier();
+        std::array<string, 2> pair;
+        for (unsigned j = 0; j != 2; ++j)
+            pair[j] = ir.value("load i32, i32 addrspace(3)* " + shared_address("waveExchange", exchange_words, ir.binary("add", exchange_base, to_string(j))) + ", align 4");
+        barrier();
+        return pair;
+    }
+    void write_ballot(unsigned dst, const string &condition) {
+        auto mask = ballot(ir.value("and i1 " + active() + ", " + condition));
+        if (wave64) {
+            if ((dst & 1) || (dst > 104 && dst != 106 && dst != 126))
+                throw UnsupportedComputeShader("invalid wave64 mask destination");
+            auto pair = exchange_halves(mask);
+            write(dst, pair[0]);
+            write(dst + 1, pair[1]);
+        } else
+            write(dst, mask);
+    }
+    string pair_high(const Inst &i, unsigned src) {
+        if (src <= 104 || src == 106 || src == 126) {
+            if (src & 1) refuse(i.pc, "unaligned scalar mask pair");
+            return operand32(i, src + 1);
+        }
+        if ((src >= 128 && src <= 192) || src == 255) return "0";
+        if (src >= 193 && src <= 208) return "4294967295";
+        refuse(i.pc, "unsupported wave64 scalar pair");
+    }
+    void initialize(unsigned user, unsigned flags, unsigned x, unsigned y, unsigned z) {
+        unsigned threads = x * y * z;
+        lane = ir.invoke("i32", "waveGetLaneIndex", 111, {}, "nounwind readnone");
+        lane_bit = ir.binary("shl", "1", lane);
+        write(126, ballot("true"));
+        if (!wave64)
+            write(127, "0");
+        string wave = "0";
+        if (threads > 32) {
+            auto flat = ir.invoke("i32", "flattenedThreadIdInGroup.i32", 96, {}, "nounwind readnone");
+            auto first =
+                ir.invoke("i32", "waveActiveOp.i32", 119, {{"i32", flat}, {"i8", "2"}, {"i8", "1"}}, "nounwind");
+            if (threads == 64)
+                wave = ir.value("zext i1 " + cmp("ne", first, "0") + " to i32");
+            else {
+                ir.globals << "@waveStarts = internal addrspace(3) global [" << threads << " x i32] undef, align 4\n";
+                auto ptr = shared_address("waveStarts", threads, flat);
+                auto leader = ir.value("zext i1 " + cmp("eq", first, flat) + " to i32");
+                ir.body << "  store i32 " << leader << ", i32 addrspace(3)* " << ptr << ", align 4\n";
+                barrier();
+                ir.body << "  br label %rankLoop\nrankLoop:\n  %idx = phi i32 [0, %entry], [%step, %count]\n"
+                           "  %rank = phi i32 [0, %entry], [%sum, %count]\n";
+                auto more = cmp("ult", "%idx", first);
+                ir.body << "  br i1 " << more << ", label %count, label %rankDone\ncount:\n";
+                auto addr = shared_address("waveStarts", threads, "%idx");
+                auto flag = ir.value("load i32, i32 addrspace(3)* " + addr + ", align 4");
+                ir.body << "  %sum = add i32 %rank, " << flag
+                        << "\n  %step = add i32 %idx, 1\n  br label %rankLoop\nrankDone:\n";
+                wave = "%rank";
+            }
+        }
+        if (wave64) {
+            exchange_words = threads / 32;
+            half_index = wave;
+            exchange_base = ir.binary("and", wave, "4294967294");
+            upper_half = cmp("ne", ir.binary("and", wave, "1"), "0");
+            write(127, "4294967295");
+        }
+        auto logical = ir.binary("add", ir.binary("mul", wave, "32"), lane);
+        write(256, ir.binary("urem", logical, to_string(x)));
+        if (((flags >> 11) & 3) >= 1)
+            write(257, ir.binary("urem", ir.binary("udiv", logical, to_string(x)), to_string(y)));
+        if (((flags >> 11) & 3) >= 2)
+            write(258, ir.binary("udiv", logical, to_string(x * y)));
+        for (unsigned j = 0; j < 3; ++j)
+            if (flags & (128u << j))
+                write(user++, group_intrinsic("groupId.i32", 94, j));
+        if (flags & 1024) {
+            if (wave64) wave = ir.binary("lshr", wave, "1");
+            auto info = ir.binary("or", ir.binary("shl", wave, "20"), to_string(wave64 ? threads / 64 : (threads + 31) / 32));
+            write(user, ir.binary("or", info, select(cmp("eq", wave, "0"), "2147483648", "0")));
+        }
+        initialize_constants();
+    }
+    void initialize_constants(const GraphicsConstantLayout *linked = nullptr) {
+        unsigned words = 0;
+        for (const auto &block : analysis.result.constants)
+            words += block.count;
+        if (words) {
+            if (linked)
+                words = linked->offset(static_cast<unsigned>(linked->counts.size()));
+            auto h = ir.handle({2, 0, 13, 0, 0, (words + 3) / 4 * 16});
+            unsigned pos = 0;
+            std::map<unsigned, string> vectors;
+            for (const auto &block : analysis.result.constants) {
+                if (linked)
+                    pos = linked->offset(block.root_parameter);
+                for (unsigned j = 0; j < block.count; ++j, ++pos) {
+                    auto &vec = vectors[pos / 4];
+                    if (vec.empty())
+                        vec = ir.invoke("%dx.types.CBufRet.i32", "cbufferLoadLegacy.i32", 59,
+                                        {{"%dx.types.Handle", h}, {"i32", to_string(pos / 4)}}, "nounwind readonly");
+                    write(block.first_sgpr + j,
+                          ir.value("extractvalue %dx.types.CBufRet.i32 " + vec + ", " + to_string(pos % 4)));
+                }
+            }
+        }
+    }
+    string resource(const Inst &i, const State &s, unsigned base, ComputeViewKind kind, unsigned bytes,
+                    unsigned *bound_register = nullptr) {
+        const auto &symbol = s.at(base);
+        const bool indexed = symbol.type == Symbol::Type::indexed_descriptor;
+        const unsigned count = indexed ? 1 + symbol.index_mask / 32 : 1;
+        analysis.binding(i, s, base, 4, kind, bytes);
+        auto it = std::find_if(analysis.result.bindings.begin(), analysis.result.bindings.end(), [&](const auto &b) {
+            return !b.array_position && b.array_count == count && b.kind == kind && b.root_parameter == s[base].value &&
+                   b.byte_offset == s[base].offset;
+        });
+        if (it == analysis.result.bindings.end())
+            throw std::logic_error("missing direct binding");
+        if (bound_register) *bound_register = it->shader_register;
+        const bool raw = kind == ComputeViewKind::raw_buffer_uav || kind == ComputeViewKind::buffer_srv ||
+                         kind == ComputeViewKind::raw_vector_srv || kind == ComputeViewKind::byte_window_srv ||
+                         kind == ComputeViewKind::indexed_atomic_uav;
+        const bool half = kind == ComputeViewKind::half_buffer_uav;
+        const unsigned width = kind == ComputeViewKind::typed_buffer_srv ? 4 : bytes / (half ? 2 : 4);
+        if (raw)
+            ir.features |= 16;
+        return ir.handle({unsigned(compute_uav(kind)), it->shader_register, raw ? 11u : 10u,
+                          raw    ? 0u
+                          : half ? 9u
+                                 : 5u,
+                          raw ? 0u : width, 0, count},
+                         indexed && count > 1 ? read(base) : "");
+    }
+    string load_buffer(const string &h, const string &addr, bool raw, unsigned count) {
+        using Arg = std::pair<string, string>;
+        std::vector<Arg> args{{"%dx.types.Handle", h}, {"i32", addr}, {"i32", "undef"}};
+        if (raw) {
+            args.emplace_back("i8", to_string((1u << count) - 1));
+            args.emplace_back("i32", "4");
+        }
+        return ir.invoke("%dx.types.ResRet.i32", raw ? "rawBufferLoad.i32" : "bufferLoad.i32", raw ? 139 : 68, args,
+                         "nounwind readonly");
+    }
+    void buffer_atomic(const Inst &i, const State &s) {
+        // The operation set and VGPR ordering follow gfx2hlsl.MUBUF_ATOMIC_OPS.
+        static const std::map<Name, unsigned> operations{
+            {"buffer_atomic_add", 0},  {"buffer_atomic_sub", 0},  {"buffer_atomic_and", 1},  {"buffer_atomic_or", 2},
+            {"buffer_atomic_xor", 3},  {"buffer_atomic_smin", 4}, {"buffer_atomic_smax", 5}, {"buffer_atomic_umin", 6},
+            {"buffer_atomic_umax", 7}, {"buffer_atomic_swap", 8}};
+        const bool exchange = i.name == "buffer_atomic_cmpswap";
+        const auto op = operations.find(i.name);
+        if ((!exchange && op == operations.end()) || (exchange && i.dst == 255))
+            refuse(i.pc, "unsupported buffer atomic width or operation");
+        const unsigned data = 256 + i.dst;
+        const bool indexed = (i.a & 0x2000) != 0;
+        unsigned reg;
+        auto h = resource(i, s, ((i.b >> 16) & 31) * 4,
+                          indexed ? ComputeViewKind::indexed_atomic_uav : ComputeViewKind::raw_buffer_uav, 4, &reg);
+        string address, in_range;
+        if (indexed) {
+            // b(1 + uav register) is filled from the exact recorded buffer view.
+            // Test the element count before multiplication to reject wrapped indices.
+            auto cb = ir.handle({2, reg + 1, 13, 0, 0, 16});
+            auto shape = ir.invoke("%dx.types.CBufRet.i32", "cbufferLoadLegacy.i32", 59,
+                                   {{"%dx.types.Handle", cb}, {"i32", "0"}}, "nounwind readonly");
+            auto stride = ir.value("extractvalue %dx.types.CBufRet.i32 " + shape + ", 0");
+            auto count = ir.value("extractvalue %dx.types.CBufRet.i32 " + shape + ", 1");
+            auto index = read(256 + (i.b & 255));
+            in_range = cmp("ult", index, count);
+            address = ir.binary("mul", index, stride);
+        } else {
+            address = ir.binary("add", operand32(i, i.b >> 24), to_string(i.a & 4095));
+            if (i.a & 0x1000)
+                address = ir.binary("add", address, read(256 + (i.b & 255)));
+        }
+        address = ir.binary("and", address, "4294967292");
+        auto value = read(data);
+        if (i.name == "buffer_atomic_sub")
+            value = ir.binary("sub", "0", value);
+        std::vector<std::pair<string, string>> args{{"%dx.types.Handle", h}};
+        if (!exchange)
+            args.emplace_back("i32", to_string(op->second));
+        args.emplace_back("i32", address);
+        args.emplace_back("i32", "undef");
+        args.emplace_back("i32", "undef");
+        if (exchange)
+            args.emplace_back("i32", read(data + 1));
+        args.emplace_back("i32", value);
+        auto tag = to_string(label_number++), pred = active();
+        if (indexed) {
+            if (i.a & 0x4000) {
+                auto out_of_range = ir.value("and i1 " + pred + ", " + ir.value("xor i1 " + in_range + ", true"));
+                write(data, select(out_of_range, "0", read(data)));
+            }
+            pred = ir.value("and i1 " + pred + ", " + in_range);
+        }
+        ir.body << "  br i1 " << pred << ", label %atomic" << tag << ", label %atomicEnd" << tag << "\natomic" << tag
+                << ":\n";
+        auto previous = ir.invoke("i32", exchange ? "atomicCompareExchange.i32" : "atomicBinOp.i32", exchange ? 79 : 78,
+                                  args, "nounwind");
+        if (i.a & 0x4000)
+            write(data, previous);
+        ir.body << "  br label %atomicEnd" << tag << "\natomicEnd" << tag << ":\n";
+    }
+    #include "gfx1013_compute_mtbuf.inl"
+
+    void memory(const Inst &i, const State &s) {
+        if (i.enc == Encoding::Mubuf && i.name.substr(0, 8) == "tbuffer_") {
+            formatted_byte_load(i, s);
+            return;
+        }
+        if (i.enc == Encoding::Mubuf && i.name.substr(0, 14) == "buffer_atomic_") {
+            buffer_atomic(i, s);
+            return;
+        }
+        if (i.enc == Encoding::Smem) {
+            unsigned so = i.b >> 25;
+            const auto &low = s.at(i.src[0]);
+            const bool root = low.type == Symbol::Type::root_address;
+            if (i.op < 8 && !root) {
+                if (low.type == Symbol::Type::table && low.value == compute_resource_heap)
+                    refuse(i.pc, "direct resource-heap load requires the selected GPU slot and its view type");
+                if (s.at(i.src[0]).type != Symbol::Type::table ||
+                    s.at(i.src[0] + 1).type != Symbol::Type::constant || s.at(i.src[0] + 1).value != 0)
+                    refuse(i.pc, "direct descriptor address outside bound table");
+                if (so != 125) {
+                    if (i.op != 2 || so > 105)
+                        refuse(i.pc, "direct indexed descriptor load shape");
+                    auto index = ir.binary("lshr", operand32(i, so), "5");
+                    for (unsigned j = 0; j < 4; ++j)
+                        write(i.dst + j, index);
+                }
+                return; // The CFG transfer already associated every destination word with its table slot.
+            }
+            unsigned off = i.b & 0xfffff, n = memory_count(i);
+            string h;
+            if (root) {
+                const Symbol high{Symbol::Type::root_address, low.value, 1};
+                if (low.offset || !(s.at(i.src[0] + 1) == high))
+                    refuse(i.pc, "mismatched root address high half");
+                // Like Victory's Source::Built, retain the root identity through
+                // SGPR copies. Scalar buffer loads read dwords at byte offsets.
+                // Accept a finite byte bound or the unbounded NUM_RECORDS form
+                // only for this verified zero-stride, byte-address V# layout.
+                const bool built = i.op >= 8;
+                if (built && (s.at(i.src[0] + 2).type != Symbol::Type::constant ||
+                              !(s.at(i.src[0] + 3) == Symbol{Symbol::Type::constant, 0x31016fac})))
+                    refuse(i.pc, "unsupported synthesized scalar buffer descriptor fields");
+                unsigned span = off + 4 * n;
+                if (off % 4 || span > 65536 || i.dst + n > 106)
+                    refuse(i.pc, "unsupported root descriptor load range");
+                if (so != 125) {
+                    const auto &index = s.at(so);
+                    if ((index.type != Symbol::Type::masked && index.type != Symbol::Type::constant) ||
+                        (index.value & 3) || index.value > 65536 - span)
+                        refuse(i.pc, "unbounded or unaligned root descriptor index");
+                    span += index.value;
+                }
+                if (built && span > s.at(i.src[0] + 2).value)
+                    refuse(i.pc, "scalar load exceeds synthesized descriptor byte bound");
+                auto &bindings = analysis.result.bindings;
+                auto binding = std::find_if(bindings.begin(), bindings.end(), [&](const auto &b) {
+                    return b.kind == ComputeViewKind::root_buffer_srv && b.root_parameter == low.value;
+                });
+                if (binding == bindings.end()) {
+                    bindings.push_back({ComputeViewKind::root_buffer_srv, low.value, 0, analysis.srv++, span});
+                    binding = std::prev(bindings.end());
+                } else
+                    binding->required_bytes = (std::max)(binding->required_bytes, span);
+                ir.features |= 16;
+                h = ir.handle({0, binding->shader_register, 11});
+            } else
+                h = resource(i, s, i.src[0], ComputeViewKind::buffer_srv, so == 125 ? off + 4 * n : 4);
+            auto addr = so == 125 ? to_string(off)
+                                  : ir.binary("and", ir.binary("add", operand32(i, so), to_string(off)), "4294967292");
+            for (unsigned j = 0; j < n; j += 4) {
+                unsigned width = (std::min)(4u, n - j);
+                auto chunk = so == 125 ? to_string(off + j * 4) :
+                             j ? ir.binary("add", addr, to_string(j * 4)) : addr;
+                auto ret = load_buffer(h, chunk, true, width);
+                for (unsigned k = 0; k < width; ++k)
+                    write(i.dst + j + k, ir.value("extractvalue %dx.types.ResRet.i32 " + ret + ", " + to_string(k)));
+            }
+            return;
+        }
+        bool store = i.name == "buffer_store_raw" || i.name == "buffer_store_format";
+        bool raw = i.name == "buffer_load_dword" || i.name == "buffer_store_raw";
+        bool half = i.name == "buffer_store_format" && (i.op & 128);
+        constexpr unsigned widths[]{1, 2, 4, 3};
+        unsigned n = raw ? widths[i.op & 3] : (i.op & 3) + 1, data = 256 + i.dst;
+        if (i.dst + (half ? (n + 1) / 2 : n) > 256)
+            refuse(i.pc, "direct buffer data overflow");
+        auto kind = store ? (raw    ? ComputeViewKind::raw_buffer_uav
+                             : half ? ComputeViewKind::half_buffer_uav
+                                    : ComputeViewKind::typed_buffer_uav)
+                    : raw && s.at(((i.b >> 16) & 31) * 4 + 1).type == Symbol::Type::zero_stride_word
+                          ? ComputeViewKind::byte_window_srv
+                    : raw ? ComputeViewKind::raw_vector_srv
+                          : ComputeViewKind::typed_buffer_srv;
+        auto h = resource(i, s, ((i.b >> 16) & 31) * 4, kind, raw ? 4 : n * (half ? 2 : 4));
+        auto addr = (i.a & (raw ? 0x1000 : 0x2000)) ? read(256 + (i.b & 255)) : "0";
+        if (raw) {
+            addr = ir.binary("add", addr, to_string(i.a & 4095));
+            addr = ir.binary("and", ir.binary("add", addr, operand32(i, i.b >> 24)), "4294967292");
+        }
+        if (!store) {
+            auto ret = load_buffer(h, addr, raw, n);
+            for (unsigned k = 0; k < n; ++k)
+                vector_write(data + k, ir.value("extractvalue %dx.types.ResRet.i32 " + ret + ", " + to_string(k)));
+            return;
+        }
+        const string tag = to_string(label_number++), pred = active();
+        if (!graphics_input)
+            ir.body << "  br i1 " << pred << ", label %store" << tag << ", label %after" << tag << "\nstore" << tag
+                << ":\n";
+        std::vector<std::pair<string, string>> args{{"%dx.types.Handle", h}, {"i32", addr}, {"i32", "undef"}};
+        for (unsigned j = 0; j < 4; ++j) {
+            string value = "undef";
+            if (j < n || !raw) {
+                const unsigned component = (std::min)(j, n - 1);
+                value = read(data + (half ? component / 2 : component));
+                if (half) {
+                    if (component % 2)
+                        value = ir.binary("lshr", value, "16");
+                    value = ir.invoke("float", "legacyF16ToF32", 131, {{"i32", value}}, "nounwind readnone");
+                }
+            }
+            args.emplace_back(half ? "float" : "i32", value);
+        }
+        args.emplace_back("i8", to_string(raw ? (1u << n) - 1 : 15));
+        if (raw)
+            args.emplace_back("i32", "4");
+        ir.invoke("void",
+                  raw    ? "rawBufferStore.i32"
+                  : half ? "bufferStore.f32"
+                         : "bufferStore.i32",
+                  raw ? 140 : 69, args, "nounwind");
+        if (!graphics_input)
+            ir.body << "  br label %after" << tag << "\nafter" << tag << ":\n";
+    }
+    string select_float(const string &condition, const string &yes, const string &no) {
+        return ir.value("select i1 " + condition + ", float " + yes + ", float " + no);
+    }
+    // Invert the cube projection. Each pair of faces has a common major
+    // axis, with the negative face second. The two minor axes span [-1,1].
+    std::array<string, 3> cube_axes(const string &face, const string &u, const string &v, bool tangent) {
+        const auto nu = ir.value("fsub float -0.0, " + u), nv = ir.value("fsub float -0.0, " + v);
+        const auto axis = ir.binary("lshr", ir.binary("and", face, "7"), "1");
+        const auto is_x = cmp("eq", axis, "0"), is_y = cmp("eq", axis, "1");
+        const auto negative = cmp("ne", ir.binary("and", face, "1"), "0");
+        const auto major = tangent ? "0.0" : select_float(negative, "-1.0", "1.0");
+        return {select_float(is_x, major, select_float(is_y, u, select_float(negative, nu, u))),
+                select_float(is_y, major, nv),
+                select_float(is_x, select_float(negative, u, nu), select_float(is_y, select_float(negative, nv, v), major))};
+    }
+    void image_io(const Inst &i, const State &s) {
+        const bool bias = i.op == 37, gradient = i.op == 34, query = i.op == 96, dimensions = i.op == 14;
+        const bool compare = i.op == 40 || i.op == 47;
+        const bool implicit = i.op == 32 || i.op == 40 || bias || query || i.op == 64;
+        if (implicit && !pixel_stage)
+            refuse(i.pc, "implicit derivatives require a pixel stage");
+        const bool gather = i.op == 64 || i.op == 71;
+        const bool sample = (!gather && implicit) || compare || gradient || i.op == 39 || i.op == 36, store = i.op == 8,
+                   half = store && (i.b >> 31);
+        const bool lod = i.op == 1 || i.op == 36;
+        const unsigned mask = (i.a >> 8) & 15, addr = i.b & 255, base = ((i.b >> 16) & 31) * 4, dim = (i.a >> 3) & 7;
+        constexpr unsigned dx_kind[]{1, 2, 4, 5, 6, 7, 3, 8};
+        constexpr unsigned coord_count[]{1, 2, 3, 3, 2, 3, 2, 3};
+        const unsigned coords = coord_count[dim];
+        if ((i.op != 0 && i.op != 1 && !store && !sample && !gather && !dimensions) || !mask || (i.a & 0x3e0c0u) ||
+            (i.b & 0x3e000000u) || (gather && ((mask & (mask - 1)) || (dim != 1 && dim != 3 && dim != 5))) ||
+            (query && ((dim != 1 && dim != 3) || (mask & ~3u))) ||
+            (compare && (mask != 1 || (dim != 1 && dim != 3 && dim != 5) || (i.a & 0x1000u))) ||
+            ((sample || gather) && (i.a & 0x1000u) && gradient) ||
+            (dimensions && (dim == 4 || dim >= 6 || (i.b & 0x40000000u))) ||
+            (store && !half && mask != 15) || (half && mask != 1 && mask != 3 && mask != 15) ||
+            s.at(base).type != Symbol::Type::descriptor)
+            refuse(i.pc, "direct image opcode or descriptor modifiers");
+        if ((dim == 3 && ((!sample && !gather && !dimensions) || (i.a & 0x1000u))) ||
+            (dim >= 6 && (sample || gather || store || lod)))
+            refuse(i.pc, "unsupported cube or multisample operation");
+        const bool d16_sample = !store && (i.b >> 31);
+        const unsigned channels = half && mask == 1 ? 1 : half && mask == 3 ? 2 : 4;
+        const bool cube_sample = dim == 3 && (sample || gather);
+        const auto kind = half    ? (channels == 1 ? ComputeViewKind::half_scalar_uav :
+                                     channels == 2 ? ComputeViewKind::half2_texture_uav : ComputeViewKind::half4_texture_uav)
+                          : store ? ComputeViewKind::texture_uav
+                          : cube_sample ? (compare ? ComputeViewKind::cube_comparison_srv : ComputeViewKind::cube_sample_srv)
+                          : d16_sample ? ComputeViewKind::d16_sample_srv
+                          : compare ? ComputeViewKind::comparison_texture_srv
+                                  : ComputeViewKind::texture_srv;
+        analysis.binding(i, s, base, 8, kind, 0, dim);
+        const auto &bs = analysis.result.bindings;
+        auto it = std::find_if(bs.begin(), bs.end(), [&](const auto &b) {
+            return !b.array_position && b.image_dimension == dim && b.kind == kind &&
+                   b.root_parameter == s[base].value && b.byte_offset == s[base].offset;
+        });
+        if (it == bs.end())
+            throw std::logic_error("missing image binding");
+        auto h = ir.handle({unsigned(store), it->shader_register, cube_sample ? 9u : dx_kind[dim], 9, compare ? 1u : channels, 0});
+        auto coordinate = [&](unsigned j) {
+            unsigned r = addr + j;
+            if (j && (i.a & 6)) {
+                const unsigned word_index = (j - 1) / 4;
+                if (word_index >= ((i.a >> 1) & 3))
+                    refuse(i.pc, "incomplete image NSA address list");
+                r = (i.image_address_words[word_index] >> (8 * ((j - 1) % 4))) & 255;
+            }
+            if (r > 255)
+                refuse(i.pc, "image coordinate register overflow");
+            return read(256 + r);
+        };
+        auto texture_dimensions = [&](const string &mip) {
+            return ir.invoke("%dx.types.Dimensions", "getDimensions", 72,
+                             {{"%dx.types.Handle", h}, {"i32", mip}}, "nounwind readonly");
+        };
+        if (dimensions) {
+            auto info = texture_dimensions(coordinate(0));
+            unsigned dst = i.dst;
+            for (unsigned ch = 0; ch < 4; ++ch) {
+                if (!(mask & (1u << ch))) continue;
+                if (dst > 255) refuse(i.pc, "image destination overflow");
+                auto value = ch == 3 || ch < (dim == 3 ? 2 : coords) ? ir.value("extractvalue %dx.types.Dimensions " + info + ", " + to_string(ch)) : "1";
+                vector_write(256 + dst++, value);
+            }
+            return;
+        }
+        std::array<string, 4> c{"undef", "undef", "undef", "undef"};
+        string level = "0";
+        const unsigned spatial = coords - unsigned(dim == 3 || dim == 4 || dim == 5);
+        const bool a16 = (i.b & 0x40000000u) != 0;
+        if (a16) {
+            if (dim != 1 || lod || (i.a & 6) || (sample && i.op != 32 && i.op != 39) || gather || (store && !half))
+                refuse(i.pc, "packed image addressing");
+            auto packed = coordinate(0);
+            c[0] = ir.binary("and", packed, "65535");
+            c[1] = ir.binary("lshr", packed, "16");
+        } else {
+            for (unsigned j = 0; j < coords; ++j)
+                c[j] = coordinate(j + unsigned(bias || compare) + (gradient ? 2 * spatial : 0));
+            if (bias || compare)
+                level = coordinate(0);
+            if (lod || dim >= 6)
+                level = coordinate(coords);
+        }
+        if (!store) {
+            string r;
+            if (sample || gather) {
+                auto sampler_reg = analysis.sampler_index(i, s, sample || implicit, i.op == 71, implicit || gradient, compare);
+                if (i.op == 64 && (analysis.result.samplers.at(sampler_reg - analysis.first_sampler).words[1] & 0xffffff))
+                    refuse(i.pc, "implicit gather requires a sampler fixed to mip zero");
+                auto sampler = ir.handle({3, sampler_reg, 14, 0, 0, 0, 1, compare});
+                using Arg = std::pair<string, string>;
+                std::vector<Arg> args{{"%dx.types.Handle", h}, {"%dx.types.Handle", sampler}};
+                const auto size = (i.a & 0x1000u) ? texture_dimensions("0") : string{};
+                for (unsigned j = 0; j < coords; ++j) {
+                    c[j] = a16 ? ir.invoke("float", "legacyF16ToF32", 131, {{"i32", c[j]}}, "nounwind readnone") :
+                                 ir.value("bitcast i32 " + c[j] + " to float");
+                    if (!size.empty() && j < spatial) {
+                        auto extent = ir.value("extractvalue %dx.types.Dimensions " + size + ", " + to_string(j));
+                        auto scale = ir.value("uitofp i32 " + extent + " to float");
+                        c[j] = ir.value("fdiv float " + c[j] + ", " + scale);
+                    }
+                }
+                string face;
+                if (dim == 3) {
+                    // GFX packs face + 8 * layer. Desktop cube arrays take a
+                    // direction plus the layer relative to the bound view.
+                    face = ir.value("fptosi float " + c[2] + " to i32");
+                    auto projected = [&](const string &a) {
+                        return ir.value("fsub float " + ir.value("fmul float " + a + ", 2.0") + ", 3.0");
+                    };
+                    auto direction = cube_axes(face, projected(c[0]), projected(c[1]), false);
+                    std::copy(direction.begin(), direction.end(), c.begin());
+                    c[3] = ir.value("sitofp i32 " + ir.binary("ashr", face, "3") + " to float");
+                }
+                if (query) {
+                    for (unsigned j = 0; j < 3; ++j)
+                        args.emplace_back("float", c[j]);
+                    args.emplace_back("i1", "true");
+                    unsigned dst = i.dst;
+                    for (unsigned ch = 0; ch < 2; ++ch) {
+                        if (!(mask & (1u << ch))) continue;
+                        if (dst > 255) refuse(i.pc, "image destination overflow");
+                        args.back().second = ch ? "false" : "true";
+                        auto result = ir.invoke("float", "calculateLOD.f32", 81, args, "nounwind readonly");
+                        vector_write(256 + dst++, ir.value("bitcast float " + result + " to i32"));
+                    }
+                    return;
+                }
+                for (unsigned j = 0; j < 4; ++j)
+                    args.emplace_back("float", c[j]);
+                const unsigned offsets = dim == 3 ? 0 : spatial;
+                for (unsigned j = 0; j < (sample ? 3u : 2u); ++j)
+                    args.emplace_back("i32", j < offsets ? "0" : "undef");
+                if (compare) {
+                    args.emplace_back("float", ir.value("bitcast i32 " + level + " to float"));
+                    if (implicit)
+                        args.emplace_back("float", "undef");
+                } else if (gather) {
+                    unsigned channel = 0;
+                    while (!(mask & (1u << channel))) ++channel;
+                    args.emplace_back("i32", to_string(channel));
+                } else if (gradient) {
+                    // Victory emit/lower.rs: d/dx and then d/dy of spatial
+                    // coordinates precede the coordinates, excluding array slices.
+                    for (unsigned axis = 0; axis < 2; ++axis) {
+                        std::array<string, 3> d{"undef", "undef", "undef"};
+                        for (unsigned j = 0; j < spatial; ++j)
+                            d[j] = ir.value("bitcast i32 " + coordinate(axis * spatial + j) + " to float");
+                        if (dim == 3)
+                            d = cube_axes(face, ir.value("fmul float " + d[0] + ", 2.0"),
+                                          ir.value("fmul float " + d[1] + ", 2.0"), true);
+                        for (const auto &component : d) args.emplace_back("float", component);
+                    }
+                    args.emplace_back("float", "undef");
+                } else if (implicit) {
+                    if (bias)
+                        args.emplace_back("float", ir.value("bitcast i32 " + level + " to float"));
+                    args.emplace_back("float", "undef"); // no per-instruction minimum LOD clamp
+                } else
+                    args.emplace_back("float", lod ? ir.value("bitcast i32 " + level + " to float") : "0.0");
+                const char *method = compare ? (implicit ? "sampleCmp.f32" : "sampleCmpLevelZero.f32") :
+                                     gather ? "textureGather.f32" : gradient ? "sampleGrad.f32" :
+                                     bias ? "sampleBias.f32" : implicit ? "sample.f32" : "sampleLevel.f32";
+                const unsigned opcode = compare ? (implicit ? 64 : 65) : gather ? 73 : gradient ? 63 : bias ? 61 : implicit ? 60 : 62;
+                r = ir.invoke("%dx.types.ResRet.f32", method, opcode, args, "nounwind readonly");
+            } else
+                r = ir.invoke("%dx.types.ResRet.f32", "textureLoad.f32", 66,
+                              {{"%dx.types.Handle", h},
+                               {"i32", level},
+                               {"i32", c[0]},
+                               {"i32", c[1]},
+                               {"i32", c[2]},
+                               {"i32", "undef"},
+                               {"i32", "undef"},
+                               {"i32", "undef"}},
+                              "nounwind readonly");
+            unsigned dst = i.dst;
+            string pending_half;
+            for (unsigned c = 0; c < 4; ++c)
+                if (gather || (mask & (1u << c))) {
+                    if (dst > 255)
+                        refuse(i.pc, "image destination overflow");
+                    auto value = ir.value("extractvalue %dx.types.ResRet.f32 " + r + ", " + to_string(c));
+                    auto bits = ir.value("bitcast float " + value + " to i32");
+                    if (d16_sample) {
+                        bits = packed_half_rne(bits);
+                        if (pending_half.empty()) {
+                            pending_half = bits;
+                            continue;
+                        }
+                        bits = ir.binary("or", pending_half, ir.binary("shl", bits, "16"));
+                        pending_half.clear();
+                    }
+                    vector_write(256 + dst++, bits);
+                }
+            if (!pending_half.empty()) vector_write(256 + dst, pending_half);
+        } else {
+            if (i.dst + (half ? (channels + 1) / 2 : channels) > 256)
+                refuse(i.pc, "image data overflow");
+            string label = to_string(label_number++), pred = active();
+            if (!graphics_input)
+                ir.body << "  br i1 " << pred << ", label %img" << label << ", label %imgover" << label << "\nimg" << label
+                    << ":\n";
+            std::vector<std::pair<string, string>> args{
+                {"%dx.types.Handle", h}, {"i32", c[0]}, {"i32", c[1]}, {"i32", c[2]}};
+            std::array<string, 4> values;
+            string packed;
+            for (unsigned c = 0; c < channels; ++c) {
+                if (half) {
+                    if (!(c & 1)) packed = read(256 + i.dst + c / 2);
+                    const auto bits = c & 1 ? ir.binary("lshr", packed, "16") : packed;
+                    values[c] = ir.invoke("float", "legacyF16ToF32", 131, {{"i32", bits}}, "nounwind readnone");
+                } else
+                    values[c] = ir.value("bitcast i32 " + read(256 + i.dst + c) + " to float");
+            }
+            // DXIL typed stores use a full write mask; narrower views ignore the tail.
+            for (unsigned c = 0; c < 4; ++c)
+                args.emplace_back("float", values[(std::min)(c, channels - 1)]);
+            args.emplace_back("i8", "15");
+            ir.invoke("void", "textureStore.f32", 67, args, "nounwind");
+            if (!graphics_input)
+                ir.body << "  br label %imgover" << label << "\nimgover" << label << ":\n";
+        }
+    }
+    void local_memory(const Inst &i, unsigned words) {
+        const auto op = decode_local_data(i.a, i.b);
+        // The host executes a guest wave64 on two wave32s. Meet before
+        // each operation, outside its lane predicate, as in Victory split_lds.
+        if (wave64)
+            barrier();
+        const auto label = to_string(label_number++);
+        auto enabled = active();
+        ir.body << "  br i1 " << enabled << ", label %ds" << label << ", label %dsDone" << label << "\nds" << label
+                << ":\n";
+        const auto address = read(256 + op.address);
+        for (unsigned j = 0; j < op.count; ++j) {
+            auto index = ir.binary("lshr", ir.binary("add", address, to_string(op.byte_offset(j))), "2");
+            auto ptr = shared_address("lds", words, index);
+            if (op.read)
+                write(256 + op.destination + j, ir.value("load i32, i32 addrspace(3)* " + ptr + ", align 4"));
+            else {
+                auto data = read(256 + op.data_register(j));
+                if (op.atomic_ir) {
+                    if (op.subtract)
+                        data = ir.binary("sub", "0", data);
+                    auto old = ir.value(string("atomicrmw ") + op.atomic_ir + " i32 addrspace(3)* " + ptr +
+                                        ", i32 " + data + " monotonic");
+                    if (op.return_old)
+                        write(256 + op.destination, old);
+                } else
+                    ir.body << "  store i32 " << data << ", i32 addrspace(3)* " << ptr << ", align 4\n";
+            }
+        }
+        ir.body << "  br label %dsDone" << label << "\ndsDone" << label << ":\n";
+    }
+    string shift(const string &op, const string &a, const string &b) {
+        return ir.binary(op, a, ir.binary("and", b, "31"));
+    }
+    string subword(const string &value, unsigned sel, bool sign) {
+        if (sel == 6)
+            return value;
+        unsigned width = sel < 4 ? 8 : 16, bit = sel < 4 ? 8 * sel : 16 * (sel - 4);
+        auto slice = ir.binary("lshr", value, to_string(bit));
+        if (!sign)
+            return ir.binary("and", slice, to_string((1u << width) - 1));
+        auto left = ir.binary("shl", slice, to_string(32 - width));
+        return ir.binary("ashr", left, to_string(32 - width));
+    }
+    string place_subword(const Inst &i, const string &value) {
+        if (i.dst_select == 6)
+            return value;
+        unsigned sel = i.dst_select, width = sel < 4 ? 8 : 16, bit = sel < 4 ? 8 * sel : 16 * (sel - 4);
+        Word mask = (1u << width) - 1;
+        string result = subword(value, sel < 4 ? 0 : 4, i.dst_unused == 1);
+        if (bit)
+            result = ir.binary("shl", result, to_string(bit));
+        if (i.dst_unused == 2)
+            result = ir.binary("or", result, ir.binary("and", read(i.dst), to_string(~(mask << bit))));
+        return result;
+    }
+    string cube_alu(Name op, const string &x, const string &y, const string &z) {
+        auto magnitude = [&](const string &v) {
+            return ir.invoke("float", "unary.f32", 6, {{"float", v}}, "nounwind readnone");
+        };
+        auto at_least = [&](const string &a, const string &b) { return ir.value("fcmp oge float " + a + ", " + b); };
+        auto negative = [&](const string &a) { return ir.value("fcmp olt float " + a + ", 0.0"); };
+        auto negate = [&](const string &a) { return ir.value("fsub float -0.0, " + a); };
+        const auto ax = magnitude(x), ay = magnitude(y), az = magnitude(z);
+        // The tie order is Z, Y, X, as in pixel_aot's cube lowering.
+        const auto major_z = ir.value("and i1 " + at_least(az, ax) + ", " + at_least(az, ay));
+        const auto major_y = at_least(ay, ax);
+        auto axis = [&](const string &xf, const string &yf, const string &zf) {
+            return select_float(major_z, zf, select_float(major_y, yf, xf));
+        };
+        if (op == "v_cubeid_f32")
+            return axis(select_float(negative(x), "1.0", "0.0"), select_float(negative(y), "3.0", "2.0"),
+                        select_float(negative(z), "5.0", "4.0"));
+        if (op == "v_cubesc_f32")
+            return axis(select_float(negative(x), z, negate(z)), x, select_float(negative(z), negate(x), x));
+        if (op == "v_cubetc_f32") {
+            const auto ny = negate(y);
+            return axis(ny, select_float(negative(y), negate(z), z), ny);
+        }
+        return ir.value("fmul float " + axis(x, y, z) + ", 2.0");
+    }
+    string packed_half_rne(const string &bits) {
+        // Round the integer significand to nearest even. Some desktop
+        // implementations truncate legacyF32ToF16 (Victory 9376fd6,
+        // emit/lower.rs::f16_nearest). This also preserves subnormals.
+        const auto sign = ir.binary("and", ir.binary("lshr", bits, "16"), "32768");
+        const auto mag = ir.binary("and", bits, "2147483647");
+        const auto exp = ir.binary("lshr", mag, "23");
+        const auto frac = ir.binary("and", mag, "8388607");
+        auto round_shift = [&](const string &v, const string &shift, const string &half) {
+            const auto odd = ir.binary("and", ir.binary("lshr", v, shift), "1");
+            const auto bias = ir.binary("add", ir.binary("sub", half, "1"), odd);
+            return ir.binary("lshr", ir.binary("add", v, bias), shift);
+        };
+        const auto normal = round_shift(ir.binary("sub", mag, "939524096"), "13", "4096");
+        const auto sub_range = ir.value("and i1 " + cmp("uge", exp, "102") + ", " + cmp("ule", exp, "112"));
+        const auto shift = select(sub_range, ir.binary("sub", "126", exp), "14");
+        const auto half = ir.binary("shl", "1", ir.binary("sub", shift, "1"));
+        const auto sub = round_shift(ir.binary("or", frac, "8388608"), shift, half);
+        auto h = select(cmp("ule", exp, "112"), select(sub_range, sub, "0"), normal);
+        h = select(cmp("ugt", exp, "142"), "31744", h);
+        const auto nan = cmp("ugt", mag, "2139095040");
+        h = select(nan, ir.binary("or", ir.binary("lshr", frac, "13"), "32256"), h);
+        return ir.binary("or", h, sign);
+    }
+    bool float_alu(const Inst &i, const string *permuted = nullptr) {
+        auto n = i.name;
+        if ((i.subword || (!i.wide && !i.dpp_control && !permuted)) &&
+            (n == "v_cvt_f16_f32" || n == "v_cvt_f32_f16")) {
+            if (i.scale || i.clamp || i.src_sext[0])
+                refuse(i.pc, "unsupported SDWA half conversion modifier");
+            string bits = operand32(i, i.src[0]);
+            if (i.subword) bits = subword(bits, i.src_select[0], false);
+            const bool narrow = n == "v_cvt_f16_f32";
+            if (i.abs) bits = ir.binary("and", bits, narrow ? "2147483647" : "32767");
+            if (i.neg) bits = ir.binary("xor", bits, narrow ? "2147483648" : "32768");
+            if (narrow) {
+                bits = packed_half_rne(bits);
+                if (!i.subword) bits = ir.binary("or", bits, ir.binary("and", read(i.dst), "4294901760"));
+            } else {
+                auto f = ir.invoke("float", "legacyF16ToF32", 131, {{"i32",bits}}, "nounwind readnone");
+                bits = ir.value("bitcast float " + f + " to i32");
+            }
+            vector_write(i.dst, place_subword(i, bits));
+            return true;
+        }
+        if (n == "v_cvt_pkrtz_f16_f32") {
+            if (i.clamp || i.scale || i.subword || (i.wide && (i.a & 0x7800)))
+                refuse(i.pc, "unsupported packed half conversion modifier");
+            auto pack = [&](unsigned j) {
+                auto bits = operand32(i, i.src[j]);
+                if (i.abs & (1u << j)) bits = ir.binary("and", bits, "2147483647");
+                if (i.neg & (1u << j)) bits = ir.binary("xor", bits, "2147483648");
+                auto f = ir.value("bitcast i32 " + bits + " to float");
+                auto h = ir.invoke("i32", "legacyF32ToF16", 130, {{"float",f}}, "nounwind readnone");
+                auto mag = ir.binary("and", h, "32767");
+                auto back = ir.invoke("float", "legacyF16ToF32", 131, {{"i32",mag}}, "nounwind readnone");
+                auto abs = ir.value("bitcast i32 " + ir.binary("and", bits, "2147483647") + " to float");
+                auto rounded_up = ir.value("fcmp ogt float " + back + ", " + abs);
+                return ir.binary("and", ir.binary("sub", h, ir.value("zext i1 " + rounded_up + " to i32")), "65535");
+            };
+            auto low = pack(0), high = pack(1);
+            vector_write(i.dst, ir.binary("or", low, ir.binary("shl", high, "16")));
+            return true;
+        }
+        const auto rule = alu_rules.find(n);
+        const bool byte_to_float =
+            n.size() == 16 && n.substr(0, 15) == "v_cvt_f32_ubyte" && n.back() >= '0' && n.back() <= '3';
+        const bool round = n == "v_fract_f32" || n == "v_trunc_f32" || n == "v_ceil_f32";
+        const bool to_integer = n == "v_cvt_i32_f32" || n == "v_cvt_u32_f32" ||
+                                n == "v_cvt_flr_i32_f32" || n == "v_cvt_rpi_i32_f32";
+        const bool cube = n == "v_cubeid_f32" || n == "v_cubesc_f32" || n == "v_cubetc_f32" || n == "v_cubema_f32";
+        const bool mixed = i.enc == Encoding::Mix && (n == "v_fma_mix_f32" || n == "v_fma_mixlo_f16" || n == "v_fma_mixhi_f16");
+        if (!mixed && !to_integer && !byte_to_float && !round && !cube && n != "v_mul_legacy_f32" &&
+            n != "v_cos_f32" && (rule == alu_rules.end() || rule->second.type == AluType::Bits))
+            return false;
+        auto source = [&](unsigned j) {
+            auto v = !j && permuted ? *permuted : operand32(i, i.src[j]);
+            if (i.subword && j < 2)
+                v = subword(v, i.src_select[j], i.src_sext[j]);
+            return v;
+        };
+        auto fp = [&](unsigned j) {
+            auto bits = source(j);
+            if (i.abs & (1u << j))
+                bits = ir.binary("and", bits, "2147483647");
+            if (i.neg & (1u << j))
+                bits = ir.binary("xor", bits, "2147483648");
+            return ir.value("bitcast i32 " + bits + " to float");
+        };
+        auto unary = [&](unsigned op, const string &v) {
+            return ir.invoke("float", "unary.f32", op, {{"float", v}}, "nounwind readnone");
+        };
+        auto binary = [&](unsigned op, const string &a, const string &b) {
+            return ir.invoke("float", "binary.f32", op, {{"float", a}, {"float", b}}, "nounwind readnone");
+        };
+        string result;
+        if (to_integer) {
+            if (i.scale || i.clamp)
+                refuse(i.pc, "integer conversion output modifier");
+            auto a = fp(0);
+            if (n == "v_cvt_rpi_i32_f32")
+                a = ir.value("fadd float " + a + ", 0.5");
+            if (n == "v_cvt_rpi_i32_f32" || n == "v_cvt_flr_i32_f32")
+                a = unary(27, a);
+            const bool sign = n != "v_cvt_u32_f32";
+            // Only convert a representable input. Select the ISA's saturated
+            // result (and zero for NaN) independently of LLVM poison behavior.
+            auto lower = ir.value("fcmp oge float " + a + ", " + (sign ? "-2147483648.0" : "0.0"));
+            auto upper = ir.value("fcmp olt float " + a + ", " + (sign ? "2147483648.0" : "4294967296.0"));
+            auto safe = select_float(ir.value("and i1 " + lower + ", " + upper), a, "0.0");
+            auto converted = ir.value(string(sign ? "fptosi" : "fptoui") + " float " + safe + " to i32");
+            auto bounded = select(upper, converted, sign ? "2147483647" : "4294967295");
+            if (sign)
+                bounded = select(lower, bounded, "2147483648");
+            else
+                bounded = select(lower, bounded, "0");
+            auto ordered = ir.value("fcmp ord float " + a + ", " + a);
+            vector_write(i.dst, place_subword(i, select(ordered, bounded, "0")));
+            return true;
+        }
+        if (mixed) {
+            // GFX10 VOP3P splits OP_SEL_HI between the two instruction words.
+            const unsigned half = ((i.b >> 27) & 3) | ((i.a >> 12) & 4);
+            std::vector<std::pair<string,string>> args;
+            for (unsigned j = 0; j < 3; ++j) {
+                auto bits = source(j);
+                if (half & (1u << j)) {
+                    bits = subword(bits, 4 + ((i.a >> (11 + j)) & 1), false);
+                    const auto value = ir.invoke("float", "legacyF16ToF32", 131, {{"i32", bits}}, "nounwind readnone");
+                    bits = ir.value("bitcast float " + value + " to i32");
+                }
+                if (i.abs & (1u << j)) bits = ir.binary("and", bits, "2147483647");
+                if (i.neg & (1u << j)) bits = ir.binary("xor", bits, "2147483648");
+                args.emplace_back("float", ir.value("bitcast i32 " + bits + " to float"));
+            }
+            result = ir.invoke("float", "tertiary.f32", 46, args, "nounwind readnone");
+            if (i.clamp) result = unary(7, result);
+            if (n == "v_fma_mix_f32") {
+                vector_write(i.dst, ir.value("bitcast float " + result + " to i32"));
+            } else {
+                auto h = ir.invoke("i32", "legacyF32ToF16", 130, {{"float", result}}, "nounwind readnone");
+                const bool high = n == "v_fma_mixhi_f16";
+                auto keep = ir.binary("and", read(i.dst), high ? "65535" : "4294901760");
+                vector_write(i.dst, ir.binary("or", keep, high ? ir.binary("shl", h, "16") : ir.binary("and", h, "65535")));
+            }
+            return true;
+        }
+        if (byte_to_float || (rule != alu_rules.end() && rule->second.type == AluType::ToFloat)) {
+            if (i.abs || i.neg)
+                refuse(i.pc, "integer conversion source modifier");
+            auto a = source(0);
+            if (byte_to_float) {
+                unsigned shift_bits = 8u * (n.back() - '0');
+                if (shift_bits)
+                    a = ir.binary("lshr", a, to_string(shift_bits));
+                a = ir.binary("and", a, "255");
+            }
+            result = ir.value(string(n == "v_cvt_f32_i32" ? "sitofp" : "uitofp") + " i32 " + a + " to float");
+        } else {
+            auto a = fp(0);
+            if (n == "v_fma_f32" || n == "v_fmac_f32" || n == "v_fmamk_f32" || n == "v_fmaak_f32") {
+                // Victory emit/lower.rs uses DXIL FMad for gfx10 f32 FMA.
+                auto as_float = [&](const string &bits) { return ir.value("bitcast i32 " + bits + " to float"); };
+                auto b = n == "v_fmamk_f32" ? as_float(to_string(i.literal)) : fp(1);
+                auto c = n == "v_fmac_f32" ? as_float(read(i.dst)) : n == "v_fmaak_f32" ? as_float(to_string(i.literal)) :
+                         n == "v_fmamk_f32" ? fp(1) : fp(2);
+                result = ir.invoke("float", "tertiary.f32", 46, {{"float", a}, {"float", b}, {"float", c}}, "nounwind readnone");
+            } else if (n == "v_mul_legacy_f32") {
+                auto b = fp(1);
+                auto zero = ir.value("or i1 " + ir.value("fcmp oeq float " + a + ", 0.0") + ", " +
+                                     ir.value("fcmp oeq float " + b + ", 0.0"));
+                result = select_float(zero, "0.0", ir.value("fmul float " + a + ", " + b));
+            } else if (n == "v_sin_f32" || n == "v_cos_f32") {
+                // Victory trig_turns: reduce in turns before converting to
+                // radians, preserving signed zero and exact quarter-turn zeros.
+                auto part = ir.value("fsub float " + a + ", " + unary(26, a));
+                part = select_float(ir.value("fcmp oeq float " + a + ", 0.0"), a, part);
+                const bool cosine = n == "v_cos_f32";
+                auto radians = ir.value("fmul float " + part + ", 0x401921FB60000000");
+                auto exact = ir.value("fcmp oeq float " + unary(6, part) + (cosine ? ", 0.25" : ", 0.5"));
+                result = select_float(exact, "0.0", unary(cosine ? 12 : 13, radians));
+            } else if (cube)
+                result = cube_alu(n, a, fp(1), fp(2));
+            else if (n == "v_add_f32" || n == "v_sub_f32" || n == "v_subrev_f32" || n == "v_mul_f32") {
+                auto b = fp(1);
+                if (n == "v_subrev_f32")
+                    std::swap(a, b);
+                result = ir.value(string(n == "v_add_f32"   ? "fadd"
+                                         : n == "v_mul_f32" ? "fmul"
+                                                            : "fsub") +
+                                  " float " + a + ", " + b);
+            } else if (n == "v_med3_f32") {
+                auto b = fp(1), c = fp(2);
+                auto lo = binary(36, a, b), hi = binary(35, a, b);
+                auto median = binary(35, lo, binary(36, hi, c));
+                auto nan = ir.value("or i1 " + ir.value("fcmp uno float " + a + ", " + b) + ", " +
+                                    ir.value("fcmp uno float " + c + ", " + c));
+                result = select_float(nan, binary(36, lo, c), median);
+            } else if (n == "v_min_f32" || n == "v_max_f32" || n == "v_min3_f32" || n == "v_max3_f32") {
+                unsigned op = n.substr(2, 3) == "min" ? 36 : 35;
+                result = binary(op, a, fp(1));
+                if (rule->second.arity == 3)
+                    result = binary(op, result, fp(2));
+            } else if (n == "v_exp_f32")
+                result = unary(21, a);
+            else if (n == "v_log_f32")
+                result = unary(23, a);
+            else if (n == "v_rndne_f32")
+                result = unary(26, a);
+            else if (n == "v_floor_f32")
+                result = unary(27, a);
+            else if (round)
+                result = unary(n == "v_fract_f32" ? 22 : n == "v_ceil_f32" ? 28 : 29, a);
+            else if (n == "v_sqrt_f32")
+                result = unary(24, a);
+            else if (n == "v_rsq_f32")
+                result = unary(25, a);
+            else if (n == "v_rcp_f32")
+                result = ir.value("fdiv float 1.000000e+00, " + a);
+            else
+                return false;
+        }
+        if (i.scale)
+            result = ir.value("fmul float " + result + ", " + (i.scale == 1 ? "2.0" : i.scale == 2 ? "4.0" : "0.5"));
+        if (i.clamp)
+            result = unary(7, result);
+        vector_write(i.dst, place_subword(i, ir.value("bitcast float " + result + " to i32")));
+        return true;
+    }
+    string graphics_lane_mask(const Inst &i, const State &state, unsigned src, const char *failure) {
+        if (src == 106) return read(106);
+        if (src < 106) {
+            const auto &mask = state[src];
+            if ((mask.type == Symbol::Type::lane_mask || mask.type == Symbol::Type::uniform_mask) && !mask.offset &&
+                (!analysis.program.graphics_wave64 || (!(src & 1) &&
+                    state[src+1] == Symbol{mask.type,mask.value,1})))
+                return read(1024+mask.value);
+        }
+        refuse(i.pc,failure);
+    }
+    string comparison(const Inst &i) {
+        if (graphics_input && i.wide && (i.a & 0x7800))
+            refuse(i.pc, "unsupported graphics compare operand selection");
+        if ((i.abs || i.neg) && i.name.find("_f16") == Name::npos && i.name.find("_f32") == Name::npos)
+            refuse(i.pc, "integer comparison with floating modifier");
+        auto input = [&](unsigned j) {
+            auto value = operand32(i,i.src[j]);
+            return i.subword ? subword(value,i.src_select[j],i.src_sext[j]) : value;
+        };
+        auto a = input(0), b = input(1);
+        return comparison(i,a,b);
+    }
+    string comparison(const Inst &i, const string &lhs, const string &rhs) {
+        Name n = i.name;
+        const auto at = n.rfind('_');
+        if (at == n.npos)
+            refuse(i.pc, "comparison missing type");
+        Name type = n.substr(at + 1), stem = n.substr(0, at);
+        Name op = stem.substr(stem.rfind('_') + 1);
+        bool fp = type == "f16" || type == "f32";
+        bool sign = type == "i16" || type == "i32";
+        bool half = type == "f16" || type == "i16" || type == "u16";
+        if (!fp && !sign && type != "u16" && type != "u32")
+            refuse(i.pc, "direct comparison width");
+        if (op == "f")
+            return "false";
+        if (op == "t" || op == "tru")
+            return "true";
+        string a = lhs, b = rhs;
+        auto bits = [&](string v, unsigned j) {
+            if (i.abs & (1u << j))
+                v = ir.binary("and", v, half ? "32767" : "2147483647");
+            if (i.neg & (1u << j))
+                v = ir.binary("xor", v, half ? "32768" : "2147483648");
+            return v;
+        };
+        if (op == "class" && fp) {
+            if ((i.abs | i.neg) & 2 ||
+                (i.subword && (half || i.src_select[0] != 6 || i.src_sext[0])) ||
+                (i.wide && (i.a & 0x7800)))
+                refuse(i.pc, "unsupported floating class operand selection");
+            // The class mask is integer data. Testing raw bits keeps sNaNs,
+            // subnormals and negative zero distinct (gfx2hlsl's class16/32).
+            auto word = bits(a,0);
+            auto neg = cmp("ne", ir.binary("and",word,half ? "32768" : "2147483648"), "0");
+            auto exp = ir.binary("and", word, half ? "31744" : "2139095040");
+            auto frac = ir.binary("and", word, half ? "1023" : "8388607");
+            auto empty = cmp("eq", frac, "0");
+            auto nan = select(cmp("ne",ir.binary("and",frac,half ? "512" : "4194304"),"0"), "2", "1");
+            auto zero_or_tiny = select(empty, select(neg,"32","64"), select(neg,"16","128"));
+            auto normal = select(neg,"8","256");
+            auto cls = select(cmp("eq",exp,half ? "31744" : "2139095040"),
+                              select(empty,select(neg,"4","512"),nan),
+                              select(cmp("eq",exp,"0"),zero_or_tiny,normal));
+            return cmp("ne",ir.binary("and",cls,b),"0");
+        }
+        if (fp) {
+            auto convert = [&](const string &v, unsigned j) {
+                auto value = bits(v, j);
+                return half ? ir.invoke("float", "legacyF16ToF32", 131, {{"i32", ir.binary("and", value, "65535")}},
+                                        "nounwind readnone")
+                            : ir.value("bitcast i32 " + value + " to float");
+            };
+            a = convert(a, 0);
+            b = convert(b, 1);
+            static const std::map<Name, Name> predicates{{"lt", "olt"},  {"le", "ole"},  {"eq", "oeq"},  {"lg", "one"},
+                                                         {"gt", "ogt"},  {"ge", "oge"},  {"o", "ord"},   {"u", "uno"},
+                                                         {"nge", "ult"}, {"nlg", "ueq"}, {"ngt", "ule"}, {"nle", "ugt"},
+                                                         {"neq", "une"}, {"nlt", "uge"}};
+            auto it = predicates.find(op);
+            if (it == predicates.end())
+                refuse(i.pc, "unknown floating comparison predicate");
+            return ir.value("fcmp " + string(it->second) + " float " + a + ", " + b);
+        }
+        if (half) {
+            a = subword(a, 4, sign);
+            b = subword(b, 4, sign);
+        }
+        if (op == "eq")
+            return cmp("eq", a, b);
+        if (op == "lg" || op == "ne")
+            return cmp("ne", a, b);
+        if (op != "lt" && op != "le" && op != "gt" && op != "ge")
+            refuse(i.pc, "unknown integer comparison predicate");
+        return cmp(string(sign ? "s" : "u") + string(op), a, b);
+    }
+    // Compute SCC liveness once, only for programs that construct buffer
+    // descriptors symbolically. A join can observe the old SCC through either
+    // predecessor. Closed loops without a read do not make it live.
+    bool uses_scc_after(const Inst &definition) {
+        const auto &program = analysis.program;
+        if (scc_live.empty()) {
+            scc_live.resize(program.code.size());
+            std::vector<std::vector<size_t>> predecessors(program.code.size());
+            std::vector<size_t> pending;
+            for (size_t j = 0; j < program.code.size(); ++j) {
+                const auto &inst = program.code[j];
+                const auto n = inst.name;
+                const bool explicit_read = std::find(inst.src.begin(), inst.src.end(), 253u) != inst.src.end();
+                // These scalar mask operations set SCC from their entire
+                // result and do not consume the incoming SCC. An explicit
+                // SRC_SCC operand still takes precedence below.
+                const bool mask_scc = n == "s_andn2_b64" || n == "s_and_b64" || n == "s_or_b64" ||
+                    n == "s_xor_b64" || n == "s_not_b64" || n == "s_wqm_b32" || n == "s_wqm_b64" ||
+                    n == "s_and_saveexec_b64" || n == "s_or_saveexec_b64";
+                const bool overwrites = mask_scc || inst.enc == Encoding::Sopc || n == "s_bfe_u32" || n == "s_and_b32" ||
+                    n == "s_or_b32" || n == "s_max_u32" || n == "s_add_u32" || n == "s_sub_u32" ||
+                    n == "s_add_i32" || n == "s_sub_i32" || n == "s_and_saveexec_b32" ||
+                    n == "s_andn2_wrexec_b32" || n == "s_andn2_b32" || n == "s_orn2_b32" ||
+                    n == "s_nor_b32" || n == "s_nand_b32" || n == "s_xnor_b32" || n == "s_not_b32" ||
+                    n == "s_lshr_b32" || n == "s_lshl_b32" || n == "s_ashr_i32" || n == "s_xor_b32";
+                const bool preserves_pair = n == "s_mul_i32" || n == "s_mul_hi_i32" || n == "s_mul_hi_u32" ||
+                    n == "s_bfm_b32" || n == "s_pack_ll_b32_b16" || n == "s_pack_lh_b32_b16" ||
+                    n == "s_pack_hh_b32_b16";
+                const bool uncertain_scalar = (inst.enc == Encoding::Sopk && n != "s_movk_i32") ||
+                    (inst.enc == Encoding::Sop2 && !overwrites && !preserves_pair) ||
+                    (inst.enc == Encoding::Sop1 && !overwrites && n != "s_mov_b32" && n != "s_mov_b64");
+                if (explicit_read || uncertain_scalar || (inst.branch() && (inst.op == 4 || inst.op == 5))) {
+                    scc_live[j] = true;
+                    pending.push_back(j);
+                    continue;
+                }
+                if (overwrites || n == "s_endpgm") continue;
+                if (inst.branch()) predecessors[program.at.at(inst.target())].push_back(j);
+                if (!inst.branch() || inst.op != 2)
+                    predecessors[program.at.at(inst.next)].push_back(j);
+            }
+            while (!pending.empty()) {
+                const auto j = pending.back();
+                pending.pop_back();
+                for (auto prev : predecessors[j]) {
+                    if (scc_live[prev]) continue;
+                    scc_live[prev] = true;
+                    pending.push_back(prev);
+                }
+            }
+        }
+        return scc_live[program.at.at(definition.next)];
+    }
+    void arithmetic(const Inst &i, const State &state, const string *permuted = nullptr) {
+        auto n = i.name;
+        if (n == "v_mad_u32_u16" || n == "v_mad_i32_i16") {
+            // AMD RDNA 2 ISA, VOP3A opcodes 883/885. Only the two
+            // multiplicands are halfwords. The addend and result are dwords.
+            if (!i.wide || i.abs || i.neg || i.scale || (i.a & 0x6000))
+                refuse(i.pc, "unsupported halfword MAD operand modifiers");
+            const bool sign = n == "v_mad_i32_i16";
+            auto half = [&](unsigned j) {
+                auto value = operand32(i, i.src[j]);
+                if (i.a & (1u << (11 + j))) return ir.binary(sign ? "ashr" : "lshr", value, "16");
+                return sign ? ir.binary("ashr", ir.binary("shl", value, "16"), "16")
+                            : ir.binary("and", value, "65535");
+            };
+            auto product = ir.binary("mul", half(0), half(1));
+            auto addend = operand32(i, i.src[2]);
+            auto sum = ir.binary("add", product, addend);
+            if (i.clamp) {
+                if (sign) {
+                    auto overflow = ir.binary("and", ir.binary("xor", product, sum), ir.binary("xor", addend, sum));
+                    sum = select(cmp("slt", overflow, "0"),
+                                 select(cmp("slt", product, "0"), "2147483648", "2147483647"), sum);
+                } else sum = select(cmp("ult", sum, product), "4294967295", sum);
+            }
+            vector_write(i.dst, sum);
+            return;
+        }
+        if (auto dst = carry_destination(i)) {
+            if (pixel_stage || (graphics_input && ir.loop_dependencies) || i.subword || i.dpp_control || i.clamp || i.neg || i.scale)
+                refuse(i.pc, "unsupported carry instruction stage or operand modifiers");
+            // Victory add_sub_carry and pixel_aot model unsigned carry/borrow
+            // as lane bits. Snapshot both operands and carry-in before writing
+            // the result VGPR or its possibly aliased scalar mask.
+            const bool add = n.substr(0, 5) == "v_add";
+            auto a = operand32(i, i.src[0]), b = operand32(i, i.src[1]);
+            if (n.substr(0, 8) == "v_subrev") std::swap(a, b);
+            auto result = ir.binary(add ? "add" : "sub", a, b);
+            auto carry = add ? cmp("ult", result, a) : cmp("ult", a, b);
+            if (n.find("_ci_") != n.npos) {
+                unsigned src = i.src[2];
+                if (src > 106) refuse(i.pc, "unsupported carry-in mask source");
+                string bit;
+                if (graphics_input) {
+                    bit = cmp("ne",graphics_lane_mask(i,state,src,"unproven vertex carry-in mask"),"0");
+                } else {
+                    auto mask = operand32(i, src);
+                    if (wave64) mask = select(upper_half, pair_high(i, src), mask);
+                    bit = cmp("ne", ir.binary("and", mask, lane_bit), "0");
+                }
+                auto edge = cmp("eq", result, add ? "4294967295" : "0");
+                auto extra = ir.value("and i1 " + edge + ", " + bit);
+                carry = ir.value("or i1 " + carry + ", " + extra);
+                result = ir.binary(add ? "add" : "sub", result, ir.value("zext i1 " + bit + " to i32"));
+            }
+            vector_write(i.dst, result);
+            if (graphics_input) {
+                if (!graphics_predicate.empty()) carry = ir.value("and i1 " + graphics_predicate + ", " + carry);
+                auto bit = ir.value("zext i1 " + carry + " to i32");
+                // An explicit VOP3B SDST leaves VCC untouched. Its per-lane
+                // bit may feed another carry, but neither dword is numeric.
+                if (*dst != 106) write(*dst,{});
+                if (analysis.program.graphics_wave64) write(*dst+1,{});
+                write(*dst == 106 ? 106 : 1024+i.pc,bit);
+            } else write_ballot(*dst, carry);
+            return;
+        }
+        if (auto field = byte_descriptor_field(i,state)) {
+            // Keep derived words symbolic, including the status bit until a
+            // later instruction overwrites it. Never let a numeric branch
+            // observe a placeholder for this field or its SCC.
+            // The byte-address OOB selector ORs in two nonzero bits.
+            // Its SCC is known for every source descriptor.
+            if (field->type == Symbol::Type::byte_oob)
+                write(128, "1");
+            else if (n != "s_mul_i32" && uses_scc_after(i))
+                refuse(i.pc, "numeric SCC from a symbolic descriptor field");
+            if (graphics_input) write(i.dst, {});
+            return;
+        }
+        if (float_alu(i, permuted))
+            return;
+        if (i.enc == Encoding::Vopc && !i.clamp && !i.scale &&
+            (n.find("class") == n.npos || n.find("_f16") != n.npos || n.find("_f32") != n.npos)) {
+            auto condition = comparison(i);
+            write_ballot(i.dst, condition);
+            return;
+        }
+        const bool select_mods = n == "v_cndmask_b32" && i.wide && !((i.abs | i.neg) & 4);
+        if ((i.subword && i.enc != Encoding::Vop1 && i.enc != Encoding::Vop2) || ((i.abs || i.neg) && !select_mods) || i.clamp || i.scale)
+            refuse(i.pc, "direct ALU operand modifiers");
+        auto val = [&](unsigned j) {
+            auto value = !j && permuted ? *permuted : operand32(i, i.src[j]);
+            if (select_mods && (i.abs & (1u << j))) value = ir.binary("and", value, "2147483647");
+            if (select_mods && (i.neg & (1u << j))) value = ir.binary("xor", value, "2147483648");
+            return i.subword && j < 2 ? subword(value, i.src_select[j], i.src_sext[j]) : value;
+        };
+        if (n == "s_mov_b32" || n == "s_mov_b64") {
+            if (i.dst > 105 && i.dst != 106 && i.dst != 126 && !(wave64 && (i.dst == 107 || i.dst == 127)))
+                refuse(i.pc, "direct scalar move destination");
+            if (i.src[0] <= 105 && !state[i.src[0]].numeric()) {
+                if (i.dst > 105)
+                    refuse(i.pc, "descriptor used as mask");
+                if (n == "s_mov_b64" && ((i.dst | i.src[0]) & 1))
+                    refuse(i.pc, "unaligned scalar pair");
+                if (state[i.src[0]].type == Symbol::Type::indexed_descriptor)
+                    write(i.dst, read(i.src[0]));
+                if (n == "s_mov_b64" && state.at(i.src[0] + 1).type == Symbol::Type::indexed_descriptor)
+                    write(i.dst + 1, read(i.src[0] + 1));
+                // Transfer tracks symbolic low words; preserve numeric high words of a pair independently.
+                if (n == "s_mov_b64" && state.at(i.src[0] + 1).numeric())
+                    write(i.dst + 1, operand32(i, i.src[0] + 1));
+                return;
+            }
+            string a = val(0);
+            if (n == "s_mov_b64") {
+                unsigned src = i.src[0];
+                if (src >= 240 && src != 255)
+                    refuse(i.pc, "floating inline constant in 64-bit move");
+                if ((i.dst & 1) || (src < 128 && (src & 1)))
+                    refuse(i.pc, "unaligned scalar pair");
+                auto hi = !wave64 && src == 106 ? "0" : pair_high(i, src);
+                write(i.dst + 1, hi);
+            }
+            write(i.dst, a);
+            return;
+        }
+        if (i.enc == Encoding::Sopk && (n.substr(0, 7) == "s_cmpk_" || n == "s_addk_i32" || n == "s_mulk_i32")) {
+            auto a = operand32(i, i.dst);
+            auto immediate = to_string(n.find("_u32") != n.npos ? Word(uint16_t(i.a)) : Word(int16_t(i.a)));
+            if (n.substr(0, 7) == "s_cmpk_") {
+                write(128, ir.value("zext i1 " + comparison(i, a, immediate) + " to i32"));
+                return;
+            }
+            auto result = ir.binary(n == "s_mulk_i32" ? "mul" : "add", a, immediate);
+            if (n == "s_addk_i32") {
+                auto overflow = ir.binary("and", ir.binary("xor", a, result), ir.binary("xor", immediate, result));
+                write(128, ir.binary("lshr", overflow, "31"));
+            }
+            write(i.dst, result);
+            return;
+        }
+        if (n == "s_movk_i32") {
+            write(i.dst, to_string(Word(int16_t(i.a))));
+            return;
+        }
+        if (n == "v_readfirstlane_b32") {
+            // Guest EXEC selects the first lane, even if it is not physical lane zero.
+            auto low = read(126);
+            auto mask = wave64 ? select(upper_half, read(127), low) : low;
+            auto first = ir.invoke("i32", "unaryBits.i32", 32, {{"i32", mask}}, "nounwind readnone");
+            first = select(cmp("eq", mask, "0"), "0", first);
+            auto value = ir.invoke("i32", "waveReadLaneAt.i32", 117, {{"i32", val(0)}, {"i32", first}}, "nounwind");
+            if (wave64) {
+                auto candidates = exchange_halves(value);
+                value = select(cmp("ne", low, "0"), candidates[0], candidates[1]);
+            }
+            write(i.dst, value);
+            return;
+        }
+        if (n == "v_lshrrev_b64" || n == "v_lshlrev_b64") {
+            unsigned src = i.src[1];
+            if (i.dst >= 511 || (src < 256 && src != 128) || src == 511)
+                refuse(i.pc, "direct 64-bit shift operand");
+            string lo = "0", hi = "0";
+            if (src != 128) {
+                lo = read(src);
+                hi = read(src + 1);
+                auto low = ir.value("zext i32 " + lo + " to i64"), high = ir.value("zext i32 " + hi + " to i64");
+                auto bits = ir.value("shl i64 " + high + ", 32");
+                bits = ir.value("or i64 " + bits + ", " + low);
+                auto amt = ir.value("zext i32 " + ir.binary("and", val(0), "63") + " to i64");
+                bits = ir.value(string(n == "v_lshrrev_b64" ? "lshr" : "shl") + " i64 " + bits + ", " + amt);
+                lo = ir.value("trunc i64 " + bits + " to i32");
+                hi = ir.value("trunc i64 " + ir.value("lshr i64 " + bits + ", 32") + " to i32");
+                ir.features |= 1048576;
+            }
+            vector_write(i.dst, lo);
+            vector_write(i.dst + 1, hi);
+            return;
+        }
+        if (n == "s_bfe_u32" && i.src[0] <= 105) {
+            const auto &descriptor = state[i.src[0]];
+            const auto field = source(i, i.src[1], state);
+            if (descriptor.type == Symbol::Type::indexed_descriptor && descriptor.value == compute_resource_heap &&
+                descriptor.offset % 32 == 4 && field.type == Symbol::Type::constant && field.value == 0xe0010) {
+                auto &bindings = analysis.result.bindings;
+                auto it = std::find_if(bindings.begin(), bindings.end(), [](const auto &binding) {
+                    return binding.kind == ComputeViewKind::heap_stride_srv;
+                });
+                if (it == bindings.end()) {
+                    bindings.push_back({ComputeViewKind::heap_stride_srv, compute_resource_heap, 0, analysis.srv++, 4});
+                    it = std::prev(bindings.end());
+                }
+                ir.features |= 16;
+                auto handle = ir.handle({0, it->shader_register, 11, 0, 0, 0});
+                auto slot = ir.binary("add", read(i.src[0]), to_string(descriptor.offset / 32));
+                auto bytes = load_buffer(handle, ir.binary("shl", slot, "2"), true, 1);
+                auto stride = ir.binary("and", ir.value("extractvalue %dx.types.ResRet.i32 " + bytes + ", 0"), "16383");
+                write(i.dst, stride);
+                write(128, ir.value("zext i1 " + cmp("ne", stride, "0") + " to i32"));
+                return;
+            }
+        }
+        auto a = val(0);
+        string b, z;
+        const bool scalar = n.substr(0, 2) == "s_";
+        if (i.enc != Encoding::Vop1 && i.enc != Encoding::Sop1)
+            b = val(1);
+        // As in Victory's SALU lowering and pixel_aot's SGPR-pair rules,
+        // bitset reads its previous destination and leaves SCC alone.
+        if (n == "s_bitset0_b32" || n == "s_bitset1_b32" || n == "s_bitset0_b64" || n == "s_bitset1_b64") {
+            const bool pair = n.substr(n.size() - 3) == "b64";
+            if (i.dst > 105 || (pair && (i.dst & 1)))
+                refuse(i.pc, "bitset requires a general scalar destination or aligned pair");
+            auto old = operand32(i, i.dst);
+            auto bit = shift("shl", "1", a);
+            auto replace = [&](const string &value) {
+                return n[8] == '1' ? ir.binary("or", value, bit)
+                                   : ir.binary("and", value, ir.binary("xor", bit, "4294967295"));
+            };
+            if (pair) {
+                auto high = operand32(i, i.dst + 1);
+                auto upper = cmp("ne", ir.binary("and", a, "32"), "0");
+                write(i.dst, select(upper, old, replace(old)));
+                write(i.dst + 1, select(upper, replace(high), high));
+            } else
+                write(i.dst, replace(old));
+            return;
+        }
+        if (n == "s_bitreplicate_b64_b32") {
+            if ((i.dst > 104 && (graphics_input || i.dst != 106)) || (i.dst & 1))
+                refuse(i.pc, "bitreplicate requires an aligned general scalar pair or compute VCC");
+            // pixel_aot expands each 16-bit half into the even positions,
+            // then duplicates each of the original bits into its neighbour.
+            auto replicate = [&](string half) {
+                unsigned shift = 8;
+                for (Word mask : {0x00ff00ffu, 0x0f0f0f0fu, 0x33333333u, 0x55555555u}) {
+                    half = ir.binary("and", ir.binary("or", half, ir.binary("shl", half, to_string(shift))), to_string(mask));
+                    shift >>= 1;
+                }
+                return ir.binary("or", half, ir.binary("shl", half, "1"));
+            };
+            write(i.dst, replicate(ir.binary("and", a, "65535")));
+            write(i.dst + 1, replicate(ir.binary("lshr", a, "16")));
+            return;
+        }
+        if (n == "s_pack_ll_b32_b16" || n == "s_pack_lh_b32_b16" || n == "s_pack_hh_b32_b16") {
+            const auto lo = n == "s_pack_hh_b32_b16" ? ir.binary("lshr", a, "16") : ir.binary("and", a, "65535");
+            const auto hi = n == "s_pack_ll_b32_b16" ? ir.binary("shl", b, "16") : ir.binary("and", b, "4294901760");
+            write(i.dst, ir.binary("or", lo, hi));
+            return;
+        }
+        if (i.enc == Encoding::Sop2 && i.op >= 0x2e && i.op <= 0x31) {
+            unsigned amount = i.op - 0x2d;
+            auto shifted = ir.binary("shl", a, to_string(amount));
+            auto sum = ir.binary("add", shifted, b);
+            auto shifted_out = cmp("ne", ir.binary("lshr", a, to_string(32 - amount)), "0");
+            auto carry = ir.value("or i1 " + shifted_out + ", " + cmp("ult", sum, shifted));
+            write(i.dst, sum);
+            write(128, ir.value("zext i1 " + carry + " to i32"));
+            return;
+        }
+        if ((i.enc == Encoding::Sop1 || i.enc == Encoding::Sop2) && n.size() > 6 && n.substr(n.size() - 4) == "_b64") {
+            bool save = n.find("_saveexec_") != Name::npos;
+            auto op = n.substr(2, n.find('_', 2) - 2);
+            if ((i.dst & 1) || (i.dst > 104 && i.dst != 106 && i.dst != 126) ||
+                (save && i.enc != Encoding::Sop1) || (!save && i.enc != Encoding::Sop2))
+                refuse(i.pc, "unsupported wave64 scalar operation");
+            auto ah = pair_high(i, i.src[0]);
+            auto bl = save ? read(126) : b, bh = save ? read(127) : pair_high(i, i.src[1]);
+            auto combine = [&](const string &left, const string &right) -> string {
+                if (op == "and" || op == "or" || op == "xor") return ir.binary(string(op), left, right);
+                if (op == "andn2" || op == "orn2")
+                    return ir.binary(op == "andn2" ? "and" : "or", left, ir.binary("xor", right, "4294967295"));
+                if (op == "nand" || op == "nor" || op == "xnor")
+                    return ir.binary("xor", ir.binary(op == "nand" ? "and" : op == "nor" ? "or" : "xor", left, right), "4294967295");
+                refuse(i.pc, "unsupported wave64 scalar mask operation");
+            };
+            // SAVEEXEC combines its source operand with the old EXEC in ISA operand order.
+            auto lo = combine(a, bl), hi = combine(ah, bh);
+            write(i.dst, save ? bl : lo);
+            write(i.dst + 1, save ? bh : hi);
+            if (save) { write(126, lo); write(127, hi); }
+            write(128, ir.value("zext i1 " + cmp("ne", ir.binary("or", lo, hi), "0") + " to i32"));
+            return;
+        }
+        if (n == "s_and_saveexec_b32" || n == "s_andn2_wrexec_b32") {
+            auto old = read(126);
+            auto mask = ir.binary("and", a, n == "s_and_saveexec_b32" ? old : ir.binary("xor", old, "4294967295"));
+            write(i.dst, n == "s_and_saveexec_b32" ? old : mask);
+            write(126, mask);
+            write(128, ir.value("zext i1 " + cmp("ne", mask, "0") + " to i32"));
+            return;
+        }
+        if (n == "s_add_i32" || n == "s_sub_i32") {
+            auto z = ir.binary(n == "s_add_i32" ? "add" : "sub", a, b);
+            auto left = ir.binary("xor", a, z);
+            auto right = ir.binary("xor", n == "s_add_i32" ? b : a, n == "s_add_i32" ? z : b);
+            write(128, ir.binary("lshr", ir.binary("and", left, right), "31"));
+            write(i.dst, z);
+            return;
+        }
+        if (n == "s_addc_u32" || n == "s_subb_u32") {
+            auto carry = read(128);
+            bool add = n == "s_addc_u32";
+            auto partial = ir.binary(add ? "add" : "sub", a, b),
+                 result = ir.binary(add ? "add" : "sub", partial, carry);
+            auto flag = add ? cmp("ult", partial, a) : cmp("ult", a, b);
+            auto carry2 = add ? cmp("ult", result, partial) : cmp("ult", partial, carry);
+            write(i.dst, result);
+            write(128, ir.value("zext i1 " + ir.value("or i1 " + flag + ", " + carry2) + " to i32"));
+            return;
+        }
+        if (n == "s_brev_b32" || n == "v_bfrev_b32" || n == "v_bcnt_u32_b32") {
+            bool count = n == "v_bcnt_u32_b32";
+            auto value = ir.invoke("i32", count ? "unaryBits.i32" : "unary.i32", count ? 31 : 30, {{"i32", a}},
+                                   "nounwind readnone");
+            if (scalar)
+                write(i.dst, value);
+            else
+                vector_write(i.dst, place_subword(i, count ? ir.binary("add", value, b) : value));
+            return;
+        }
+        if (n == "v_swap_b32") {
+            if (i.wide || i.src[0] < 256)
+                refuse(i.pc, "invalid vector swap source");
+            auto old = read(i.dst);
+            vector_write(i.dst, a);
+            vector_write(i.src[0], old);
+            return;
+        }
+        if (n == "s_cselect_b32") {
+            write(i.dst, select(cmp("ne", read(128), "0"), a, b));
+            return;
+        }
+        if (n == "s_bitcmp1_b32" || n == "s_bitcmp0_b32") {
+            auto bit = ir.binary("and", shift("lshr", a, b), "1");
+            write(128, n == "s_bitcmp0_b32" ? ir.binary("xor", bit, "1") : bit);
+            return;
+        }
+        if (n == "s_min_u32" || n == "s_max_u32" || n == "s_min_i32" || n == "s_max_i32" ||
+            n == "v_min_u32" || n == "v_max_u32" || n == "v_min_i32" || n == "v_max_i32") {
+            const string sign = n.substr(n.size() - 3) == "i32" ? "s" : "u";
+            auto pred = cmp(sign + (n.substr(2, 3) == "min" ? "lt" : "gt"), a, b);
+            auto result = select(pred, a, b);
+            if (scalar) {
+                write(i.dst, result);
+                write(128, ir.value("zext i1 " + pred + " to i32"));
+            } else {
+                vector_write(i.dst, place_subword(i, result));
+            }
+            return;
+        }
+        if (n == "v_cndmask_b32")
+            z = select(cmp("ne", ir.binary("and", wave64 ? select(upper_half, pair_high(i, i.src[2]), val(2)) : val(2), lane_bit), "0"), b, a);
+        else if (n == "v_mov_b32")
+            z = a;
+        else if (n == "s_mul_i32" || n == "v_mul_lo_u32" || n == "v_mul_lo_i32")
+            z = ir.binary("mul", a, b);
+        else if (n == "v_mul_hi_u32" || n == "v_mul_hi_i32" || n == "s_mul_hi_u32" || n == "s_mul_hi_i32") {
+            // Accumulate 16-bit partial products without requiring Int64ShaderOps.
+            auto lo = [&](const string &v) { return ir.binary("and", v, "65535"); };
+            auto hi = [&](const string &v) { return ir.binary("lshr", v, "16"); };
+            auto al = lo(a), ah = hi(a), bl = lo(b), bh = hi(b);
+            auto middle = ir.binary("add", ir.binary("mul", ah, bl), hi(ir.binary("mul", al, bl)));
+            auto carry = hi(ir.binary("add", lo(middle), ir.binary("mul", al, bh)));
+            z = ir.binary("add", ir.binary("add", ir.binary("mul", ah, bh), hi(middle)), carry);
+            if (n == "v_mul_hi_i32" || n == "s_mul_hi_i32") {
+                z = ir.binary("sub", z, select(cmp("slt", a, "0"), b, "0"));
+                z = ir.binary("sub", z, select(cmp("slt", b, "0"), a, "0"));
+            }
+        } else if (n == "s_abs_i32")
+            z = select(cmp("slt", a, "0"), ir.binary("sub", "0", a), a);
+        else if (n == "v_add_nc_u32" || n == "s_add_u32")
+            z = ir.binary("add", a, b);
+        else if (n == "s_sub_u32" || n == "v_sub_nc_u32")
+            z = ir.binary("sub", a, b);
+        else if (n == "v_subrev_nc_u32")
+            z = ir.binary("sub", b, a);
+        else if (n == "v_not_b32")
+            z = ir.binary("xor", a, "4294967295");
+        else if (n == "s_and_b32" || n == "v_and_b32")
+            z = ir.binary("and", a, b);
+        else if (n == "s_or_b32" || n == "v_or_b32")
+            z = ir.binary("or", a, b);
+        else if (n == "v_xor_b32" || n == "s_xor_b32")
+            z = ir.binary("xor", a, b);
+        else if (n == "v_and_or_b32")
+            z = ir.binary("or", ir.binary("and", a, b), val(2));
+        else if (n == "v_xad_u32")
+            z = ir.binary("add", ir.binary("xor", a, b), val(2));
+        else if (n == "v_or3_b32" || n == "v_xor3_b32" || n == "v_add3_u32") {
+            const char *op = n == "v_or3_b32" ? "or" : n == "v_xor3_b32" ? "xor" : "add";
+            z = ir.binary(op, ir.binary(op, a, b), val(2));
+        } else if (n == "v_add_lshl_u32")
+            z = shift("shl", ir.binary("add", a, b), val(2));
+        else if (n == "v_mul_u32_u24" || n == "v_mad_u32_u24") {
+            z = ir.binary("mul", ir.binary("and", a, "16777215"), ir.binary("and", b, "16777215"));
+            if (n == "v_mad_u32_u24")
+                z = ir.binary("add", z, val(2));
+        } else if ((n.substr(2, 3) == "min" || n.substr(2, 3) == "max" || n.substr(2, 4) == "med3") &&
+                   (n.substr(n.size() - 4) == "_u32" || n.substr(n.size() - 4) == "_i32") && !scalar) {
+            const bool signed_order = n.substr(n.size() - 4) == "_i32";
+            auto bound = [&](const string &x, const string &y, bool minimum) {
+                return select(cmp(signed_order ? (minimum ? "slt" : "sgt") : (minimum ? "ult" : "ugt"), x, y), x, y);
+            };
+            bool minimum = n.substr(2, 3) == "min";
+            if (n.substr(2, 4) == "med3") {
+                auto c = val(2);
+                z = bound(bound(a, b, true), bound(bound(a, b, false), c, true), false);
+            } else {
+                z = bound(a, b, minimum);
+                if (n[5] == '3')
+                    z = bound(z, val(2), minimum);
+            }
+        } else if (n == "v_bfi_b32")
+            z = ir.binary("or", ir.binary("and", a, b), ir.binary("and", ir.binary("xor", a, "4294967295"), val(2)));
+        else if (n == "s_bfe_u32" || n == "s_bfe_i32") {
+            const bool sign = n == "s_bfe_i32";
+            auto offset = ir.binary("and", b, "31");
+            auto width = ir.binary("and", ir.binary("lshr", b, "16"), "127");
+            auto shifted = ir.binary(sign ? "ashr" : "lshr", a, offset);
+            auto pad = ir.binary("and", ir.binary("sub", "32", width), "31");
+            auto narrow = ir.binary(sign ? "ashr" : "lshr", ir.binary("shl", shifted, pad), pad);
+            z = select(cmp("eq", width, "0"), "0", select(cmp("uge", width, "32"), shifted, narrow));
+        }
+        else if (n == "v_bfe_u32")
+            z = ir.binary("and", shift("lshr", a, b), ir.binary("sub", shift("shl", "1", val(2)), "1"));
+        else if (n == "v_bfe_i32") {
+            auto width = ir.binary("and", val(2), "31");
+            auto pad = ir.binary("sub", "32", width);
+            auto field = shift("ashr", a, b);
+            z = select(cmp("eq", width, "0"), "0", shift("ashr", shift("shl", field, pad), pad));
+        } else if (n == "s_orn2_b32")
+            z = ir.binary("or", a, ir.binary("xor", b, "4294967295"));
+        else if (n == "s_nand_b32" || n == "s_xnor_b32")
+            z = ir.binary("xor", ir.binary(n == "s_nand_b32" ? "and" : "xor", a, b), "4294967295");
+        else if (n == "s_ashr_i32")
+            z = shift("ashr", a, b);
+        else if (n == "s_bfm_b32")
+            z = shift("shl", ir.binary("sub", shift("shl", "1", a), "1"), b);
+        else if (n == "s_not_b32")
+            z = ir.binary("xor", a, "4294967295");
+        else if (n == "s_andn2_b32" || n == "s_nor_b32")
+            z = n == "s_andn2_b32" ? ir.binary("and", a, ir.binary("xor", b, "4294967295"))
+                                   : ir.binary("xor", ir.binary("or", a, b), "4294967295");
+        else if (n == "s_lshl_b32" || n == "s_lshr_b32")
+            z = shift(n == "s_lshl_b32" ? "shl" : "lshr", a, b);
+        else if (n == "v_lshlrev_b32" || n == "v_lshrrev_b32" || n == "v_ashrrev_i32")
+            z = shift(n == "v_lshlrev_b32" ? "shl" : n == "v_lshrrev_b32" ? "lshr" : "ashr", b, a);
+        else if (n == "v_lshl_add_u32" || n == "v_lshl_or_b32")
+            z = ir.binary(n == "v_lshl_add_u32" ? "add" : "or", shift("shl", a, b), val(2));
+        else if (n == "v_mbcnt_hi_u32_b32" || n == "v_mbcnt_lo_u32_b32") {
+            bool high = n == "v_mbcnt_hi_u32_b32";
+            auto before = ir.binary("sub", lane_bit, "1");
+            auto mask = wave64 ? select(upper_half, high ? before : "4294967295", high ? "0" : before)
+                               : high ? "0" : before;
+            auto lower = ir.binary("and", a, mask);
+            z = ir.binary("add", b, ir.invoke("i32", "unaryBits.i32", 31, {{"i32", lower}}, "nounwind readnone"));
+        } else if (i.enc == Encoding::Sopc || i.enc == Encoding::Vopc || n.substr(0, 6) == "v_cmpx" ||
+                   n.substr(0, 6) == "v_cmp_") {
+            auto condition = comparison(i, a, b);
+            if (scalar)
+                write(128, ir.value("zext i1 " + condition + " to i32"));
+            else
+                write_ballot(i.dst, condition);
+            return;
+        } else
+            refuse(i.pc, "direct DXIL lowering for " + string(n));
+        if (scalar) {
+            write(i.dst, z);
+            if (n != "s_mul_i32" && n != "s_mul_hi_u32" && n != "s_mul_hi_i32" && n != "s_bfm_b32") {
+                auto flag = n == "s_add_u32"   ? cmp("ult", z, a)
+                            : n == "s_sub_u32" ? cmp("ult", a, b)
+                                               : cmp("ne", z, "0");
+                write(128, ir.value("zext i1 " + flag + " to i32"));
+            }
+        } else
+            vector_write(i.dst, place_subword(i, z));
+    }
+    void mirror(const Inst &i, const State &state, unsigned threads) {
+        // A row is contained in one physical wave32 even for split guest wave64.
+        // Shader control flow stays wave-uniform. Guest EXEC predicates VGPR
+        // writes, so FI can fetch the last VGPR value from a disabled thread.
+        const unsigned mask = i.mirror_mask();
+        if (threads % (mask + 1))
+            refuse(i.pc, "DPP mirror needs complete source lane groups");
+        const auto rule = alu_rules.find(i.name);
+        if (rule == alu_rules.end() || rule->second.arity > 2)
+            refuse(i.pc, "unsupported DPP arithmetic");
+        if (i.enc == Encoding::Vop1 && ((i.neg | i.abs) & 2))
+            refuse(i.pc, "unexpected second DPP source modifier");
+        auto source_lane = ir.binary("xor", lane, to_string(mask));
+        auto src = operand32(i, i.src[0]);
+        auto word = ir.invoke("i32", "waveReadLaneAt.i32", 117, {{"i32",src},{"i32",source_lane}}, "nounwind");
+        string source_enabled, previous;
+        if (!i.dpp_fetch_inactive) {
+            auto exec = wave64 ? select(upper_half, read(127), read(126)) : read(126);
+            source_enabled = cmp("ne", ir.binary("and", exec, ir.binary("shl", "1", source_lane)), "0");
+            if (i.dpp_bound_zero) word = select(source_enabled, word, "0");
+            else previous = read(i.dst);
+        }
+        arithmetic(i, state, &word);
+        if (!previous.empty())
+            write(i.dst, select(source_enabled, read(i.dst), previous));
+    }
+    NativeComputeShader lower(unsigned entry, unsigned user, unsigned flags, unsigned x, unsigned y, unsigned z) {
+        const unsigned lds_words = ((flags >> 15) & 511) * 128;
+        const bool uses_lds = std::any_of(analysis.program.code.begin(), analysis.program.code.end(),
+                                          [](const Inst &i) { return i.enc == Encoding::Lds; });
+        if (uses_lds)
+            ir.globals << "@lds = internal addrspace(3) global [" << lds_words << " x i32] undef, align 4\n";
+        initialize(user, flags, x, y, z);
+        const auto &p = analysis.program;
+        const bool writes_uavs = std::any_of(p.code.begin(), p.code.end(), [](const Inst &i) {
+            return i.name.substr(0, 12) == "buffer_store" || i.name.substr(0, 13) == "buffer_atomic" ||
+                   (i.enc == Encoding::Image && i.op == 8);
+        });
+        std::set<unsigned> labels{entry};
+        ir.body << "  br label %pc" << entry << "\n";
+        for (auto &i : p.code)
+            if (i.branch()) {
+                labels.insert(i.target());
+                if (i.op != 2)
+                    labels.insert(i.next);
+            }
+        for (size_t k = 0; k < p.code.size(); ++k) {
+            const auto &i = p.code[k];
+            if (labels.count(i.pc)) {
+                if (k && p.code[k - 1].name != "s_endpgm" && !p.code[k - 1].branch())
+                    ir.body << "  br label %pc" << i.pc << "\n";
+                ir.body << "pc" << i.pc << ":\n";
+            }
+            if (!p.reached[k]) {
+                ir.body << "  unreachable\n";
+                while (k + 1 < p.code.size() && !labels.count(p.code[k + 1].pc))
+                    ++k;
+                continue;
+            }
+            if (i.branch()) {
+                if (i.op == 2)
+                    ir.body << "  br label %pc" << i.target() << "\n";
+                else {
+                    unsigned r = i.op == 4 || i.op == 5 ? 128 : i.op == 6 || i.op == 7 ? 106 : 126;
+                    auto mask = wave64 && r != 128 ? ir.binary("or", read(r), read(r + 1)) : read(r);
+                    auto pred = cmp((i.op & 1) ? "ne" : "eq", mask, "0");
+                    ir.body << "  br i1 " << pred << ", label %pc" << i.target() << ", label %pc" << i.next << "\n";
+                }
+            } else if (i.name == "s_endpgm")
+                ir.body << "  ret void\n";
+            // Hardware scheduling and register-dependency waits have no SGPR
+            // operands. SSA dependencies carry these constraints into DXIL.
+            else if (i.name == "v_nop" || i.name == "s_inst_prefetch" || i.name == "s_clause" || i.name == "s_nop" ||
+                     i.name == "s_waitcnt" || i.name == "s_waitcnt_depctr" || i.name == "s_setprio")
+                continue;
+            else if (i.enc == Encoding::Mubuf || i.enc == Encoding::Smem)
+                memory(i, p.before[k]);
+            else if (i.enc == Encoding::Lds)
+                local_memory(i, lds_words);
+            else if (i.name == "s_barrier")
+                barrier(writes_uavs ? 11 : 9); // group rendezvous, LDS and, when used, UAV memory
+            else if (i.name == "s_waitcnt_vscnt" || i.name == "s_waitcnt_vmcnt" ||
+                     i.name == "s_waitcnt_lgkmcnt" || i.name == "s_waitcnt_expcnt") {
+                // null,0 drains this wave's counter. Memory-only barriers
+                // preserve ordering without rendezvousing other workgroup waves.
+                if (i.dst != 125 || (i.a & 65535))
+                    refuse(i.pc, "compute counter wait requires null and a zero threshold");
+                if (i.name == "s_waitcnt_lgkmcnt" && uses_lds)
+                    barrier(8);
+                if ((i.name == "s_waitcnt_vscnt" || i.name == "s_waitcnt_vmcnt") && writes_uavs)
+                    barrier(2);
+            }
+            else if (i.enc == Encoding::Sopp)
+                refuse(i.pc, "unsupported compute control instruction " + string(i.name));
+            else if (i.enc == Encoding::Image)
+                image_io(i, p.before[k]);
+            else if (i.mirror_mask())
+                mirror(i, p.before[k], x*y*z);
+            else
+                arithmetic(i, p.before[k]);
+        }
+        auto &r = analysis.result;
+        r.instruction_count = unsigned(p.code.size());
+        const unsigned rank_words = x * y * z > 64 ? x * y * z : 0;
+        if ((uses_lds ? lds_words : 0) + rank_words + (uses_exchange ? exchange_words : 0) > 8192)
+            refuse(entry, "combined shared storage exceeds 32 KiB");
+        r.dxil_ir = ir.finish_compute(x, y, z);
+        return std::move(r);
+    }
+};

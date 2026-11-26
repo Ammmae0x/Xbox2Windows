@@ -2,6 +2,53 @@
 
 New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiments/README.md)); this file keeps the older notes.
 
+## Guest row mirrors and masked branches in the direct DXIL frontend
+
+The hardware fixture gives each guest lane a distinct value. DPP16 control
+`0x141` reverses each group of eight and `0x140` reverses each group of
+sixteen. The reference implementation at Victory revision `9376fd6` computes
+these indices in `victory-shader/src/emit/lower.rs::dpp`. Its `cross_lane`
+check restricts pixel shaders to quad-local operations. The older Python
+`pixel_aot.parse_dpp` also checks whether both halves use the same quad
+permutation. The compute shader exchanges the first operand before applying the
+local second operand. A sparse EXEC mask distinguishes fetching an inactive
+source, supplying zero and retaining the destination. The test checks both
+workgroups and the surrounding buffer guards.
+
+The pixel fixture opens EXEC to all lanes, seeds a guest register with scalar
+lane writes and reads back lanes in each half of a guest wave64. The compiler
+can track those words independently of the desktop rasterizer's choice of
+quads. A second fixture uses repeated min/max, alternate-row selection and
+a scalar lane broadcast. An ordinary WQM pixel input whose source lies in
+another quad still requires a guest pixel-wave layout. For structured vertex
+EXEC branches the container fixture checks control-flow joins, saved-mask
+clobbers and scalar values escaping a masked arm.
+
+```powershell
+cmake --build --preset dev --target compile_dxil native_store_replay offscreen_check
+ctest --preset dev --no-tests=error -R '^(native_dpp_mirror_hardware|native_direct_container)$'
+```
+
+### Pixel coverage and whole-wave mask branches
+
+For a mask held in scalar registers, `s_wqm_b32` and `s_wqm_b64` expand
+each occupied four-bit group to four ones. A scalar region that saves the
+expanded EXEC or branches on zero tests the complete guest width. The fixture
+includes a wave64 with only bit 32 set and a wave32 with the same two input
+words. They take opposite branches.
+
+A separate pixel fixture interpolates a value, removes covered lanes where it
+is negative, runs a quad permutation under WQM and restores exact coverage
+before exporting. A survivor can read a neighbor whose coverage was removed.
+Successive filters intersect the surviving coverage. This lowering checks that
+an empty quad cannot contribute to another quad or leave an observable store.
+A cross-quad permutation in the same live arm is a rejection control.
+
+```powershell
+cmake --build --preset dev --target compile_dxil offscreen_check
+ctest --preset dev --no-tests=error -V -R '^native_graphics_wqm_hardware$'
+```
+
 ## Desktop culling and front-face winding
 
 `raster_winding_warp` and `raster_winding_hardware` draw two mirrored triangles

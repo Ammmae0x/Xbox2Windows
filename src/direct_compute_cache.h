@@ -1,0 +1,16 @@
+#pragma once
+
+#include "gfx1013_compute_native.h"
+
+// The result includes the emitted DXIL module and its exact desktop/guest binding layout.
+namespace x2w {
+size_t index_graphics_interfaces(const std::filesystem::path &source, const std::filesystem::path &cache);
+// Signature component (f32/u32/i32) for supported typed IA and RTV formats.
+unsigned dxil_io_component(unsigned dxgi_format);
+NativeComputeShader prepare_direct_compute(const std::filesystem::path &input, unsigned entry, bool container,
+                                           const std::filesystem::path &cache, bool &cache_hit);
+DirectGraphicsPair prepare_direct_graphics(std::string_view a, std::string_view b,
+                                          const std::filesystem::path &cache, bool &cache_hit,
+                                          std::string_view root = {}, std::string_view input_layout = {},
+                                          std::string_view pixel_entry = {});
+}
