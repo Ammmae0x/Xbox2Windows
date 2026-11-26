@@ -2107,9 +2107,11 @@ const int virtual_query_ex_wrapped = [] {
 // a kernel copy into or out of a page of the run being taken apart fails at once, with no fault to retry. Measured
 // under Wine (tests/xmem_run_break_readers_check.cpp, ReadFile_import and WriteFile_import): ReadFile fails with
 // ERROR_NOACCESS and leaves the file position where it was, WriteFile with ERROR_INVALID_USER_BUFFER. A synchronous
-// call (no OVERLAPPED) that fails with one of those while a break was in progress, or began or ended around it, and
-// whose buffer lies in a run, waits for memory.mutex (the end of the break) and runs again, at most io_attempts times
-// in all. A call that fails that way with no break around it, or outside the runs, fails at once as before.
+// call (no OVERLAPPED) on a disk file that fails with one of those while a break was in progress, or began or ended
+// around it, and whose buffer lies in a run, waits for memory.mutex (the end of the break) and runs again, at most
+// io_attempts times in all. A call that fails that way with no break around it, outside the runs, or on a handle that
+// is not a disk file, fails at once as before: a pipe, socket or console may have consumed or sent data in the failed
+// call, so running it again could lose or repeat that data. GetFileType is asked only on that failure path.
 // Not covered: overlapped I/O (the copy happens at completion, after the call has returned), a call that a break
 // cuts short after part of the copy (a short count), and I/O from other modules or through GetProcAddress.
 using WriteFileFn = BOOL(WINAPI*)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
@@ -2128,7 +2130,7 @@ bool in_a_run(const void* buffer, DWORD bytes)
 }
 
 template <class Call>
-BOOL io_outside_breaks(const void* buffer, DWORD bytes, LPOVERLAPPED overlapped, const Call& call)
+BOOL io_outside_breaks(HANDLE file, const void* buffer, DWORD bytes, LPOVERLAPPED overlapped, const Call& call)
 {
     if (overlapped || !buffer || !bytes || mapping_thread || !shared_views_on.load(std::memory_order_acquire)) return call();
     for (int attempt = 1;; ++attempt) {
@@ -2137,7 +2139,7 @@ BOOL io_outside_breaks(const void* buffer, DWORD bytes, LPOVERLAPPED overlapped,
         const DWORD error = GetLastError();
         const bool broken = (before & 1) || break_generation() != before;
         if ((error != ERROR_NOACCESS && error != ERROR_INVALID_USER_BUFFER) || !broken || attempt == io_attempts ||
-            !in_a_run(buffer, bytes)) {
+            GetFileType(file) != FILE_TYPE_DISK || !in_a_run(buffer, bytes)) {
             SetLastError(error);
             return FALSE;
         }
@@ -2146,12 +2148,12 @@ BOOL io_outside_breaks(const void* buffer, DWORD bytes, LPOVERLAPPED overlapped,
 
 BOOL WINAPI read_file_stable(HANDLE file, LPVOID buffer, DWORD bytes, LPDWORD read, LPOVERLAPPED overlapped)
 {
-    return io_outside_breaks(buffer, bytes, overlapped, [&] { return next_read_file(file, buffer, bytes, read, overlapped); });
+    return io_outside_breaks(file, buffer, bytes, overlapped, [&] { return next_read_file(file, buffer, bytes, read, overlapped); });
 }
 
 BOOL WINAPI write_file_stable(HANDLE file, LPCVOID buffer, DWORD bytes, LPDWORD written, LPOVERLAPPED overlapped)
 {
-    return io_outside_breaks(buffer, bytes, overlapped, [&] { return kernel_write_file(file, buffer, bytes, written, overlapped); });
+    return io_outside_breaks(file, buffer, bytes, overlapped, [&] { return kernel_write_file(file, buffer, bytes, written, overlapped); });
 }
 
 const int file_io_wrapped = [] {

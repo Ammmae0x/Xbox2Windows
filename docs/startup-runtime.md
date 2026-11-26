@@ -3205,10 +3205,13 @@ run once, as before.
 Inside an unmap a kernel copy into or out of a page of that view fails at once. Measured under
 Wine: `ReadFile` fails with `ERROR_NOACCESS` and leaves the file position as it was, `WriteFile`
 with `ERROR_INVALID_USER_BUFFER`. The main module's `ReadFile` and `WriteFile` imports therefore
-run again, up to 4 times in all, when a synchronous call fails with one of those errors while an
-unmap or join was in progress or began or ended around it, and its buffer lies in a view of a
-run; they wait for that one to end first. Overlapped I/O (the copy happens at completion), a call
-cut short after part of the copy, and I/O from other modules are not covered.
+run again, up to 4 times in all, when a synchronous call on a disk file fails with one of those
+errors while an unmap or join was in progress or began or ended around it, and its buffer lies in
+a view of a run; they wait for that one to end first. A call on a pipe, socket or console is not
+run again, because the failed call may already have consumed or sent data (measured under Wine: an
+anonymous pipe read inside an unmap fails with `ERROR_NOACCESS` and leaves its data queued).
+Overlapped I/O (the copy happens at completion), a call cut short after part of the copy, and I/O
+from other modules are not covered.
 
 | | Default | `X2W_XMEM_SHARED_VIEWS=1` |
 |---|---|---|

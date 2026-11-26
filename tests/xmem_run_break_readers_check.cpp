@@ -8,8 +8,9 @@
 //
 // Cases (one window each): x2w_xmem_stable_call, XMemVirtualQuery, this program's VirtualQueryEx import (wrapped by
 // xmem.dll when it loads with the switch), this program's ReadFile and WriteFile imports (synchronous, into and out
-// of the page; wrapped the same way), x2w_local::writable, x2w_startup::measure_placed_buffer and
-// x2w_startup::snapshot_samplers. Then io_outside_runs: a ReadFile into a reserved page in no run fails at once.
+// of the page; wrapped the same way), a ReadFile from an anonymous pipe into the page (not run again: it fails inside
+// the window), x2w_local::writable, x2w_startup::measure_placed_buffer and x2w_startup::snapshot_samplers. Then
+// io_outside_runs: a ReadFile into a reserved page in no run fails at once.
 //
 // With `control` (the build whose local_log.h asks xmem.dll for a missing export, so the header readers run
 // directly) the three header readers answer inside the window: the check expects that, and fails if they wait.
@@ -266,6 +267,41 @@ bool write_file_from(unsigned char* target)
     const bool read = h != INVALID_HANDLE_VALUE && ReadFile(h, data, io_bytes, &done, nullptr) && done == io_bytes;
     if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
     return read && std::memcmp(data, target, io_bytes) == 0;
+}
+
+// An anonymous pipe with two 4096-byte messages queued, read into the page inside the window. The wrapper runs a
+// failed call again only on a disk file, so this one fails inside the window instead of waiting for the break. Its
+// error must be one the wrapper retries on a disk file, or answering at once would show nothing. Measured under Wine
+// (Proton Experimental, 2026-11): ERROR_NOACCESS inside the window, both messages still queued. A pipe read into a
+// mapped page of a run fails there even outside a break (ERROR_INVALID_USER_BUFFER), while one into a VirtualAlloc
+// buffer reads the first message, so a retry after the break would not have read it either.
+struct PipeRead {
+    BOOL ok = FALSE;
+    DWORD bytes = 0, error = 0, queued_before = 0, queued_after = 0;
+    bool second_message = false;  // the bytes read are the second message's
+} pipe_read;
+
+bool read_pipe_into(unsigned char* target)
+{
+    HANDLE r = nullptr, w = nullptr;
+    if (!CreatePipe(&r, &w, nullptr, 16 * io_bytes)) return false;
+    unsigned char first[io_bytes], second[io_bytes];
+    io_pattern(first);
+    std::memset(second, 0x5a, io_bytes);
+    DWORD done = 0;
+    const bool queued = WriteFile(w, first, io_bytes, &done, nullptr) && done == io_bytes &&
+                        WriteFile(w, second, io_bytes, &done, nullptr) && done == io_bytes;
+    PipeRead& p = pipe_read;
+    PeekNamedPipe(r, nullptr, 0, nullptr, &p.queued_before, nullptr);
+    p.ok = queued && ReadFile(r, target, io_bytes, &p.bytes, nullptr);
+    p.error = p.ok ? 0 : GetLastError();
+    PeekNamedPipe(r, nullptr, 0, nullptr, &p.queued_after, nullptr);
+    p.second_message = p.ok && std::memcmp(target, second, io_bytes) == 0;
+    CloseHandle(r);
+    CloseHandle(w);
+    std::printf("ReadFile from a pipe into the run: ok=%d bytes=%lu error=%lu queued before %lu after %lu, second "
+                "message %d\n", p.ok, p.bytes, p.error, p.queued_before, p.queued_after, p.second_message);
+    return p.ok && p.bytes == io_bytes && std::memcmp(target, first, io_bytes) == 0;
 }
 
 // A read into a reserved page that is in no run fails at once, as without the wrapper: nothing waits for it.
@@ -832,6 +868,9 @@ int main(int argc, char** argv)
         });
         window_case(shim, at, index++, "ReadFile_import", true, read_file_into);
         window_case(shim, at, index++, "WriteFile_import", true, write_file_from);
+        window_case(shim, at, index++, "ReadFile_pipe", false, read_pipe_into);
+        check(!pipe_read.ok && (pipe_read.error == ERROR_NOACCESS || pipe_read.error == ERROR_INVALID_USER_BUFFER),
+              "fails_with_an_error_the_wrapper_retries_for_disk_files", "ReadFile_pipe");
         io_outside_runs();
     }
     // The header readers: waiting with the export, answering inside the window without it (control).
