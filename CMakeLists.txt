@@ -4663,6 +4663,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tools/fuzz_cpu.py" check "${CPU_FUZZ_SEED}" "${CPU_FUZZ_FUNCTIONS}"
         "$<TARGET_FILE:cpu_fuzz>" "$<TARGET_FILE:cpu_fuzz_lifted>" "${cpu_fuzz_o2}")
     set_tests_properties(cpu_aot_fuzz_smoke PROPERTIES TIMEOUT 60)
+    add_test(NAME tooling_fuzz_cpu_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/fuzz_cpu_cli_check.py")
+    set_tests_properties(tooling_fuzz_cpu_cli_check PROPERTIES TIMEOUT 60)
     # Fixed RSP frames: saved nonvolatile registers, partial spill overlaps and a planted reload fault.
     set(CPU_FUZZ_FRAMES_SEED "0xF4A3" CACHE STRING "Seed for the CPU differential fuzz frame test")
     set(CPU_FUZZ_FRAMES_FUNCTIONS "16" CACHE STRING "Number of generated functions in the CPU differential fuzz frame test")
