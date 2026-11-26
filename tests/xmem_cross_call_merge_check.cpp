@@ -10,7 +10,7 @@
 //   deployed  (deployed xmem.dll, X2W_XMEM_TEST_NO_MERGE=1) the deployed shim ignores the test switch and merges.
 //   default   (deployed xmem.dll, X2W_XMEM_SHARED_VIEWS unset) every page keeps a view of its own.
 //   timing    (test-controls xmem.dll; not a ctest case) ms of a join, of a break and of an own-view map against the
-//             run length R (X2W_XMEM_TEST_MERGE_CAP), for the cap's table in the review notes.
+//             run length R (X2W_XMEM_TEST_MERGE_CAP): a table of "timing:" lines, one row per R from 16 to 4096.
 // The pass line of control, deployed and default is printed at the end of main, only when no check failed.
 //
 // Cases of `check`:
@@ -326,7 +326,7 @@ void capped(const Shim& shim, unsigned char* base)
           shim.release(n, tokens.data()), "capped: unmap and release");
 }
 
-// timing (not a ctest case; ready.md's table): for a run of R pages, the ms of the call that joins page R to a run of
+// timing (not a ctest case; one row per R): for a run of R pages, the ms of the call that joins page R to a run of
 // R - 1 (X2W_XMEM_TEST_MERGE_CAP=R), of the unmap of page R/2 (one break of the whole run) and, for comparison, of a
 // single-page call that maps a view of its own (X2W_XMEM_TEST_NO_MERGE=1). Every byte of the run is written before
 // the join and before the break, as a title's use of the pages would (a run that is mostly untouched unmaps much

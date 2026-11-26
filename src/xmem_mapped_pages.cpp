@@ -1761,9 +1761,6 @@ extern "C" BOOL WINAPI x2w_xmem_stable_call(void (*fn)(void*), void* context)
     return TRUE;
 }
 
-// Experimental export: the slab accounting behind those pages (#1199): slabs open, slots in use and slots free
-// in the open slabs. A slab is reserved when it is created, its slots are committed on first use, and empty slabs
-// are closed when all of their slots are freed and unpinned.
 // Test export: MapViewOfFile3 and placeholder-split attempts made by the physical-page map path so far.
 extern "C" BOOL WINAPI x2w_xmem_map_counts(ULONGLONG* maps, ULONGLONG* splits)
 {
@@ -1773,6 +1770,9 @@ extern "C" BOOL WINAPI x2w_xmem_map_counts(ULONGLONG* maps, ULONGLONG* splits)
     return TRUE;
 }
 
+// Experimental export: the slab accounting behind those pages (#1199): slabs open, slots in use and slots free
+// in the open slabs. A slab is reserved when it is created, its slots are committed on first use, and empty slabs
+// are closed when all of their slots are freed and unpinned.
 extern "C" BOOL WINAPI x2w_xmem_slab_stats(ULONGLONG* slabs, ULONGLONG* slots_in_use, ULONGLONG* slots_free)
 {
     if (!slabs || !slots_in_use || !slots_free) return FALSE;
