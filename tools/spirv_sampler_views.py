@@ -11,8 +11,15 @@ BRIDGE = "%bridge_cmp"
 BRIDGE_SET = "3"
 
 
+def _require_assembly_str(assembly):
+    """Reject non-string SPIR-V assembly inputs."""
+    if not isinstance(assembly, str):
+        raise ValueError(f"assembly must be a str, got {type(assembly).__name__}")
+
+
 def strip_comments(assembly):
     """Split into lines and drop `;` comments; a quoted string may span lines and may hold a `;`."""
+    _require_assembly_str(assembly)
     lines, quoted, escaped = [], False, False
     for line in assembly.splitlines():
         end = len(line)
@@ -133,18 +140,23 @@ def table_slot(module, table):
     sets, bindings = module["sets"].get(table, []), module["bindings"].get(table, [])
     if len(sets) != 1 or len(bindings) != 1 or len(sets[0]) != 1 or len(bindings[0]) != 1:
         raise ValueError("sampler table requires one DescriptorSet and one Binding decoration")
-    if not (sets[0][0].isdigit() and bindings[0][0].isdigit()):
+    if not (sets[0][0].isascii() and sets[0][0].isdigit()
+            and bindings[0][0].isascii() and bindings[0][0].isdigit()):
         raise ValueError("sampler table requires literal DescriptorSet and Binding numbers")
-    if table in module["decorated"] or len(module["defs"][table]) != 3:
+    if table in module["decorated"] or len(module["defs"].get(table, [])) != 3:
         raise ValueError("unsupported sampler table declaration")
     return sets[0][0], bindings[0][0]
 
 
 def register_end(defs, table, binding):
     """The first register after a table's views; a runtime or unresolvable size has no end."""
-    shape = defs[defs[defs[table][1]][2]]
-    length = defs.get(shape[2], []) if shape[0] == "OpTypeArray" else []
-    if len(length) == 3 and length[0] == "OpConstant" and length[2].isdigit() and int(length[2]) > 0:
+    decl = defs.get(table, [])
+    pointer = defs.get(decl[1], []) if len(decl) >= 2 else []
+    shape = defs.get(pointer[2], []) if len(pointer) >= 3 else []
+    length = defs.get(shape[2], []) if len(shape) >= 3 and shape[0] == "OpTypeArray" else []
+    if (len(length) == 3 and length[0] == "OpConstant"
+            and length[2].isascii() and length[2].isdigit() and int(length[2]) > 0
+            and str(binding).isascii() and str(binding).isdigit()):
         return int(binding) + int(length[2])
     return None
 
@@ -164,6 +176,7 @@ def bridge_names(module, split):
 
 
 def split_sampler_views(assembly):
+    _require_assembly_str(assembly)
     if "Dref" not in assembly:
         return assembly
     lines = strip_comments(assembly)
@@ -179,7 +192,7 @@ def split_sampler_views(assembly):
         return assembly
     if module["indirect"]:
         raise ValueError("unsupported indirect descriptor decorations")
-    set_three = any(values and values[0].isdigit() and int(values[0]) == int(BRIDGE_SET)
+    set_three = any(values and values[0].isascii() and values[0].isdigit() and int(values[0]) == int(BRIDGE_SET)
                     for assigned in module["sets"].values() for values in assigned)
     if BRIDGE in assembly or set_three:
         raise ValueError("comparison sampler view requires free descriptor set 3 and bridge_cmp IDs")
