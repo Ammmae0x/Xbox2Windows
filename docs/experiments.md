@@ -17781,3 +17781,21 @@ python -B tests/docs_links_check.py
 
 `startup_resource_retire_reasons` drives the `Held` attribution line; `startup_resource_retire_views` proves the
 design-B keep cases (a live slot stays reboundable after final `Release()` and completed fences). The tables above record contributors' local executable runs. The fixtures validate the retention behavior independently. Refs #2379, #2679, #2719, #1199.
+
+## Binary16 normalized integer conversions (`v_cvt_norm_i16_f16`, `v_cvt_norm_u16_f16`) across VOP1/VOP3/DPP16/DPP8/SDWA in pixel_aot
+
+[The pixel shader translator](../tools/pixel_aot.py) adds 10 exact binary16 normalized integer conversion forms across all 5 encodings (counted in both `docs/coverage/gfx1013.tsv` and `docs/coverage/rdna2.tsv`):
+
+- `v_cvt_norm_i16_f16` (`VOP1`, `VOP3` `_e64`, `DPP16`, `DPP8`, `SDWA` — 5 forms)
+- `v_cvt_norm_u16_f16` (`VOP1`, `VOP3` `_e64`, `DPP16`, `DPP8`, `SDWA` — 5 forms)
+
+All 10 require explicit `half_denorm="preserve"`, refuse `HALF_RTZ`, enforce the static finite-proof contract (`#839`), and tag plain/e64/DPP/SDWA-DWORD destinations as `("low16", alu)` (readable only by audited 16-bit integer readers). `cvt_norm_i16_f16` (`round_rne(clamp(x, -1, 1) * 32767)`) and `cvt_norm_u16_f16` (`round_rne(clamp(x, 0, 1) * 65535)`) compute the exact rational product in 32-bit unsigned integer arithmetic, avoiding binary32 double-rounding on `0x3801..0x3804` / `0xb801..0xb802` and preserving subnormal inputs (`0x0100`, `0x03ff`, `0x83ff`) under `-denorm ftz`.
+
+```powershell
+python3 tests/pixel_aot_check.py
+ctest --preset dev --no-tests=error -R '^(pixel_aot_f16_cvt_norm_warp|pixel_aot_f16_cvt_norm_hardware|pixel_aot_binary)$' -V
+```
+
+Linux controls (including exhaustive verification against `fractions.Fraction` across all 63,488 finite binary16 values and single-instruction DPP16/DPP8 permutation-to-intrinsic checks pinning `QuadReadAcross{X,Y,Diagonal}` and `QuadReadLaneAt` lane order), `form_coverage_check.check_f16_cvt_norm_forms`, and Python mutation checks ran locally; Ubuntu LLVM 15 `pixel_aot_binary` round-trips run on PR CI, while `pixel_aot_f16_cvt_norm_{warp,hardware}` runs in `dev`/`release` presets and `main` CI (not `ctest --preset pr`). The draw harness compiles each fixture both optimized (`-denorm preserve`) and unoptimized (`-Od -denorm ftz`) so DXC retains the pure-`uint` conversion arithmetic in DXIL rather than constant-folding `plain_e32`/`plain_e64`/`sdwa` to immediate stores (note: because no binary32 float ops are emitted in `cvt_norm_{i16,u16}_f16`, `-denorm ftz` produces the same integer instructions as `-denorm preserve`).
+
+Independent Windows 11 (`26200.9974`, DXC `1.9.2602.17`, `debug_layer=unavailable`) measurements on `bd8f6f42` ([comment 1](https://github.com/R0Y00/Xbox2Windows/pull/2857#issuecomment-7196200555)) and `3100f363` ([comment 2](https://github.com/R0Y00/Xbox2Windows/pull/2857#issuecomment-7200844836)) passed `pixel_aot_f16_cvt_norm_hardware` (`AMD Radeon RX 9070 XT` `1002:7550`, driver `32.0.32029.2010`) and `pixel_aot_f16_cvt_norm_warp` with `max_absolute_error=0`, all 20 mutation draws mismatching, and DXIL disassembly confirming the `-Od` pass retains the `mul`/`lshr`/`shl` integer path. Scope limits: under `#839`'s static finite-proof contract (`half16_arith_source` / `half16_dpp_source`), operands are statically known per-lane uniform values, so device draw readbacks do not distinguish lane-routing changes on `dpp16`/`dpp8` (the permutation-to-intrinsic mapping is pinned statically in `check_f16_cvt_norm_controls`), mutation draws compile optimized rather than `-Od`, and the exhaustive 63,488-value check runs in Python rather than on-device.
