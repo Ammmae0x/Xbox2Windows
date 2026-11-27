@@ -127,7 +127,7 @@ NativeComputeShader decode(std::string_view bytes) {
     unsigned n = in.count(1000000);
     shader.bindings.reserve(n);
     for (unsigned j = 0; j < n; ++j) {
-        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::byte_window_srv)));
+        auto kind = static_cast<ComputeViewKind>(in.count(static_cast<unsigned>(ComputeViewKind::heap_buffer_srv)));
         ComputeViewBinding b{kind, in.word(), in.word(), in.word(), in.word(), in.word(), in.word(), in.count(7)};
         b.scalar_table = static_cast<ComputeViewBinding::ScalarTable>(in.count(unsigned(ComputeViewBinding::ScalarTable::srv)));
         if (!b.array_count || b.array_position >= b.array_count ||
@@ -307,12 +307,17 @@ size_t index_graphics_interfaces(const fs::path &source, const fs::path &cache) 
     return count;
 }
 NativeComputeShader prepare_direct_compute(const std::filesystem::path &input, unsigned entry, bool container,
-                                           const std::filesystem::path &cache, bool &cache_hit) {
+                                           const std::filesystem::path &cache, bool &cache_hit,
+                                           HeapViewContract heap_view) {
+    if (!container && heap_view != HeapViewContract::none)
+        throw std::runtime_error("a heap view contract needs a container request");
     ComputeRequest request{};
     ComputeContainer packed;
     Bytes identity = X2W_NATIVE_SHADER_REVISION;
     identity += container ? "/container/cs_6_6" : "/slot67/cs_6_6";
     word(identity, container ? 0 : entry);
+    if (heap_view != HeapViewContract::none)
+        identity += heap_view == HeapViewContract::raw_buffer ? "/heap-view/raw_buffer" : "/heap-view/other";
     if (container) {
         packed = read_compute_container(input);
         identity += shader_digest(packed.bytes) + shader_digest(packed.root);
@@ -334,7 +339,7 @@ NativeComputeShader prepare_direct_compute(const std::filesystem::path &input, u
         }
     }
     if (!cache_hit) {
-        program = container ? translate_compute_container(std::move(packed)) : translate_compute(request, entry, true);
+        program = container ? translate_compute_container(std::move(packed), heap_view) : translate_compute(request, entry, true);
         publish(path, key, encode(program));
     }
     return program;

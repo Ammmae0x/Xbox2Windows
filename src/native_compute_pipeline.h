@@ -18,6 +18,8 @@ struct NativeComputePipeline {
     unsigned constant_words = 0, atomic_views = 0;
     unsigned instructions = 0;
     bool cache_hit = false, frontend_cache_hit = false;
+    bool heap_indexed = false; // reads ResourceDescriptorHeap: the root signature indexes the heap directly, which must be set
+                               // on the list (bind() does it) and holds the selectable slots from index 0
     double frontend_ms = 0;
     double backend_ms = 0;
     double pipeline_ms = 0;
@@ -29,6 +31,7 @@ struct NativeComputePipeline {
 
 NativeComputePipeline create_native_compute_pipeline(ID3D12Device *device, ShaderDxilCompiler &compiler,
                                                      const std::filesystem::path &marker, unsigned entry,
-                                                     const std::filesystem::path &cache, bool direct_dxil = false);
+                                                     const std::filesystem::path &cache, bool direct_dxil = false,
+                                                     HeapViewContract heap_view = HeapViewContract::none);
 
 } // namespace x2w
