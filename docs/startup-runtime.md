@@ -3553,7 +3553,8 @@ texture with that description exists at the address, its view is created as befo
 70 already read from an address keep their own paths unchanged: the single texel, the `0x105`
 BC3/BC7 surface (partial last tiles included) and the `0x109` BC chains. For any other description
 with no live texture whose `Layout` is `0x101`, `0x102`, `0x105`, `0x106`, `0x109` or `0x10a` (256 B,
-4 KiB and 64 KiB blocks in the standard and display orders, no XOR), the texels are read from the
+4 KiB and 64 KiB blocks in the standard and display orders, no XOR) or the linear mode `0x100` (rows
+whose pitch is rounded up to 256 bytes, the mips stored from the smallest up), the texels are read from the
 address in that console layout (`src/startup_stubs/address_texture.h`, device-free). A translated
 draw that samples the view copies each mip of each array slice from that layout into desktop
 footprint rows (`src/startup_stubs/gfx10_layout.h`: address equations, block sizes and mip-tail rules
@@ -3570,8 +3571,8 @@ viewed as a Texture3D. addrlib lays a 3D resource in a standard or display mode 
 `GFX10_SW_4K_S3_PATINFO`, the block is 16x16x16, 8x16x16, 8x16x8, 8x8x8 or 4x8x8 elements for 1- to
 16-byte elements, and blocks follow along x, then y, then a layer of blocks at a time along z, with
 every side padded to whole blocks. Each depth layer is copied to its own footprint rows.
-Anything else is refused as before and leaves the destination descriptor unchanged: layout `0` and
-the linear mode `0x100` without a live texture, cube views, three-dimensional descriptions in any
+Anything else is refused as before and leaves the destination descriptor unchanged: layout `0`
+without a live texture, cube views, three-dimensional descriptions in any
 other layout, with a mip chain or with a block-compressed format, multisampled textures, the XOR
 swizzle modes and every other layout value. The texels must be readable and span
 at most 64 MiB.
