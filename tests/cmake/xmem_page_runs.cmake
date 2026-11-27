@@ -28,7 +28,7 @@ add_test(NAME xmem_run_break_readers_next_break_control COMMAND xmem_run_break_r
 # the readers' output buffer in a mapped slot not yet committed.
 add_test(NAME xmem_run_break_readers_default COMMAND xmem_run_break_readers_check "$<TARGET_FILE:xmem_shim_test_controls>" default)
 add_test(NAME xmem_run_break_readers_lazy COMMAND xmem_run_break_readers_check "$<TARGET_FILE:xmem_shim_test_controls>" lazy)
-# A fault handler that reads the breaks after a later break on another run has begun: a second unmap on a disjoint
+# A fault handler that looks the page up after a later break on another run has begun: a second unmap on a disjoint
 # run, and one permissive call that joins the CPU run and then its GPU mirror run (X2W_XMEM_GPU_MIRROR; the program
 # sets X2W_XMEM_JOIN_CALLS=1 for `mirror` only).
 # stamps: a held fault whose break is followed by 63, 64 or 200 later breaks on another page is retried each time

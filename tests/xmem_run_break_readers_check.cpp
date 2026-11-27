@@ -17,12 +17,13 @@
 //
 // Then a page that faults in two breaks in a row (retry_remapped_page): a thread faults on a page of a run taken
 // apart by break A, and the test build's X2W_XMEM_TEST_HOLD_RETRY holds the handler until break A has ended, so the
-// handler reads the generation after it; the thread is retried and reads its page. Break B then takes the same page
-// apart, and the thread faults on it again: that fault must be retried as well (a different break). With
-// `next-break-control` the handler is not held, so it reads break A while A is open: that order passes even when
-// the handler names the breaks wrongly, which shows the hold is what this case depends on.
+// handler finds the page mapped again and looks up the stamp break A left on the run; the thread is retried and reads
+// its page. Break B then takes the same page apart and stamps the run again, and the thread faults on it again: that
+// fault must be retried as well (a different stamp). With `next-break-control` the handler is not held, so it sees
+// break A in progress and waits for memory.mutex before the lookup: that order passes even when the handler's check
+// of a fault after its break has ended is wrong, which shows the hold is what this case depends on.
 //
-// A fault whose handler reads the breaks only after a later break on another run has begun (two_runs: break B on a
+// A fault whose handler looks the page up only after a later break on another run has begun (two_runs: break B on a
 // disjoint run; mirror: one permissive XMemMapPhysicalPages call that joins the CPU run and then its GPU mirror run)
 // must be retried as well: the page's run keeps the stamp of the break that mapped it again, whatever breaks follow on
 // other runs. Joins across calls need X2W_XMEM_JOIN_CALLS=1: main sets it for `mirror` and clears it for every other
@@ -490,7 +491,7 @@ struct Events {
 };
 
 // Break A: unmap page 7 of a run of eight; break B: unmap page 6 of what is left, [0, 7). The reader's page 2 is in
-// both. hold_retry: the handler for the fault in break A reads the break only after A has ended.
+// both. hold_retry: the handler for the fault in break A looks the page up only after A has ended.
 void next_break_case(const Shim& shim, unsigned char* base, bool hold_retry)
 {
     const char* const name = hold_retry ? "next_break" : "next_break_control";
@@ -522,12 +523,12 @@ void next_break_case(const Shim& shim, unsigned char* base, bool hold_retry)
         check(WaitForSingleObject(retry.first, 10000) == WAIT_OBJECT_0, "handler_held_before_reading_the_break", name);
         SetEnvironmentVariableA("X2W_XMEM_TEST_HOLD_RETRY", nullptr);
     } else {
-        Sleep(100);  // the handler reads break A while it is open, then waits for it
+        Sleep(100);  // the handler sees break A in progress and waits for memory.mutex
     }
     SetEvent(window_a.second);
     unmap_a.join();
     check(raw_state(target) == MEM_COMMIT, "break_a_ended", name);
-    if (hold_retry) SetEvent(retry.second);  // the handler now reads the generation after break A
+    if (hold_retry) SetEvent(retry.second);  // the handler now looks the page up after break A
     for (int i = 0; i < 200 && reads.load() < 1; ++i) Sleep(10);
     check(reads.load() == 1 && first_value == 0x52000002u, "first_fault_retried", name);
 
@@ -546,12 +547,12 @@ void next_break_case(const Shim& shim, unsigned char* base, bool hold_retry)
     shim.map(base, 6, nullptr);
     shim.release(pages, tokens);
     CloseHandle(second_read);
-    if (!hold_retry) std::printf("next-break control: the handler read break A while it was open\n");
+    if (!hold_retry) std::printf("next-break control: the handler ran while break A was open\n");
 }
 // Break A takes apart run 1, break B (begun after A ended) run 2, a disjoint run. The handler for a fault in A is held
-// (X2W_XMEM_TEST_HOLD_RETRY) until B is held open, so it reads the breaks while B is in progress: it must still find
-// A and retry the fault. A handler that knew only the last break's ranges passes the fault on, and the process ends
-// with an access violation.
+// (X2W_XMEM_TEST_HOLD_RETRY) until B is held open, so it looks the page up while B is in progress: it must still find
+// the stamp of A on run 1 and retry the fault. A handler that knew only the last break's ranges passes the fault on,
+// and the process ends with an access violation.
 void two_runs_case(const Shim& shim, unsigned char* base)
 {
     const char* const name = "two_runs";
@@ -590,7 +591,7 @@ void two_runs_case(const Shim& shim, unsigned char* base)
     std::thread unmap_b([&] { shim.map(run2 + 7 * page, 1, nullptr); });
     check(WaitForSingleObject(window_b.first, 10000) == WAIT_OBJECT_0 && raw_state(run2 + 2 * page) != MEM_COMMIT,
           "break_b_held_on_run_2", name);
-    SetEvent(retry.second);  // the handler reads the breaks now, with B in progress
+    SetEvent(retry.second);  // the handler looks the page up now, with B in progress
     Sleep(100);
     SetEvent(window_b.second);
     unmap_b.join();
@@ -651,7 +652,7 @@ void mirror_case(const Shim& shim, unsigned char* cpu)
     SetEvent(release);  // the CPU merge ends; the GPU merge begins and holds
     check(WaitForSingleObject(unmapped, 10000) == WAIT_OBJECT_0 && raw_state(twin + 2 * page) != MEM_COMMIT &&
           raw_state(target) == MEM_COMMIT, "gpu_merge_held_after_the_cpu_merge", name);
-    SetEvent(retry.second);  // the handler reads the breaks now, with the GPU merge in progress
+    SetEvent(retry.second);  // the handler looks the page up now, with the GPU merge in progress
     Sleep(100);
     SetEvent(release);
     mapper.join();
