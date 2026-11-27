@@ -896,6 +896,12 @@ def names_one_value(sym):
     return sym[0] in ('const', 'ud', 'execcopy') or (sym[0] in ('ptr', 'ptrhi') and len(sym) == 2)
 
 
+def descriptor_select(sym):
+    """True for what Stage.scalar_select records for a compute s_cselect_b32 with a descnum arm:
+    ('descnum', 'cselect', select offset, arm, arm). It has no run-time value, so no consumer may read it as one."""
+    return bool(sym) and sym[:2] == ('descnum', 'cselect')
+
+
 def scalar_destinations(name, asm):
     """The SGPRs (and 'm0') an instruction may write; 'any' for s_movrel*, whose register comes from m0."""
     if name.startswith(NO_SCALAR_DESTINATION) or '_store' in name:
@@ -2895,6 +2901,14 @@ class Stage:
     def descriptor(self, tok):
         """Resource key for a descriptor operand like s[8:11]: (source, byte offset or None)."""
         r = reg_range(tok)
+        held = self.select_word(tok)
+        if held is not None:
+            # Only the first word names the resource below; a select of descriptor data in any word (such as a
+            # size word zeroed on one arm) would be dropped, so the access refuses.
+            raise Unsupported('descriptor operand %s: s%d holds a select of descriptor data' % (tok, held))
+        held = self.joined_word(tok)
+        if held is not None:
+            raise Unsupported('descriptor operand %s: s%d holds a word joined at a branch target' % (tok, held))
         s = self.sym.get(r[1]) if r else None
         if r and r[0] == 's' and r[1] <= 107 and r[2] >= 106:
             if getattr(self, 'has_branches', False):
@@ -2915,6 +2929,23 @@ class Stage:
                 raise Unsupported('descriptor operand %s is a pointer with offset %s' % (tok, hex(s[2]) if isinstance(s[2], int) else s[2]))
             return s[1], None
         raise Unsupported('descriptor operand %s holds %s' % (tok, s))
+
+    def select_word(self, tok):
+        """The first SGPR of operand tok that holds a select of descriptor data (descriptor_select), or None."""
+        r = reg_range(tok)
+        if not r or r[0] != 's':
+            return None
+        return next((n for n in range(r[1], min(r[2], 105) + 1) if descriptor_select(self.sym.get(n))), None)
+
+    def joined_word(self, tok):
+        """In compute, the first SGPR after the first word of operand tok that holds a value joined at a branch
+        target, or None. The paths bring different words there, a select of descriptor data possibly among them,
+        and the access names its resource by the first word only. A loop head joins the same way."""
+        r = reg_range(tok)
+        if getattr(self, 'kind', None) != 'cs' or not r or r[0] != 's':
+            return None
+        return next((n for n in range(r[1] + 1, min(r[2], 105) + 1)
+                     if (self.sym.get(n) or ('',))[0] == 'joined at a branch target'), None)
 
     def heap_sampler(self, tok):
         """'qh[...]' when the four sampler words of tok came from one run-time sampler heap load."""
@@ -5543,6 +5574,7 @@ class Stage:
                     self.set_s(dst[1], '0u', ('const', 0), scc='false')
                     return None
             raise Unsupported('TG_SIZE register s%d read outside s_and_b32 with 0xfc0' % tg_srcs[0])
+        self.refuse_select_source(base, ops[1:])  # whole ranges: srcs names only the low word of a pair
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
             if 'src_scc' in srcs and not getattr(self, 'scc_verified', False):
                 raise Unsupported('src_scc with unverified SCC')
@@ -6032,6 +6064,16 @@ class Stage:
         low = [('s%d' % reg_range(t)[1]) if reg_range(t) and reg_range(t)[0] == 's' else t for t in ops]
         if pair and 'm0' in low:
             raise Unsupported('64-bit scalar operand m0')
+        r = reg_range(low[0])
+        if not pair and getattr(self, 'kind', None) == 'cs' and r and r[0] == 's' and r[1] == r[2] <= 105:
+            # A select between descriptor-derived data (descnum, no run-time value) and constants, such as
+            # s_cselect_b32 sX, 0, sX, which can zero a buffer's size: record both arms and the offset whose SCC
+            # picks one. Nothing reads that symbol as a value (S, refuse_select_source, select_word), so neither
+            # arm is dropped.
+            arms = [self.select_arm(t) for t in low[1:]]
+            if None not in arms and any(arm[0] == 'descnum' for arm in arms):
+                self.set_s(r[1], None, ('descnum', 'cselect', self.pc, *arms))
+                return
         expr = 'scc ? %s : %s' % (self.u(low[1]), self.u(low[2]))
         if low[0] == 'm0':
             self.sym.pop('m0', None)
@@ -6052,6 +6094,28 @@ class Stage:
         if pair:
             self.masks.add(d)
             self.set_s(d + 1, '0u')
+
+    def select_arm(self, tok):
+        """An s_cselect_b32 source as a symbol: the descnum a register holds, ('const', value) for a literal or a
+        register holding a known constant, otherwise None."""
+        r = reg_range(tok)
+        if r:
+            sym = self.sym.get(r[1]) if r[0] == 's' and r[1] == r[2] and r[1] <= 105 else None
+            return sym if sym and (sym[0] == 'descnum' or sym[0] == 'const' and len(sym) == 2) else None
+        value = self.const_u32(tok)
+        return None if value is None else ('const', value)
+
+    def refuse_select_source(self, base, srcs):
+        """A scalar ALU source holding a select of descriptor data in any of its registers (the high word of a pair
+        too): a move copies the symbol, anything else would turn it into an unrelated descnum or descriptor edit,
+        losing the arm that SCC picks, so it refuses."""
+        if base in ('s_mov_b32', 's_mov_b64'):
+            return
+        for tok in srcs:
+            r = reg_range(tok)
+            regs = ['m0'] if tok == 'm0' else range(r[1], r[2] + 1) if r and r[0] == 's' else ()
+            if any(descriptor_select(self.sym.get(n)) for n in regs):
+                raise Unsupported('%s on a select of descriptor data' % base)
 
     def smem_soffset(self, tok, record_use=True):
         """Runtime expression for an SMEM scalar offset operand (s0..s105 or m0)."""
