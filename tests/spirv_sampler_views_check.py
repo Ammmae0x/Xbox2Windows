@@ -74,6 +74,16 @@ MUTATIONS = (
         '        raise ValueError(f"assembly must be a str, got {type(assembly).__name__}")\n',
     ),
     (
+        "drop_isascii_guard",
+        "    if not isinstance(token, str) or not token.isascii():\n",
+        "    if not isinstance(token, str):\n",
+    ),
+    (
+        "drop_hex_literal_parse",
+        '    if len(token) > 2 and token[:2] in ("0x", "0X") and all(ch in "0123456789abcdefABCDEF" for ch in token[2:]):\n',
+        "    if False:\n",
+    ),
+    (
         "drop_register_end_safe_lookup",
         "    decl = defs.get(table, [])\n"
         "    pointer = defs.get(decl[1], []) if len(decl) >= 2 else []\n"
@@ -88,6 +98,21 @@ MUTATIONS = (
         "        elif words[2].startswith(\n",
     ),
     (
+        "drop_unresolved_rule",
+        '            unresolved = True  # an ordinary sample with an unknown sampler may use any table\n',
+        "            pass\n",
+    ),
+    (
+        "drop_failures_dispatch",
+        '            raise ValueError(FAILURES[source[0]])\n',
+        "            pass\n",
+    ),
+    (
+        "drop_early_exit_no_tables",
+        '    if not tables or not module["comparisons"] or not module["ordinary"]:\n',
+        "    if False:\n",
+    ),
+    (
         "drop_indirect_decoration_guard",
         '    if module["indirect"]:\n',
         "    if False:\n",
@@ -99,8 +124,13 @@ MUTATIONS = (
     ),
     (
         "drop_overlap_check",
-        "            if (stop is None or int(binding) < stop) and (end is None or start < end):\n",
+        "            if (stop is None or binding_num < stop) and (end is None or start < end):\n",
         "            if False:\n",
+    ),
+    (
+        "drop_decorated_sampler_path_guard",
+        '        if module["decorated"].intersection((chain[2], words[4], sampled_load, pointer)):\n',
+        "        if False:\n",
     ),
 )
 
@@ -238,11 +268,59 @@ class SpirvSamplerViewsTests(unittest.TestCase):
         self.assertIn("OpDecorate %bridge_cmp_table_1 Binding 4", multi_lines)
         self.assertFalse(any("Binding 9" in line and "bridge" in line for line in multi_lines))
 
-        # Pass-through when no comparison or no mixed table.
+        # Pass-through when no comparison, no mixed table, or bindless OpTypeSampledImage array.
         no_dref = _sub(BASE_MODULE, "%cmp = OpImageSampleDrefExplicitLod %float %si %uv %half Lod %lod\n", "")
         self.assertEqual(mod.split_sampler_views(no_dref), no_dref)
 
-        # register_end handles missing OpTypePointer / OpTypeArray keys without KeyError.
+        bindless_sampled_image = _sub(
+            BASE_MODULE,
+            "%samparr = OpTypeArray %smp %two\n"
+            "%_ptr_UC_rt_smp = OpTypePointer UniformConstant %samparr\n"
+            "%_ptr_UC_smp = OpTypePointer UniformConstant %smp\n"
+            "%samplers = OpVariable %_ptr_UC_rt_smp UniformConstant",
+            "%pair_arr = OpTypeArray %pair %two\n"
+            "%_ptr_UC_pair_arr = OpTypePointer UniformConstant %pair_arr\n"
+            "%_ptr_UC_pair = OpTypePointer UniformConstant %pair\n"
+            "%samplers = OpVariable %_ptr_UC_pair_arr UniformConstant",
+        )
+        bindless_sampled_image = _sub(
+            bindless_sampled_image,
+            "%p = OpAccessChain %_ptr_UC_smp %samplers %i\n"
+            "%s = OpLoad %smp %p\n"
+            "%im = OpLoad %img %texture\n"
+            "%si = OpSampledImage %pair %im %s",
+            "%p = OpAccessChain %_ptr_UC_pair %samplers %i\n"
+            "%si = OpLoad %pair %p",
+        )
+        self.assertEqual(mod.split_sampler_views(bindless_sampled_image), bindless_sampled_image)
+
+        # Conservative unresolved-ordinary rule: unknown ordinary sampler forces split of Dref table.
+        unresolved_ordinary = _sub(
+            BASE_MODULE,
+            "%raw = OpImageSampleExplicitLod %vec4 %si %uv Lod %lod",
+            "%weird_smp = OpUndef %smp\n"
+            "%weird_si = OpSampledImage %pair %im %weird_smp\n"
+            "%raw = OpImageSampleExplicitLod %vec4 %weird_si %uv Lod %lod",
+        )
+        unresolved_lines = mod.split_sampler_views(unresolved_ordinary).splitlines()
+        self.assertIn("%bridge_cmp = OpVariable %_ptr_UC_rt_smp UniformConstant", unresolved_lines)
+        self.assertIn("OpDecorate %bridge_cmp DescriptorSet 3", unresolved_lines)
+
+        # Valid hex-versus-decimal controls: 0x2 does not collide with set 3; hex table binding 0x1 works & checks overlap.
+        hex_ok = _sub(BASE_MODULE, "OpDecorate %out DescriptorSet 0", "OpDecorate %out DescriptorSet 0x2")
+        hex_ok_lines = mod.split_sampler_views(hex_ok).splitlines()
+        self.assertIn("OpDecorate %bridge_cmp DescriptorSet 3", hex_ok_lines)
+
+        hex_binding_ok = _sub(BASE_MODULE, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 0x1")
+        hex_binding_lines = mod.split_sampler_views(hex_binding_ok).splitlines()
+        self.assertIn("OpDecorate %bridge_cmp Binding 0x1", hex_binding_lines)
+
+        hex_overlap = _sub(multi, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 0x1")
+        hex_overlap = _sub(hex_overlap, "OpDecorate %second Binding 4", "OpDecorate %second Binding 0x2")
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            mod.split_sampler_views(hex_overlap)
+
+        # register_end handles missing OpTypePointer / OpTypeArray keys and non-ASCII constant digits without KeyError.
         self.assertIsNone(mod.register_end({}, "%samplers", "1"))
         self.assertIsNone(mod.register_end({"%samplers": ["OpVariable", "%missing_ptr", "UniformConstant"]}, "%samplers", "1"))
         self.assertIsNone(
@@ -266,6 +344,18 @@ class SpirvSamplerViewsTests(unittest.TestCase):
                 "1",
             )
         )
+        self.assertIsNone(
+            mod.register_end(
+                {
+                    "%samplers": ["OpVariable", "%ptr", "UniformConstant"],
+                    "%ptr": ["OpTypePointer", "UniformConstant", "%arr"],
+                    "%arr": ["OpTypeArray", "%smp", "%two"],
+                    "%two": ["OpConstant", "%uint", "\u00b3"],
+                },
+                "%samplers",
+                "1",
+            )
+        )
         self.assertEqual(
             mod.register_end(
                 {
@@ -275,7 +365,7 @@ class SpirvSamplerViewsTests(unittest.TestCase):
                     "%two": ["OpConstant", "%uint", "2"],
                 },
                 "%samplers",
-                "1",
+                "0x1",
             ),
             3,
         )
@@ -283,10 +373,10 @@ class SpirvSamplerViewsTests(unittest.TestCase):
         # table_slot refuses missing table, missing/non-literal/duplicate/extra decorations.
         parsed = mod.read_module(mod.strip_comments(BASE_MODULE))
         self.assertEqual(mod.table_slot(parsed, "%samplers"), ("0", "1"))
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "one DescriptorSet and one Binding"):
             mod.table_slot(parsed, "%missing")
 
-        # Refusals: indirect decorations, set 3, %bridge_cmp, overlap, malformed OpDecorate.
+        # Refusals: indirect decorations, set 3 (decimal and hex), %bridge_cmp, overlap, FAILURES, decorated sampler, OpDecorate.
         indirect = _sub(
             BASE_MODULE,
             "OpDecorate %samplers Binding 1",
@@ -303,9 +393,15 @@ class SpirvSamplerViewsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "indirect"):
             mod.split_sampler_views(indirect_id)
 
-        for set3_line in ("OpDecorate %samplers DescriptorSet 3", "\tOpDecorate  %samplers  DescriptorSet 03"):
+        for set3_line in (
+            "OpDecorate %samplers DescriptorSet 3",
+            "\tOpDecorate  %samplers  DescriptorSet 03",
+            "OpDecorate %out DescriptorSet 0x3",
+            "OpDecorate %out DescriptorSet 0X03",
+        ):
+            target_line = "OpDecorate %out DescriptorSet 0" if "%out" in set3_line else "OpDecorate %samplers DescriptorSet 0"
             with self.assertRaisesRegex(ValueError, "free descriptor set 3"):
-                mod.split_sampler_views(_sub(BASE_MODULE, "OpDecorate %samplers DescriptorSet 0", set3_line))
+                mod.split_sampler_views(_sub(BASE_MODULE, target_line, set3_line))
 
         with self.assertRaisesRegex(ValueError, "bridge_cmp"):
             mod.split_sampler_views(
@@ -317,26 +413,71 @@ class SpirvSamplerViewsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "overlap"):
             mod.split_sampler_views(overlap)
 
-        # Malformed OpDecorate refusals.
-        for bad_dec in (
-            _sub(BASE_MODULE, "OpDecorate %samplers DescriptorSet 0\n", ""),
-            _sub(BASE_MODULE, "OpDecorate %samplers Binding 1\n", ""),
-            _sub(BASE_MODULE, "OpDecorate %samplers DescriptorSet 0", "OpDecorate %samplers DescriptorSet"),
-            _sub(BASE_MODULE, "OpDecorate %samplers DescriptorSet 0", "OpDecorate %samplers DescriptorSet %bad"),
-            _sub(BASE_MODULE, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding -1"),
-            _sub(BASE_MODULE, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 1 2"),
-            _sub(
-                BASE_MODULE,
-                "OpDecorate %samplers Binding 1",
-                "OpDecorate %samplers Binding 1\nOpDecorate %samplers Binding 2",
+        # FAILURES dispatch refusals (image / load / provenance) and decorated sampler path.
+        bad_dref_image = _sub(
+            BASE_MODULE,
+            "%cmp = OpImageSampleDrefExplicitLod %float %si %uv %half Lod %lod",
+            "%cmp = OpImageSampleDrefExplicitLod %float %im %uv %half Lod %lod",
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported depth-reference sampled image"):
+            mod.split_sampler_views(bad_dref_image)
+
+        bad_dref_load = _sub(
+            BASE_MODULE,
+            "%cmp = OpImageSampleDrefExplicitLod %float %si %uv %half Lod %lod",
+            "%bad_si = OpSampledImage %pair %im %im\n"
+            "%cmp = OpImageSampleDrefExplicitLod %float %bad_si %uv %half Lod %lod",
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported depth-reference sampler load"):
+            mod.split_sampler_views(bad_dref_load)
+
+        bad_dref_prov = _sub(
+            BASE_MODULE,
+            "%cmp = OpImageSampleDrefExplicitLod %float %si %uv %half Lod %lod",
+            "%bad_ptr = OpUndef %_ptr_UC_smp\n"
+            "%bad_s = OpLoad %smp %bad_ptr\n"
+            "%bad_si = OpSampledImage %pair %im %bad_s\n"
+            "%cmp = OpImageSampleDrefExplicitLod %float %bad_si %uv %half Lod %lod",
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported depth-reference sampler provenance"):
+            mod.split_sampler_views(bad_dref_prov)
+
+        decorated_si = _sub(
+            BASE_MODULE,
+            "OpDecorate %samplers Binding 1",
+            "OpDecorate %samplers Binding 1\nOpDecorate %si NonUniformEXT",
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported decorated sampler path"):
+            mod.split_sampler_views(decorated_si)
+
+        # Malformed / non-ASCII OpDecorate refusals with pinned messages.
+        for bad_dec, expected_msg in (
+            (_sub(BASE_MODULE, "OpDecorate %samplers DescriptorSet 0\n", ""), "one DescriptorSet and one Binding"),
+            (_sub(BASE_MODULE, "OpDecorate %samplers Binding 1\n", ""), "one DescriptorSet and one Binding"),
+            (_sub(BASE_MODULE, "OpDecorate %samplers DescriptorSet 0", "OpDecorate %samplers DescriptorSet"), "one DescriptorSet and one Binding"),
+            (_sub(BASE_MODULE, "OpDecorate %samplers DescriptorSet 0", "OpDecorate %samplers DescriptorSet %bad"), "literal DescriptorSet and Binding"),
+            (_sub(BASE_MODULE, "OpDecorate %samplers DescriptorSet 0", "OpDecorate %samplers DescriptorSet \u0663"), "literal DescriptorSet and Binding"),
+            (_sub(BASE_MODULE, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding -1"), "literal DescriptorSet and Binding"),
+            (_sub(BASE_MODULE, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 0_1"), "literal DescriptorSet and Binding"),
+            (_sub(BASE_MODULE, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 1 2"), "one DescriptorSet and one Binding"),
+            (
+                _sub(
+                    BASE_MODULE,
+                    "OpDecorate %samplers Binding 1",
+                    "OpDecorate %samplers Binding 1\nOpDecorate %samplers Binding 2",
+                ),
+                "one DescriptorSet and one Binding",
             ),
-            _sub(
-                BASE_MODULE,
-                "OpDecorate %samplers Binding 1",
-                "OpDecorate %samplers Binding 1\nOpDecorate %samplers NonUniformEXT",
+            (
+                _sub(
+                    BASE_MODULE,
+                    "OpDecorate %samplers Binding 1",
+                    "OpDecorate %samplers Binding 1\nOpDecorate %samplers NonUniformEXT",
+                ),
+                "unsupported sampler table declaration",
             ),
         ):
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, expected_msg):
                 mod.split_sampler_views(bad_dec)
 
     def test_contract_and_refusals(self) -> None:
@@ -353,7 +494,7 @@ class SpirvSamplerViewsTests(unittest.TestCase):
                 mod = _load_temp_module(mut_path, mod_name)
                 try:
                     with self.assertRaises(
-                        (AssertionError, KeyError, IndexError, AttributeError, TypeError),
+                        (AssertionError, ValueError, KeyError, IndexError, AttributeError, TypeError),
                         msg=f"mutation {label} escaped detection",
                     ):
                         self._verify_module_contract(mod)
