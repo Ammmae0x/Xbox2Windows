@@ -276,6 +276,12 @@ Inst decode(const string &bytes, unsigned pc,bool direct=false, bool graphics=fa
             i.enc = Encoding::Vop1;
             i.op -= 0x180;
         }
+        if (direct && !graphics && i.enc == Encoding::Vop3 && (i.op == 0x377 || i.op == 0x378)) {
+            // The shared extent decoder already counts the trailing literal word.
+            // S1 and S2 may both reference that word.
+            if (i.src[0] == 255)
+                refuse(pc, "permlane S0 cannot be a literal");
+        }
         lit = std::find(i.src.begin(), i.src.end(), 255) != i.src.end();
     } else
         refuse(pc, "unsupported instruction " + string(encoded.name) + " " + hexword(a));
