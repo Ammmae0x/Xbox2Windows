@@ -164,11 +164,7 @@ def register_end(defs, table, binding):
     pointer = defs.get(decl[1], []) if len(decl) >= 2 else []
     shape = defs.get(pointer[2], []) if len(pointer) >= 3 else []
     length = defs.get(shape[2], []) if len(shape) >= 3 and shape[0] == "OpTypeArray" else []
-    binding_num = (
-        _parse_uint_literal(binding)
-        if isinstance(binding, str)
-        else (binding if isinstance(binding, int) and not isinstance(binding, bool) and binding >= 0 else None)
-    )
+    binding_num = _parse_uint_literal(binding)
     length_num = _parse_uint_literal(length[2]) if len(length) == 3 and length[0] == "OpConstant" else None
     if binding_num is not None and length_num is not None and length_num > 0:
         return binding_num + length_num

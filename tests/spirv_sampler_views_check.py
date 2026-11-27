@@ -84,6 +84,26 @@ MUTATIONS = (
         "    if False:\n",
     ),
     (
+        "drop_hex_af_class",
+        '    if len(token) > 2 and token[:2] in ("0x", "0X") and all(ch in "0123456789abcdefABCDEF" for ch in token[2:]):\n',
+        '    if len(token) > 2 and token[:2] in ("0x", "0X") and all(ch in "0123456789" for ch in token[2:]):\n',
+    ),
+    (
+        "drop_hex_whitelist",
+        '    if len(token) > 2 and token[:2] in ("0x", "0X") and all(ch in "0123456789abcdefABCDEF" for ch in token[2:]):\n',
+        '    if len(token) > 2 and token[:2] in ("0x", "0X"):\n',
+    ),
+    (
+        "decimal_as_hex",
+        "    if token.isdigit():\n        return int(token, 10)\n",
+        "    if token.isdigit():\n        return int(token, 16)\n",
+    ),
+    (
+        "register_end_decimal_only",
+        '    length_num = _parse_uint_literal(length[2]) if len(length) == 3 and length[0] == "OpConstant" else None\n',
+        '    length_num = int(length[2]) if len(length) == 3 and length[0] == "OpConstant" and length[2].isdigit() else None\n',
+    ),
+    (
         "drop_register_end_safe_lookup",
         "    decl = defs.get(table, [])\n"
         "    pointer = defs.get(decl[1], []) if len(decl) >= 2 else []\n"
@@ -126,6 +146,16 @@ MUTATIONS = (
         "drop_overlap_check",
         "            if (stop is None or binding_num < stop) and (end is None or start < end):\n",
         "            if False:\n",
+    ),
+    (
+        "overlap_le_stop",
+        "            if (stop is None or binding_num < stop) and (end is None or start < end):\n",
+        "            if (stop is None or binding_num <= stop) and (end is None or start < end):\n",
+    ),
+    (
+        "overlap_le_start",
+        "            if (stop is None or binding_num < stop) and (end is None or start < end):\n",
+        "            if (stop is None or binding_num < stop) and (end is None or start <= end):\n",
     ),
     (
         "drop_decorated_sampler_path_guard",
@@ -311,14 +341,34 @@ class SpirvSamplerViewsTests(unittest.TestCase):
         hex_ok_lines = mod.split_sampler_views(hex_ok).splitlines()
         self.assertIn("OpDecorate %bridge_cmp DescriptorSet 3", hex_ok_lines)
 
-        hex_binding_ok = _sub(BASE_MODULE, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 0x1")
+        hex_binding_ok = _sub(BASE_MODULE, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 0x1F")
         hex_binding_lines = mod.split_sampler_views(hex_binding_ok).splitlines()
-        self.assertIn("OpDecorate %bridge_cmp Binding 0x1", hex_binding_lines)
+        self.assertIn("OpDecorate %bridge_cmp Binding 0x1F", hex_binding_lines)
 
         hex_overlap = _sub(multi, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 0x1")
         hex_overlap = _sub(hex_overlap, "OpDecorate %second Binding 4", "OpDecorate %second Binding 0x2")
         with self.assertRaisesRegex(ValueError, "overlap"):
             mod.split_sampler_views(hex_overlap)
+
+        # Decimal >= 10 overlap control: binding 9 (size 2 -> 9..10) overlaps binding 10 (fails if 10 parsed as 0x10=16).
+        dec10_overlap = _sub(multi, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 9")
+        dec10_overlap = _sub(dec10_overlap, "OpDecorate %second Binding 4", "OpDecorate %second Binding 10")
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            mod.split_sampler_views(dec10_overlap)
+
+        # Adjacent non-overlapping register ranges in both orders (1..2 vs 3, and 3..4 vs 1) + hex array length 0x2.
+        adj_asc = _sub(multi, "OpDecorate %second Binding 4", "OpDecorate %second Binding 3")
+        adj_asc = _sub(adj_asc, "%two = OpConstant %uint 2", "%two = OpConstant %uint 0x2")
+        adj_asc_lines = mod.split_sampler_views(adj_asc).splitlines()
+        self.assertIn("OpDecorate %bridge_cmp Binding 1", adj_asc_lines)
+        self.assertIn("OpDecorate %bridge_cmp_table_1 Binding 3", adj_asc_lines)
+
+        adj_desc = _sub(multi, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 3")
+        adj_desc = _sub(adj_desc, "OpDecorate %second Binding 4", "OpDecorate %second Binding 1")
+        adj_desc = _sub(adj_desc, "%second = OpVariable %_ptr_UC_rt2 UniformConstant", "%second = OpVariable %_ptr_UC_rt_smp UniformConstant")
+        adj_desc_lines = mod.split_sampler_views(adj_desc).splitlines()
+        self.assertIn("OpDecorate %bridge_cmp Binding 3", adj_desc_lines)
+        self.assertIn("OpDecorate %bridge_cmp_table_1 Binding 1", adj_desc_lines)
 
         # register_end handles missing OpTypePointer / OpTypeArray keys and non-ASCII constant digits without KeyError.
         self.assertIsNone(mod.register_end({}, "%samplers", "1"))
@@ -459,6 +509,7 @@ class SpirvSamplerViewsTests(unittest.TestCase):
             (_sub(BASE_MODULE, "OpDecorate %samplers DescriptorSet 0", "OpDecorate %samplers DescriptorSet \u0663"), "literal DescriptorSet and Binding"),
             (_sub(BASE_MODULE, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding -1"), "literal DescriptorSet and Binding"),
             (_sub(BASE_MODULE, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 0_1"), "literal DescriptorSet and Binding"),
+            (_sub(BASE_MODULE, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 0x1_0"), "literal DescriptorSet and Binding"),
             (_sub(BASE_MODULE, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 1 2"), "one DescriptorSet and one Binding"),
             (
                 _sub(
