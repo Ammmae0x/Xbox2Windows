@@ -34,7 +34,7 @@
 //   capped      192 single-page calls make three runs of 64 pages (max_merged_run_pages); an unmap held in its window
 //               inside the middle run takes apart at most 64 pages, and the outer runs stay mapped.
 //
-// Usage: xmem_cross_call_merge_check <xmem.dll> check|control|deployed|default|timing
+// Usage: xmem_cross_call_merge_check <xmem.dll> check|control|deployed|default|no-join|timing
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
