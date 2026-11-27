@@ -3208,8 +3208,9 @@ with `ERROR_INVALID_USER_BUFFER`. The main module's `ReadFile` and `WriteFile` i
 run again, up to 4 times in all, when a synchronous call on a disk file fails with one of those
 errors while an unmap or join was in progress or began or ended around it, and its buffer lies in
 a view of a run; they wait for that one to end first. A call on a pipe, socket or console is not
-run again, because the failed call may already have consumed or sent data (measured under Wine: an
-anonymous pipe read inside an unmap fails with `ERROR_NOACCESS` and leaves its data queued).
+run again. Under Wine an anonymous pipe read inside an unmap fails with `ERROR_NOACCESS` and leaves
+its data queued (measured). Whether Windows consumes or sends any data in a call that fails this way
+is unmeasured, and if it does, running the call again would lose or repeat that data.
 Overlapped I/O (the copy happens at completion), a call cut short after part of the copy, and I/O
 from other modules are not covered.
 

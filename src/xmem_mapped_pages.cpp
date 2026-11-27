@@ -2191,7 +2191,8 @@ const int virtual_query_ex_wrapped = [] {
 // around it, and whose buffer lies in a run, waits for memory.mutex (the end of the break) and runs again, at most
 // io_attempts times in all. A call that fails that way with no break around it, outside the runs, or on a handle that
 // is not a disk file, fails at once as before: a pipe, socket or console may have consumed or sent data in the failed
-// call, so running it again could lose or repeat that data. GetFileType is asked only on that failure path.
+// call, so running it again could lose or repeat that data. Under Wine a pipe read that fails this way leaves its data
+// queued; whether Windows consumes it is unmeasured. GetFileType is asked only on that failure path.
 // Not covered: overlapped I/O (the copy happens at completion, after the call has returned), a call that a break
 // cuts short after part of the copy (a short count), and I/O from other modules or through GetProcAddress.
 using WriteFileFn = BOOL(WINAPI*)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
