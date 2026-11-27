@@ -1379,10 +1379,13 @@ bool alias_placeholders(ULONG_PTR address, SIZE_T bytes)
 {
     // VirtualQuery alone cannot distinguish a reserved private allocation from a placeholder, and on Windows
     // PRESERVE_PLACEHOLDER can silently release that allocation. Where the region query does not report the bit
-    // and the OS refuses that release for a plain reservation (placeholder_fallback), reserved regions may be
-    // offered. Every region the view covers must be reserved, not only the first one of each allocation: Wine
-    // (Proton Experimental, 2026-11) released a private allocation made in place of a placeholder together with
-    // its committed second page, and the view then replaced that page (xmem_placeholder_split_partial).
+    // and the OS refuses that release for a reservation made by VirtualAlloc (placeholder_fallback), reserved
+    // regions may be offered. Every region the view covers must be reserved, not only the first one of each
+    // allocation: Wine (Proton Experimental, 2026-11) released a private allocation made in place of a placeholder
+    // (VirtualAlloc2 MEM_REPLACE_PLACEHOLDER) together with its committed second page, and the view then replaced
+    // that page (xmem_placeholder_split_partial). Limit: Wine does not refuse the release for that kind of
+    // allocation either, so its reserved pages are still offered, and releasing one cuts it out of the caller's
+    // allocation.
     const bool fallback = placeholder_fallback();
     const auto end = address + bytes;
     while (address < end) {

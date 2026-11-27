@@ -10,7 +10,8 @@
 //   xmem_placeholder_split_check <xmem.dll> partial   test-controls build with shared views: a two-page view over a
 //                                                     private reservation whose second page is committed is refused
 //                                                     by the region walk (x2w_xmem_alias_counts), and the committed
-//                                                     page keeps its bytes
+//                                                     page keeps its bytes; prints where its allocation starts after
+//                                                     the batch (the limit in alias_placeholders)
 // control, deployed and partial exit 77 where the OS reports the bit, because there the fallback is never used. Each
 // mode sets or clears X2W_XMEM_TEST_NO_PLACEHOLDER_FALLBACK itself, so an inherited value cannot change the result.
 #include <windows.h>
@@ -52,6 +53,12 @@ MEMORY_BASIC_INFORMATION query(const BYTE* pointer)
     return info;
 }
 
+// Where the region's allocation starts, in pages from `at` (negative: before it).
+long long base_pages(const MEMORY_BASIC_INFORMATION& info, const BYTE* at)
+{
+    return (static_cast<const BYTE*>(info.AllocationBase) - at) / static_cast<long long>(page_bytes);
+}
+
 // partial: two pages of the reservation become a private reservation whose second page is committed and tagged. Its
 // first region is reserved, so a check of that region alone would accept the whole two-page view.
 int partial_case(HMODULE xmem, BYTE* pool, decltype(&X2WMapPageBatch) batch_map)
@@ -67,6 +74,8 @@ int partial_case(HMODULE xmem, BYTE* pool, decltype(&X2WMapPageBatch) batch_map)
                  "commit the second page"))
         return 1;
     std::memset(piece + page_bytes, 0x7a, page_bytes);
+    const MEMORY_BASIC_INFORMATION before = query(piece + page_bytes);
+    if (!require(before.AllocationBase == piece, "the two pages are one allocation")) return 1;
     const X2WPageRange two{0, 1, 2};
     const X2WPageBatch onto_partial{reinterpret_cast<UINT64>(piece), 1, &two};
     const HRESULT hr = batch_map(1, &onto_partial, reinterpret_cast<UINT64>(pool), pool_pages, 0, nullptr);
@@ -76,16 +85,29 @@ int partial_case(HMODULE xmem, BYTE* pool, decltype(&X2WMapPageBatch) batch_map)
                 "releases tried %llu; after: state 0x%lx type 0x%lx, then state 0x%lx type 0x%lx byte 0x%02x\n",
                 static_cast<unsigned long>(hr), refusals1 - refusals0, splits1 - splits0, first.State, first.Type,
                 second.State, second.Type, second.State == MEM_COMMIT ? piece[page_bytes] : 0u);
+    std::printf("allocation base in pages from the first page: first page %+lld (region %llu pages); committed page "
+                "%+lld before the batch, %+lld after\n",
+                base_pages(first, piece), static_cast<unsigned long long>(first.RegionSize / page_bytes),
+                base_pages(before, piece), base_pages(second, piece));
     // The walk refuses the two-page view. The batch then retries each page on its own (install_alias_plan): the
-    // reserved page alone may be released and mapped, and the rollback unmaps it again; the committed page alone is
-    // refused. A walk that checks only the first region of each allocation accepts the view, and under Wine the
+    // reserved page alone is accepted, released and mapped, and the rollback unmaps it again; the committed page alone
+    // is refused. A walk that checks only the first region of each allocation accepts the view, and under Wine the
     // release then succeeds and the view replaces the committed page (measured 2026-11-27 before the fix).
+    // Limit: the fallback cannot tell a reserved page of a private allocation made in place of a placeholder
+    // (MEM_REPLACE_PLACEHOLDER) from a placeholder. Under Wine the per-page release cuts that page out of the caller's
+    // allocation: afterwards the committed page's allocation starts one page later (measured 2026-11-27). The row
+    // asserts only that the first page is still one reserved page with its own address as its allocation base, and
+    // prints where the committed page's allocation starts.
     if (!require(refusals1 - refusals0 >= 1, "the region walk refuses the two-page view") ||
         !require(FAILED(hr), "the partly committed target is refused") ||
-        !require(first.State == MEM_RESERVE && second.State == MEM_COMMIT && second.Type == MEM_PRIVATE &&
-                     piece[page_bytes] == 0x7a && piece[2 * page_bytes - 1] == 0x7a,
-                 "the committed page keeps its bytes and the reserved page stays reserved"))
+        !require(first.State == MEM_RESERVE && first.AllocationBase == piece && first.RegionSize == page_bytes &&
+                     second.State == MEM_COMMIT && second.Type == MEM_PRIVATE && piece[page_bytes] == 0x7a &&
+                     piece[2 * page_bytes - 1] == 0x7a,
+                 "the committed page keeps its bytes and the first page stays one reserved page at its address"))
         return 1;
+    if (second.AllocationBase != piece)
+        std::puts("limit: the per-page retry cut the reserved page out of the caller's allocation "
+                  "(docs/experiments/xmem-page-runs.md)");
     std::puts("partial: a view over a reserved and a committed page was refused; the committed page kept its bytes");
     return 0;
 }
