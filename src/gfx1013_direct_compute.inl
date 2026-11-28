@@ -4,6 +4,30 @@ struct DirectCompute {
     // The nine inline float constants as binary16, which an f16 operand reads instead of the f32 pattern.
     static constexpr Word inline_half_words[]{0x3800, 0xb800, 0x3c00, 0xbc00, 0x4000,
                                               0xc000, 0x4400, 0xc400, 0x3118};
+    // D3D exp (sm4 asm) has relative error <= 2^-21, or < 8 ULP for normal f32 results.
+    // tests/f16_exp_midpoints.py generates the non-tie cases within that window
+    // using a 90-digit reference. The exact tie at -25 is handled separately.
+    struct ExpF16Midpoint { Word source, result; };
+    static constexpr ExpF16Midpoint exp_f16_midpoints[]{
+        {0x11c3, 0x3c00}, {0x11c4, 0x3c00}, {0x11c5, 0x3c01}, {0x11c6, 0x3c01},
+        {0x11c7, 0x3c01}, {0x1853, 0x3c01}, {0x1b34, 0x3c02}, {0x1b35, 0x3c03},
+        {0x1e7a, 0x3c04}, {0x1fea, 0x3c06}, {0x2164, 0x3c08}, {0x221b, 0x3c08},
+        {0x2389, 0x3c0a}, {0x2bdb, 0x3c2c}, {0x2e7c, 0x3c4a}, {0x2ea7, 0x3c4c},
+        {0x2fe7, 0x3c5b}, {0x36b6, 0x3d5a}, {0x3863, 0x3dd9}, {0x39f8, 0x3eb5},
+        {0x3a8a, 0x3f0c}, {0x3b12, 0x3f62}, {0x3b82, 0x3faa}, {0x3efc, 0x42b5},
+        {0x3f45, 0x430c}, {0x3f89, 0x4362}, {0x3fc1, 0x43aa}, {0x417e, 0x46b5},
+        {0x437e, 0x4ab5}, {0x44bf, 0x4eb5}, {0x45bf, 0x52b5}, {0x46bf, 0x56b5},
+        {0x47bf, 0x5ab5}, {0x8dc3, 0x3c00}, {0x8dc4, 0x3c00}, {0x8dc5, 0x3c00},
+        {0x8dc6, 0x3bff}, {0x8dc7, 0x3bff}, {0x8dc8, 0x3bff}, {0x9454, 0x3bff},
+        {0x9455, 0x3bfe}, {0x9738, 0x3bfd}, {0x990e, 0x3bfc}, {0x9a80, 0x3bfb},
+        {0x9bf2, 0x3bfb}, {0x9e25, 0x3bf7}, {0x9f98, 0x3bf5}, {0xa2b4, 0x3bed},
+        {0xa52d, 0x3be3}, {0xa86d, 0x3bd0}, {0xa8b4, 0x3bcc}, {0xa9d1, 0x3bc0},
+        {0xabe0, 0x3baa}, {0xaf57, 0x3b63}, {0xaf70, 0x3b62}, {0xb1d8, 0x3b0c},
+        {0xb410, 0x3ab5}, {0xb4db, 0x3a7c}, {0xb73a, 0x39d9}, {0xb8a5, 0x395a},
+        {0xbc3f, 0x37aa}, {0xbc77, 0x3762}, {0xbcbb, 0x370c}, {0xbd04, 0x36b5},
+        {0xc082, 0x32b5}, {0xc282, 0x2eb5}, {0xc441, 0x2ab5}, {0xc541, 0x26b5},
+        {0xc641, 0x22b5}, {0xc741, 0x1eb5},
+    };
     static void validate_lane_shape(const Inst &i, unsigned threads, unsigned width) {
         const auto constant = constant32(i, i.src[1]);
         const auto remaining = threads % width;
@@ -22,7 +46,7 @@ struct DirectCompute {
     HeapViewContract heap_view = HeapViewContract::none;
     // heap_view is raw_buffer and the path is direct: the byte-address rewrite of a heap descriptor is tracked.
     bool heap_window = false;
-    // Binary16 add, sub, subrev and mul are lowered only while MODE stays at
+    // Binary16 arithmetic is lowered only while MODE stays at
     // the contract this path implements: round-to-nearest-even, f16 denormals
     // kept on input and output, and FP16_OVFL clear. mode_bits holds the
     // fields this path tracks (round in [3:0], denorm in [7:4], FP16_OVFL in
@@ -1676,7 +1700,7 @@ struct DirectCompute {
             vector_write(i.dst, place_subword(i, result));
             return true;
         }
-        if (n == "v_add_f16" || n == "v_sub_f16" || n == "v_subrev_f16" || n == "v_mul_f16") {
+        if (binary16_alu(n) || binary16_unary(n)) {
             // The graphics frontend shares this ALU. Leave those programs on the
             // existing refusal; this lowering is the direct compute path.
             if (graphics_input)
@@ -1724,18 +1748,44 @@ struct DirectCompute {
             auto widen = [&](const string &bits) {
                 return ir.invoke("float", "legacyF16ToF32", 131, {{"i32", bits}}, "nounwind readnone");
             };
-            auto a = widen(half_bits(0));
-            auto b = widen(half_bits(1));
-            if (n == "v_subrev_f16")
-                std::swap(a, b);
-            const char *op = n == "v_mul_f16" ? "fmul" : n == "v_add_f16" ? "fadd" : "fsub";
-            auto widened = ir.value(string(op) + " float " + a + ", " + b);
+            const auto source = half_bits(0);
+            auto a = widen(source);
+            const bool rsq = n == "v_rsq_f16", exp = n == "v_exp_f16";
+            string widened;
+            if (n == "v_rcp_f16") {
+                widened = ir.value("fdiv float 1.000000e+00, " + a);
+            } else if (binary16_unary(n)) {
+                const unsigned opcode = rsq ? 25 : exp ? 21 : 24;
+                widened = ir.invoke("float", "unary.f32", opcode, {{"float", a}}, "nounwind readnone");
+            } else {
+                auto b = widen(half_bits(1));
+                if (n == "v_subrev_f16")
+                    std::swap(a, b);
+                const char *op = n == "v_mul_f16" ? "fmul" : n == "v_add_f16" ? "fadd" : "fsub";
+                widened = ir.value(string(op) + " float " + a + ", " + b);
+            }
             auto bits = ir.value("bitcast float " + widened + " to i32");
-            // f32 has a 24-bit significand, which covers a correctly rounded f16
-            // add, sub or mul (2*11+2). Round with the same integer nearest-even
-            // conversion v_cvt_f16_f32 uses.
+            // Round with the same integer nearest-even conversion v_cvt_f16_f32 uses.
             auto rounded = packed_half_rne(bits);
-            // D[31:16] keeps its value: LLVM GCNSubtarget::zeroesHigh16BitsOfDest lists these four ops with
+            if (rsq) {
+                // Enforce RDNA2's exact special results from the modified half bits.
+                // The D3D Rsqrt contract does not guarantee a negative infinity for -0.
+                // Select the other special results explicitly as well.
+                const auto magnitude = ir.binary("and", source, "32767");
+                // Every encoding above +infinity is negative or a positive NaN.
+                rounded = select(cmp("ugt", source, "31744"), "32256", rounded);
+                rounded = select(cmp("eq", source, "31744"), "0", rounded);
+                const auto zero_result = ir.binary("or", source, "31744");
+                rounded = select(cmp("eq", magnitude, "0"), zero_result, rounded);
+            } else if (exp) {
+                for (const auto &entry : exp_f16_midpoints)
+                    rounded = select(cmp("eq", source, to_string(entry.source)), to_string(entry.result), rounded);
+                // 2^-25 is exactly halfway between zero and the smallest half subnormal.
+                rounded = select(cmp("eq", source, to_string(0xce40)), "0", rounded);
+                const auto magnitude = ir.binary("and", source, "32767");
+                rounded = select(cmp("ugt", magnitude, "31744"), "32256", rounded);
+            }
+            // D[31:16] keeps its value: LLVM GCNSubtarget::zeroesHigh16BitsOfDest says
             // "On gfx10, all 16-bit instructions preserve the high bits", as v_cvt_f16_f32 above already does.
             vector_write(i.dst, i.subword ? place_subword(i, rounded)
                                           : ir.binary("or", ir.binary("and", read(i.dst), "4294901760"),
@@ -3828,7 +3878,7 @@ struct DirectCompute {
             if (!p.reached[k])
                 continue;
             const auto &op = p.code[k];
-        if (binary16_alu(op.name) ||
+        if (binary16_alu(op.name) || binary16_unary(op.name) ||
             op.name == "v_pk_min_f16" ||
             op.name == "v_pk_max_f16" ||
             op.name == "v_cvt_f16_u16" ||
