@@ -274,6 +274,7 @@ neg_escape_ret_rax ENDP
 
 store_mem_callee PROC FRAME
     .endprolog
+    mov dword ptr [rcx], edx
     mov qword ptr [rdx], rcx
     xor eax, eax
     ret
@@ -294,6 +295,7 @@ store_stack_callee PROC FRAME
     sub rsp, 18h
     .allocstack 18h
     .endprolog
+    mov dword ptr [rcx], edx
     mov qword ptr [rsp], rcx
     mov rax, qword ptr [rsp]
     mov eax, dword ptr [rax]
@@ -408,6 +410,8 @@ neg_multi_arg_alias_same PROC FRAME
     sub rsp, 38h
     .allocstack 38h
     .endprolog
+    xor r8d, r8d
+    xor r9d, r9d
     lea rcx, [rsp+20h]
     lea rdx, [rsp+20h]
     call two_ptrs_u64_u32
@@ -419,6 +423,8 @@ neg_multi_arg_alias_overlap PROC FRAME
     sub rsp, 38h
     .allocstack 38h
     .endprolog
+    xor r8d, r8d
+    xor r9d, r9d
     lea rcx, [rsp+20h]
     lea rdx, [rsp+24h]
     call two_ptrs_u64_u32
@@ -547,8 +553,8 @@ neg_unaccessed_ptr ENDP
 
 ptr_arith_callee PROC FRAME
     .endprolog
-    add rcx, 4
     mov eax, dword ptr [rcx]
+    add rcx, 4
     ret
 ptr_arith_callee ENDP
 
@@ -674,5 +680,401 @@ neg_bsr_cond_write_escape PROC FRAME
     add rsp, 28h
     ret
 neg_bsr_cond_write_escape ENDP
+
+tail_arg_callee PROC FRAME
+    .endprolog
+    mov dword ptr [rcx], edx
+    jmp write_u32_out
+tail_arg_callee ENDP
+
+neg_callee_tail_ptr_live PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call tail_arg_callee
+    add rsp, 28h
+    ret
+neg_callee_tail_ptr_live ENDP
+
+nested_int_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    mov dword ptr [rcx], edx
+    call pure_mix
+    add rsp, 28h
+    ret
+nested_int_callee ENDP
+
+neg_nested_int_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call nested_int_callee
+    add rsp, 28h
+    ret
+neg_nested_int_callee ENDP
+
+nested_multi_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    mov qword ptr [rcx], rdx
+    mov rdx, rcx
+    xor r8d, r8d
+    xor r9d, r9d
+    call two_ptrs_u64_u32
+    add rsp, 28h
+    ret
+nested_multi_callee ENDP
+
+neg_nested_multi_live PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call nested_multi_callee
+    add rsp, 28h
+    ret
+neg_nested_multi_live ENDP
+
+nested_cmov_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    mov eax, 1
+    test edx, edx
+    cmove rcx, rax
+    call write_u32_out
+    add rsp, 28h
+    ret
+nested_cmov_callee ENDP
+
+neg_nested_cmov_ptr PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call nested_cmov_callee
+    add rsp, 28h
+    ret
+neg_nested_cmov_ptr ENDP
+
+lea_disp_callee PROC FRAME
+    .endprolog
+    lea r9, [rcx+4]
+    mov dword ptr [r9], edx
+    xor eax, eax
+    ret
+lea_disp_callee ENDP
+
+neg_lea_disp_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call lea_disp_callee
+    add rsp, 28h
+    ret
+neg_lea_disp_callee ENDP
+
+lea_index_callee PROC FRAME
+    .endprolog
+    xor eax, eax
+    lea r9, [rcx+rax]
+    mov dword ptr [r9], edx
+    xor eax, eax
+    ret
+lea_index_callee ENDP
+
+neg_lea_index_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call lea_index_callee
+    add rsp, 28h
+    ret
+neg_lea_index_callee ENDP
+
+mem_disp_callee PROC FRAME
+    .endprolog
+    mov dword ptr [rcx+4], edx
+    xor eax, eax
+    ret
+mem_disp_callee ENDP
+
+neg_mem_disp_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call mem_disp_callee
+    add rsp, 28h
+    ret
+neg_mem_disp_callee ENDP
+
+mem_index_callee PROC FRAME
+    .endprolog
+    xor eax, eax
+    mov dword ptr [rcx+rax], edx
+    ret
+mem_index_callee ENDP
+
+neg_mem_index_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call mem_index_callee
+    add rsp, 28h
+    ret
+neg_mem_index_callee ENDP
+
+mem_ecx_callee PROC FRAME
+    .endprolog
+    mov dword ptr [ecx], edx
+    xor eax, eax
+    ret
+mem_ecx_callee ENDP
+
+neg_mem_ecx_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call mem_ecx_callee
+    add rsp, 28h
+    ret
+neg_mem_ecx_callee ENDP
+
+stos_ptr_callee PROC FRAME
+    push rdi
+    .pushreg rdi
+    .endprolog
+    mov dword ptr [rcx], edx
+    mov rdi, r8
+    mov rax, rcx
+    stosq
+    xor eax, eax
+    pop rdi
+    ret
+stos_ptr_callee ENDP
+
+neg_stos_ptr_rax PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call stos_ptr_callee
+    add rsp, 28h
+    ret
+neg_stos_ptr_rax ENDP
+
+movs_ptr_callee PROC FRAME
+    push rsi
+    .pushreg rsi
+    push rdi
+    .pushreg rdi
+    .endprolog
+    mov dword ptr [rcx], edx
+    mov rdi, r8
+    mov rsi, rcx
+    movsq
+    xor eax, eax
+    pop rdi
+    pop rsi
+    ret
+movs_ptr_callee ENDP
+
+neg_movs_ptr_rsi PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call movs_ptr_callee
+    add rsp, 28h
+    ret
+neg_movs_ptr_rsi ENDP
+
+sign_ext_callee PROC FRAME
+    .endprolog
+    mov dword ptr [rcx], edx
+    mov rax, rcx
+    cqo
+    xor eax, eax
+    ret
+sign_ext_callee ENDP
+
+neg_sign_ext_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call sign_ext_callee
+    add rsp, 28h
+    ret
+neg_sign_ext_callee ENDP
+
+mul_ptr_callee PROC FRAME
+    .endprolog
+    mov dword ptr [rcx], edx
+    mov rax, rcx
+    mul rdx
+    xor eax, eax
+    ret
+mul_ptr_callee ENDP
+
+neg_mul_ptr_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call mul_ptr_callee
+    add rsp, 28h
+    ret
+neg_mul_ptr_callee ENDP
+
+partial_write_callee PROC FRAME
+    .endprolog
+    mov dword ptr [rcx], edx
+    mov cl, dl
+    xor eax, eax
+    ret
+partial_write_callee ENDP
+
+neg_partial_write_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call partial_write_callee
+    add rsp, 28h
+    ret
+neg_partial_write_callee ENDP
+
+xor8_partial_callee PROC FRAME
+    .endprolog
+    mov dword ptr [rcx], edx
+    xor cl, cl
+    xor eax, eax
+    ret
+xor8_partial_callee ENDP
+
+neg_xor8_partial_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call xor8_partial_callee
+    add rsp, 28h
+    ret
+neg_xor8_partial_callee ENDP
+
+bit_test_reg_callee PROC FRAME
+    .endprolog
+    bt dword ptr [rcx], edx
+    setc al
+    movzx eax, al
+    ret
+bit_test_reg_callee ENDP
+
+neg_bit_test_reg_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    mov dword ptr [rsp+20h], ecx
+    lea rcx, [rsp+20h]
+    call bit_test_reg_callee
+    add rsp, 28h
+    ret
+neg_bit_test_reg_callee ENDP
+
+cmov32_mem_callee PROC FRAME
+    .endprolog
+    mov dword ptr [rcx], edx
+    test edx, edx
+    cmove ecx, dword ptr [r8]
+    xor eax, eax
+    ret
+cmov32_mem_callee ENDP
+
+neg_cmov32_mem_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+20h]
+    call cmov32_mem_callee
+    add rsp, 28h
+    ret
+neg_cmov32_mem_callee ENDP
+
+neg_may_write_saved_reg PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    mov qword ptr [rsp+20h], rbx
+    mov ebx, ecx
+    lea rcx, [rsp+20h]
+    mov edx, 1
+    call cond_write_u32
+    mov rbx, qword ptr [rsp+20h]
+    add rsp, 28h
+    ret
+neg_may_write_saved_reg ENDP
+
+neg_read_saved_reg PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    mov qword ptr [rsp+20h], rbx
+    lea rcx, [rsp+20h]
+    mov edx, 1
+    call rmw_u64
+    mov rbx, qword ptr [rsp+20h]
+    add rsp, 28h
+    ret
+neg_read_saved_reg ENDP
+
+five_arg_callee PROC FRAME
+    .endprolog
+    mov rax, qword ptr [rsp+28h]
+    mov dword ptr [rcx], eax
+    xor eax, eax
+    ret
+five_arg_callee ENDP
+
+neg_callee_stack_arg_overlap PROC FRAME
+    sub rsp, 38h
+    .allocstack 38h
+    .endprolog
+    mov qword ptr [rsp+20h], rdx
+    lea rcx, [rsp+20h]
+    call five_arg_callee
+    add rsp, 38h
+    ret
+neg_callee_stack_arg_overlap ENDP
+
+incoming_slot_ptr_callee PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    lea rcx, [rsp+50h]
+    call rmw_u64
+    add rsp, 28h
+    ret
+incoming_slot_ptr_callee ENDP
+
+neg_incoming_stack_slot_uninit PROC FRAME
+    sub rsp, 28h
+    .allocstack 28h
+    .endprolog
+    xor edx, edx
+    call incoming_slot_ptr_callee
+    add rsp, 28h
+    ret
+neg_incoming_stack_slot_uninit ENDP
 
 END

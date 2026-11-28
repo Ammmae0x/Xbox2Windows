@@ -29,3 +29,24 @@ EXPORTS
     neg_cmov32_ptr_trunc
     neg_bsf_cond_write_escape
     neg_bsr_cond_write_escape
+    neg_callee_tail_ptr_live
+    neg_nested_int_callee
+    neg_nested_multi_live
+    neg_nested_cmov_ptr
+    neg_lea_disp_callee
+    neg_lea_index_callee
+    neg_mem_disp_callee
+    neg_mem_index_callee
+    neg_mem_ecx_callee
+    neg_stos_ptr_rax
+    neg_movs_ptr_rsi
+    neg_sign_ext_callee
+    neg_mul_ptr_callee
+    neg_partial_write_callee
+    neg_xor8_partial_callee
+    neg_bit_test_reg_callee
+    neg_cmov32_mem_callee
+    neg_may_write_saved_reg
+    neg_read_saved_reg
+    neg_callee_stack_arg_overlap
+    neg_incoming_stack_slot_uninit
