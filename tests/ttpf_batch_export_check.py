@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import struct
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -179,6 +180,30 @@ class BatchExportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             batch.parse_indices("10-2")
 
+    def test_malformed_indices_are_usage_errors(self):
+        cases = {
+            "5-3": "Invalid range '5-3'",
+            "1-": "Invalid index '' in '1-'",
+            "abc": "Invalid index 'abc' in 'abc'",
+            "-2": "Invalid index '' in '-2'",
+        }
+        self.assertEqual(batch.parse_indices("0-1,3"), [0, 1, 3])
+        with tempfile.TemporaryDirectory() as tmp:
+            pool = Path(tmp) / "empty.ttpf"
+            pool.write_bytes(b"")
+            for spec, expected in cases.items():
+                out_dir = Path(tmp) / "out"
+                with self.subTest(spec=spec):
+                    proc = subprocess.run(
+                        [sys.executable, "-B", str(ROOT / "tools" / "ttpf_batch_export.py"),
+                         str(pool), "-o", str(out_dir), f"--indices={spec}"],
+                        capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn("--indices:", proc.stderr)
+                    self.assertIn(expected, proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+                    self.assertFalse(out_dir.exists())
+
     def test_export_texture_entry_strict_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp)
@@ -212,6 +237,36 @@ class BatchExportTests(unittest.TestCase):
             self.assertEqual(res_prov["format_name"], "BC7")
             self.assertEqual(res_prov["sha256"], hashlib.sha256(b"DDS_PROVISIONAL_BC7_DATA").hexdigest())
             self.assertTrue((out_dir / "tex_00001.dds").exists())
+
+    def test_requested_provisional_history_is_read_before_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool, history = root / "pool.ttpf", root / "history.json"
+            pool.write_bytes(make_synthetic_ttpf_archive())
+            dds, manifest = root / "tex_00001.dds", root / "manifest.json"
+            dds.write_bytes(b"previous DDS")
+            manifest.write_bytes(b"previous manifest")
+            command = [sys.executable, "-B", batch.__file__, pool, "-o", root,
+                       "--indices", "1", "--allow-provisional", "--history", history]
+            for data in (None, b"{", b"\xff", b"null", b"[]"):
+                with self.subTest(data=data):
+                    if data is not None:
+                        history.write_bytes(data)
+                    result = subprocess.run(command, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("--history " + str(history), result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(dds.read_bytes(), b"previous DDS")
+                    self.assertEqual(manifest.read_bytes(), b"previous manifest")
+
+            with patch.object(batch, "load_tools", return_value=MockTtpfModule), patch.object(
+                MockTtpfModule, "export", wraps=MockTtpfModule.export
+            ) as export:
+                for profile in ({}, {"bc7": {"historyIndices": [2, 5]}}):
+                    history.write_text(json.dumps(profile), encoding="utf-8")
+                    summary = batch.batch_export(pool, root, indices=[1], allow_provisional=True, history_path=history)
+                    self.assertEqual(summary["stats"]["provisional"], 1)
+                    self.assertEqual(export.call_args.kwargs["history"], profile)
 
     def test_require_rust_checks_selected_tools_and_kernels(self):
         library = SimpleNamespace(
@@ -348,6 +403,74 @@ class BatchExportTests(unittest.TestCase):
                 self.assertEqual(manifest[1]["mode"], "provisional")
             finally:
                 batch.load_tools = orig_load
+
+    def test_manifest_cannot_replace_a_requested_dds(self):
+        for index in (0, 1, 2):
+            for existing in (False, True):
+                with self.subTest(index=index, existing=existing), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    pool = root / "pool.ttpf"
+                    pool.write_bytes(b"DUMMY_POOL")
+                    out_dir = root / "out"
+                    dds = out_dir / f"tex_{index:05d}.dds"
+                    if existing:
+                        out_dir.mkdir()
+                        dds.write_bytes(b"previous dds")
+                    with patch.object(batch, "load_tools", return_value=MockTtpfModule), \
+                            patch.object(MockTtpfModule, "export", wraps=MockTtpfModule.export) as export:
+                        with self.assertRaisesRegex(ValueError, "manifest path collides with DDS"):
+                            batch.batch_export(pool, out_dir, indices=[index], manifest_path=dds)
+                    export.assert_not_called()
+                    self.assertEqual(pool.read_bytes(), b"DUMMY_POOL")
+                    if existing:
+                        self.assertEqual(dds.read_bytes(), b"previous dds")
+                    else:
+                        self.assertFalse(out_dir.exists())
+
+    def test_manifest_dds_name_in_a_different_directory_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "pool.ttpf"
+            pool.write_bytes(b"DUMMY_POOL")
+            out_dir = root / "out"
+            manifest = root / "tex_00000.dds"
+            with patch.object(batch, "load_tools", return_value=MockTtpfModule):
+                summary = batch.batch_export(pool, out_dir, indices=[0], manifest_path=manifest)
+            self.assertEqual(summary["stats"]["strict"], 1)
+            row, = json.loads(manifest.read_text())
+            dds = out_dir / row["file"]
+            self.assertEqual(dds.read_bytes(), b"DDS_STRICT_BC1_DATA")
+            self.assertEqual(row["sha256"], hashlib.sha256(dds.read_bytes()).hexdigest())
+
+    def test_manifest_cannot_replace_a_history_or_calibration_input(self):
+        for option in ("history", "calibration"):
+            with self.subTest(option=option), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                pool = root / "pool.ttpf"
+                pool.write_bytes(b"DUMMY_POOL")
+                profile = root / "profile.json"
+                original = b'{"version": 1}'
+                profile.write_bytes(original)
+                out_dir = root / "out"
+                tools = SimpleNamespace(
+                    __file__=str(root / "ttpf_mips.py"), Pool=MockTtpfModule.Pool,
+                    analyze=MockTtpfModule.analyze, export=MockTtpfModule.export,
+                    BC_FORMATS=MockTtpfModule.BC_FORMATS,
+                )
+                calibrated = SimpleNamespace(
+                    __file__=str(root / "calibrated_texture.py"), ttpf=tools,
+                    native=Mock(), LocalDecoder=Mock(),
+                )
+                kwargs = ({"history_path": profile, "allow_provisional": True} if option == "history"
+                          else {"calibration_path": profile})
+                with patch.object(batch, "load_tools", return_value=tools) as load, patch.dict(
+                    sys.modules, {"calibrated_texture": calibrated}
+                ):
+                    with self.assertRaisesRegex(ValueError, f"manifest path collides with --{option}"):
+                        batch.batch_export(pool, out_dir, indices=[0], manifest_path=profile, **kwargs)
+                load.assert_not_called()
+                self.assertEqual(profile.read_bytes(), original)
+                self.assertFalse(out_dir.exists())
 
     def test_export_fitted_then_strict_reused_directory(self):
         """A failed strict export keeps the prior DDS outside the current manifest."""

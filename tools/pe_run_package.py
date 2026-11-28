@@ -8,9 +8,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import struct
 import sys
 
+import pefile
+
 from pe_package_preflight import inspect
+from host_commit import read_host_commit, require_commit_budget
 
 # --trap-callable exit codes are TRAP_EXIT_BASE | trap number (1-based, in sorted dll!symbol order).
 TRAP_EXIT_BASE = 0xE7A00000
@@ -36,6 +40,8 @@ def plan(report, *, allow_external=True):
         if row["status"] not in accepted:
             raise ValueError(f"{image}: {name[0]}!{name[1]}: {row['status']}")
         chain = row["chain"]
+        if not chain:
+            raise ValueError(f"{image}: {name[0]}!{name[1]}: empty resolution chain")
         for caller, provider in zip([image, *(step["provider"] for step in chain)], chain):
             if provider.get("package") and caller != provider["provider"]:
                 needs[caller].add(provider["provider"])
@@ -54,6 +60,8 @@ def plan(report, *, allow_external=True):
             raise ValueError("bundled dependency cycle: " + ", ".join(sorted(pending)))
         order.extend(finished)
         pending.difference_update(finished)
+    if not order:
+        raise ValueError("reachable package graph is empty")
     if order[-1] != report["entry"]:
         raise ValueError("entry is a dependency of a bundled image")
     return order, routes
@@ -72,11 +80,43 @@ def prototype(lib, name, args, result):
     return function
 
 
+SEM_FAILCRITICALERRORS = 0x0001
+
+
+def quiet_loader(kernel, load):
+    """LoadLibraryExW with SEM_FAILCRITICALERRORS set on the calling thread for the call only.
+
+    A provider that is not a loadable image (empty, truncated or not a PE) raises a critical error
+    inside the loader. Without the flag Windows shows a modal "Bad Image" dialog and the load blocks
+    until someone closes it; with it the load just fails, and the provider's symbols are reported
+    missing. The thread's previous mode is restored, so the guest runs under the host's setting.
+    """
+    get_mode = prototype(kernel, "GetThreadErrorMode", [], W.DWORD)
+    set_mode = prototype(kernel, "SetThreadErrorMode", [W.DWORD, C.POINTER(W.DWORD)], W.BOOL)
+
+    def call(path, flags):
+        previous = W.DWORD()
+        changed = set_mode(get_mode() | SEM_FAILCRITICALERRORS, C.byref(previous))
+        try:
+            return load(path, None, flags)
+        finally:
+            if changed:
+                set_mode(previous.value, None)
+
+    return call
+
+
 def trap_key(name):
     """Parse a --trap-callable DLL!SYMBOL (or DLL!#ORDINAL) into an import key."""
     dll, sep, symbol = name.partition("!")
-    if not sep or not dll or not symbol or Path(dll).name != dll:
+    if (not sep or not dll or not symbol or dll in (".", "..")
+            or Path(dll).name != dll or "/" in dll or "\\" in dll):
         raise ValueError(f"--trap-callable expects DLL!SYMBOL or DLL!#ORDINAL, got {name!r}")
+    if symbol.startswith("#"):
+        ordinal = symbol[1:].lstrip("0")
+        if not (1 <= len(ordinal) <= 5 and ordinal.isascii() and ordinal.isdigit() and int(ordinal) <= 0xFFFF):
+            raise ValueError(f"--trap-callable expects DLL!SYMBOL or DLL!#ORDINAL, got {name!r}")
+        symbol = "#" + ordinal
     return dll.casefold(), symbol
 
 
@@ -124,7 +164,7 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
     order, routes = plan(report)
     callback = C.WINFUNCTYPE(C.c_void_p, C.c_char_p, C.c_char_p, C.c_uint32)
     kernel = C.WinDLL("kernel32", use_last_error=True)
-    load = prototype(kernel, "LoadLibraryExW", [W.LPCWSTR, W.HANDLE, W.DWORD], W.HMODULE)
+    load = quiet_loader(kernel, prototype(kernel, "LoadLibraryExW", [W.LPCWSTR, W.HANDLE, W.DWORD], W.HMODULE))
     release_host = prototype(kernel, "FreeLibrary", [W.HMODULE], W.BOOL)
     find = prototype(kernel, "GetProcAddress", [W.HMODULE, C.c_void_p], C.c_void_p)
     pin_module = prototype(kernel, "GetModuleHandleExW", [W.DWORD, C.c_void_p, C.POINTER(W.HMODULE)], W.BOOL)
@@ -149,8 +189,8 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
                         missing_keys[key].add(image)
                     continue
                 if dll not in modules:
-                    module = (load(str(shims[dll]), None, 0x900) if dll in shims else
-                              load(dll, None, 0x800) if dll in system else None)
+                    module = (load(str(shims[dll]), 0x900) if dll in shims else
+                              load(dll, 0x800) if dll in system else None)
                     modules[dll] = module
                     if module:
                         stack.callback(release_host, module)
@@ -271,7 +311,7 @@ def run(root, report, mapper, shims, system, *, preflight_only=False, pin_shims=
         return result
 
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mapper", type=Path)
     parser.add_argument("package", type=Path)
@@ -280,28 +320,54 @@ def main():
     parser.add_argument("--pin-shim", action="append", default=[], metavar="DLL",
                         help="keep a named external shim loaded until this process exits")
     parser.add_argument("--system", action="append", default=[], metavar="DLL")
+    parser.add_argument("--min-commit-mib", type=int, metavar="MIB",
+                        help="optional Windows system commit-headroom check before loading any DLL; "
+                             "0 reports headroom without imposing a minimum")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--preflight-only", action="store_true")
     mode.add_argument("--trap-callable", action="append", default=[], metavar="DLL!SYMBOL",
                       help="diagnostic: bind this unresolved external, which the caller must call rather than "
                            "read as data, to a trap that names it on stderr and terminates the process with "
                            f"{TRAP_EXIT_BASE:#x} | trap number; any unlisted unresolved external is still refused")
-    options = parser.parse_args()
+    options = parser.parse_args(argv)
     try:
+        # Perform the opt-in check before parsing the package or loading providers.
+        # A successful check does not reserve memory and cannot promise startup.
+        commit_report = None
+        if options.min_commit_mib is not None:
+            if not 0 <= options.min_commit_mib <= 1 << 20:
+                raise ValueError("--min-commit-mib must be between 0 and 1048576")
+            commit_report = require_commit_budget(options.min_commit_mib, read_host_commit())
         root = options.package.resolve(strict=True)
-        shims = {name.casefold(): Path(path).resolve(strict=True) for name, path in options.shim}
+        if not root.is_dir():
+            raise NotADirectoryError(f"package path is not a directory: {root}")
+        mapper = options.mapper
+        if mapper.is_dir():
+            raise IsADirectoryError(f"mapper path is a directory: {mapper}")
+        shims = {}
+        for name, raw_path in options.shim:
+            shim_path = Path(raw_path).resolve(strict=True)
+            if shim_path.is_dir():
+                raise IsADirectoryError(f"--shim {name} path is a directory: {shim_path}")
+            if not shim_path.is_file():
+                raise ValueError(f"--shim {name} path is not a regular file: {shim_path}")
+            shims[name.casefold()] = shim_path
         system = {name.casefold() for name in options.system}
-        if any(Path(name).name != name for name in system):
+        if any(not name or name in (".", "..") or Path(name).name != name or "/" in name or "\\" in name
+               for name in system):
             raise ValueError("System providers must be DLL basenames")
         report = inspect(root, options.entry)
-        result = run(root, report, options.mapper.resolve(), shims, system,
+        result = run(root, report, mapper.resolve(), shims, system,
                      preflight_only=options.preflight_only,
                      pin_shims={name.casefold() for name in options.pin_shim},
                      trap_callable=options.trap_callable)
-    except (ValueError, OSError) as exc:
+        if commit_report is not None:
+            result = {**result, "host_commit": commit_report}
+    except (ValueError, OSError, pefile.PEFormatError, struct.error) as exc:
         parser.exit(1, f"{exc}\n")
     print(json.dumps(result, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
