@@ -1663,6 +1663,7 @@ ctest --preset dev --no-tests=error -R '^startup_hook_(window|overlap)$' -V
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR`, `X2W_DRAW_DUMP_PIXEL=<x>,<y>` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). With `X2W_DRAW_DUMP_PIXEL`, each copy covers one texel instead and the present writes `pixel_history.txt` in `X2W_DRAW_DUMP_DIR`: one line per translated draw with `draw=`, `frame=`, `x=`, `y=`, `key=`, `count=`, `format=`, `raw=` and, for an 8-bit four-channel target, `rgba=`. The bounded history names the last draw that changed the texel (`src/startup_stubs/pixel_history.h`, `ctest --preset dev --no-tests=error -R '^startup_pixel_history_' -V`). |
 | `X2W_TEARDOWN_REPORT=1`, `X2W_TEARDOWN_NO_GUARD=<pages, readbacks or all>` | Test accounting for the caches whose destructors run during the module's CRT teardown (`src/startup_stubs/d3d12_teardown.h`, #2572). With `X2W_TEARDOWN_REPORT`, each destroyed cache writes one `x2w-teardown <cache> detached=<n> released=<n>` line to stderr with `WriteFile`, because a stdio buffer would not be flushed from a CRT teardown. `X2W_TEARDOWN_NO_GUARD` names a cache whose detach at process exit becomes an ordinary release again: the negative control `startup_teardown_unload` runs against itself, where the termination check has to fail. Unset, both change nothing and no line is written. |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. `XDspDeactivate` and `XDspDisconnect` refuse null and unknown handles with `E_INVALIDARG`. |
+| `X2W_AUDIO_ACTIVITY=1` | with `X2W_AUDIO_PERMISSIVE=1`, counts XMA context changes, HAL submits and XApu commands, and logs at most a line per second when a count moved ([Activity counter](#activity-counter)) |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_RUNTIME_LOCAL=1` | with `X2W_RUNTIME_PROXY` and `X2W_FAKE_USER`, for a host where the system gaming runtime cannot initialize (no Gaming Services). The first failed `InitializeApiImpl*` is reported as `S_OK`, and every later initialization call returns `S_OK` without calling the real export. Once initialization failure is latched, a failed real `QueryApiImpl` call can fall back only with an exact match of both GUIDs to a supported provider/interface pair for user (including gamertag), game save, package, title, connectivity or store. Persistent local storage uses its existing fake-user gate and requires its exact provider GUID and IID. Unmatched failed queries keep the real HRESULT. The proxy clears a writable output on failure only when fake user is enabled and the initialization failure is latched. A local object's `QueryInterface` accepts only `IID_IUnknown` and the IID it was created for. The local answers above apply, calls that carry the local user or store handle fail as before, and other unanswered methods return `E_NOTIMPL`. `XUserAddAsync` and async operations completed on behalf of a local answer require the real runtime's `QueryApiImpl` to return the XAsync provider (`073b7dcb`). Those operations complete with `S_OK` through XAsync, or return the query failure if XAsync is unavailable (`ctest --preset dev --no-tests=error -R '^startup_runtime_local(_control)?$'`, and the control must print `FAIL:`). |
@@ -3065,7 +3066,8 @@ observed callers. The experimental mode echoes any 32-bit type value at `+0x00` 
 (including unobserved types such as `4`) rather than rejecting it, while keeping payload bytes
 outside `+0x00` and `+0x04` zero (`+0x34` carries decoded bytes only in the optional Opus build below). Handles are never reused, and each connection's queue buffer is
 released on `XApuDisconnect`. Default non-permissive mode still traps on every export
-(`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
+(`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`). With `X2W_AUDIO_ACTIVITY=1` it also counts
+commands by class (see [Activity counter](#activity-counter)).
 
 The default build does not depend on libopus. Configuring with `-DX2W_WITH_OPUS=ON` (and `Opus_DIR` pointing at an
 installed libopus CMake package) links libopus into `xapu.dll`. The stand-ins link the static MSVC runtime, so libopus
@@ -3171,6 +3173,48 @@ address validity/mapping exports, then runs 4 threads of 1000 rounds against an 
 
 ```
 ctest --preset dev --no-tests=error -R '^startup_acphal_apu_free$' -V
+```
+
+### Activity counter
+
+With `X2W_AUDIO_ACTIVITY=1` as well, the stand-ins count what a caller does with the audio processor without decoding
+anything. `AcpHal.dll` keeps a copy of the XMA context array that `AcpHalAllocateShapeContexts` hands out and compares
+the array with it inside the calls that count (HAL submits, `AcpHalAllocateShapeContexts`, every `ApuFree` once counting
+started and `x2w_acphal_xma_activity`), at most once per 10 ms. Each 64-byte context is taken as a whole and no field in
+it is read: one that goes from all zero to nonzero counts as filled, one that changes while nonzero as changed, one that
+returns to all zero as cleared. HAL slot2 submits are counted by their type argument. `xapu.dll` counts every
+`XApuEnqueueCommand` call by command class, taken as the first `UINT32` of the command, with no cap; unreadable commands
+and unknown handles are counted apart; `commands=` is the classes plus the unreadable commands, and `rejected=` calls
+are not in it. In an `X2W_WITH_OPUS` build with `X2W_XAPU_TYPED_COMPLETIONS=1`, a type 3 command too short to decode
+returns `E_POINTER` before the queue and is still counted, as class 3.
+Neither DLL starts a thread: a counted call at least a second after a DLL's previous line (or its first
+counted call) logs the next line, with the counts since that line, only when a count moved, so nothing of either DLL
+runs after a caller unloads it. Until then the counts wait for a later call: counts from the last second before a
+caller's final call, and changes after it, are not logged, though the exports still return them. With the fixture's
+caller, for example:
+
+```
+x2w-audio xma-activity t=1.1 s: contexts filled=5 changed=3 cleared=2 live=0/0; hal submits=4 by type 1=2 3=1 other=1
+x2w-audio xapu-activity t=1.1 s: commands=7 by class 1=3 2=2 other=1 unreadable=1; rejected=1 (not in commands)
+```
+
+`t` is seconds since the process started, the same base in both DLLs; the fixture's line comes after its `ApuFree`, so
+no context is watched (`live=0/0`). A context written across a sample counts twice, and one filled and cleared between
+two samples is not counted. `ApuFree` of the array ends the count before the block can be reused, and a second
+`AcpHalAllocateShapeContexts` samples the old array once more and then watches only the new one. The totals are also
+returned by the experimental exports `x2w_acphal_xma_activity` and `x2w_xapu_command_counts`. The 64-byte stride and the
+command class are stand-in conventions, not a console layout, and no field inside a context, such as an enable flag, is
+identified. With the variable unset nothing runs: no read of caller memory, no line.
+
+The source-built check runs four child processes: counter on (the exports and the logged lines give exactly what the
+caller script did, and an array freed and allocated again is no longer counted), counter on with a caller that writes
+only the 64 bytes after the last context and sends nothing (every count 0, no line), counter off (no count, no line),
+and an unload case. That one allocates the contexts twice without `ApuFree` (the old array's unsampled change counts,
+later ones do not), then frees both DLLs, checks that they are unmapped, waits 1.5 s and must exit 0. Every result,
+output, last error and the final context bytes must match between the on and off runs:
+
+```
+ctest --preset release --no-tests=error -R '^startup_acphal_xma_activity$' -V
 ```
 
 ## Uniform first-lane reads
