@@ -25,14 +25,18 @@ Metadata and safety profile (`preserved-metadata` / masked-exception):
   - `preserved-metadata`: explicit FLDENV/FRSTOR -> FNSTENV/FNSAVE round-trips preserve
     FIP/FCS/FOP/FDP/FDS (with FOP masked to 11 bits); masked non-control/stack ops
     (FDECSTP, FLD, FLD1, FLDZ, FSTP) preserve the loaded/initialized FIP/FCS/FOP/FDP/FDS
-    (matching Intel SDM default fopcode compatibility mode; AMD/compat parts may update
-    FOP/FIP/FCS on masked non-control ops).
+    (matching the profile measured on the i7-13620H; hosts with CPUID.(EAX=7,ECX=0):EBX[13]=1
+    zero FCS/FDS on hardware, and AMD/other parts may update FOP/FIP/FCS on FDECSTP and
+    masked non-control ops).
+  - Measured x64 status profile: WAIT, FLDCW, FNSTCW, and FNSTSW AX preserve C0..C3 loaded
+    by FLDENV/FRSTOR (whereas SDM leaves C0..C3 undefined after WAIT/FLDCW/FNSTCW/FNSTSW).
   - FNINIT/FNSAVE sets FTW=0xFFFF without clearing physical register contents. FLDENV
     with non-empty FTW bits on physical registers not defined in the current function
     traps via x87_trap() (`__ud2()`).
   - Masked-exception precondition: WAIT, FDECSTP, FLD*, and FSTP* trap via x87_trap()
     when any exception is unmasked (FCW[5:0] != 0x3F) or SW.ES is set; FLDENV/FRSTOR
-    also trap if SW.ES or an unmasked pending exception is loaded.
+    also trap eagerly if SW.ES or an unmasked pending exception is loaded (stricter than
+    hardware, which defers #MF until the next waiting x87 instruction).
   - Uninitialized reads of FCW (FNSTCW before FNINIT/FLDCW/FLDENV/FRSTOR), FSW/env
     (FNSTSW/FNSTENV/FNSAVE/FDECSTP before FNINIT/FLDENV/FRSTOR), and readers of
     undefined C0..C3 after FNSTENV/FSTENV are statically rejected.

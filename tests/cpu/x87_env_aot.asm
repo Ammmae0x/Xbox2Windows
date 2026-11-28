@@ -84,6 +84,15 @@ ENDIF
     ret
 op_fldenv_fnstenv ENDP
 
+op_fldenv_wait_fnstenv PROC FRAME
+    .endprolog
+    fldenv byte ptr [rcx]
+    wait
+    fnstenv byte ptr [r8]
+    fninit
+    ret
+op_fldenv_wait_fnstenv ENDP
+
 op_fnsave_stack PROC FRAME
     .endprolog
     fninit

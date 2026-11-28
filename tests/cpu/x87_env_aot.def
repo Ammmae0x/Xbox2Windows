@@ -5,6 +5,7 @@ EXPORTS
     op_fstenv_pushed
     op_fnstenv_post_cw
     op_fldenv_fnstenv
+    op_fldenv_wait_fnstenv
     op_fnsave_stack
     op_fnsave_post_cw
     op_fnsave_post_sw
