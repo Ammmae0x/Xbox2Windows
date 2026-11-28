@@ -24,6 +24,8 @@
 #include <fstream>
 #include <cstring>
 #include <vector>
+#include "bcpack_format_fixtures.h"
+#include "bcpack_storage_goldens.h"
 
 using u64 = std::uint64_t;
 
@@ -969,6 +971,252 @@ bool dstorage_checks() {
         }
     }
 
+    // Control: interleaved requests for distinct files in a single submission continue their own streams
+    // without breaking each other's continuation chains (Refs #1198).
+    {
+        const size_t plain1_size = 128 * 1024;
+        const size_t plain2_size = 64 * 1024;
+        const auto comp1 = make_fixed_deflate_zlib(0x41, plain1_size);
+        const auto comp2 = make_fixed_deflate_zlib(0x42, plain2_size);
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file1[MAX_PATH], temp_file2[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file1)) return false;
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file2)) {
+            DeleteFileW(temp_file1);
+            return false;
+        }
+
+        HANDLE h1 = CreateFileW(temp_file1, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        HANDLE h2 = CreateFileW(temp_file2, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h1 == INVALID_HANDLE_VALUE || h2 == INVALID_HANDLE_VALUE) {
+            if (h1 != INVALID_HANDLE_VALUE) CloseHandle(h1);
+            if (h2 != INVALID_HANDLE_VALUE) CloseHandle(h2);
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        std::vector<unsigned char> file1_bytes(128 * 1024, 0);
+        std::memcpy(file1_bytes.data(), comp1.data(), comp1.size());
+        DWORD written = 0;
+        WriteFile(h1, file1_bytes.data(), static_cast<DWORD>(file1_bytes.size()), &written, nullptr);
+        WriteFile(h2, comp2.data(), static_cast<DWORD>(comp2.size()), &written, nullptr);
+        CloseHandle(h1);
+        CloseHandle(h2);
+
+        void* file_ptr1 = nullptr;
+        void* file_ptr2 = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file1, nullptr, &file_ptr1) != 0 || !file_ptr1 ||
+            reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file2, nullptr, &file_ptr2) != 0 || !file_ptr2) {
+            if (file_ptr1) reinterpret_cast<CloseFileFn>(static_cast<Object*>(file_ptr1)->vtable[3])(static_cast<Object*>(file_ptr1));
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        auto* file_obj1 = static_cast<Object*>(file_ptr1);
+        auto* file_obj2 = static_cast<Object*>(file_ptr2);
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 3, "InterleavedStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj1->vtable[3])(file_obj1);
+            reinterpret_cast<CloseFileFn>(file_obj2->vtable[3])(file_obj2);
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj1->vtable[3])(file_obj1);
+            reinterpret_cast<CloseFileFn>(file_obj2->vtable[3])(file_obj2);
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        std::vector<unsigned char> dest1_0(64 * 1024, 0);
+        std::vector<unsigned char> dest2(64 * 1024, 0);
+        std::vector<unsigned char> dest1_1(64 * 1024, 0);
+
+        unsigned char req1_0[0x48] = {};
+        *reinterpret_cast<u64*>(req1_0 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1_0 + 0x08) = dest1_0.data();
+        *reinterpret_cast<unsigned*>(req1_0 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req1_0 + 0x20) = file_obj1;
+        *reinterpret_cast<u64*>(req1_0 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req1_0 + 0x30) = static_cast<unsigned>(comp1.size());
+        *reinterpret_cast<unsigned*>(req1_0 + 0x38) = static_cast<unsigned>(plain1_size);
+
+        unsigned char req2[0x48] = {};
+        *reinterpret_cast<u64*>(req2 + 0x00) = 1;
+        *reinterpret_cast<void**>(req2 + 0x08) = dest2.data();
+        *reinterpret_cast<unsigned*>(req2 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req2 + 0x20) = file_obj2;
+        *reinterpret_cast<u64*>(req2 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req2 + 0x30) = static_cast<unsigned>(comp2.size());
+        *reinterpret_cast<unsigned*>(req2 + 0x38) = static_cast<unsigned>(plain2_size);
+
+        unsigned char req1_1[0x48] = {};
+        *reinterpret_cast<u64*>(req1_1 + 0x00) = 1;
+        *reinterpret_cast<void**>(req1_1 + 0x08) = dest1_1.data();
+        *reinterpret_cast<unsigned*>(req1_1 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req1_1 + 0x20) = file_obj1;
+        *reinterpret_cast<u64*>(req1_1 + 0x28) = 64 * 1024;
+        *reinterpret_cast<unsigned*>(req1_1 + 0x30) = static_cast<unsigned>(comp1.size());
+        *reinterpret_cast<unsigned*>(req1_1 + 0x38) = static_cast<unsigned>(plain1_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1_0);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req2);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req1_1);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 2);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) break;
+            Sleep(10);
+        }
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) {
+            reinterpret_cast<CloseFileFn>(file_obj1->vtable[3])(file_obj1);
+            reinterpret_cast<CloseFileFn>(file_obj2->vtable[3])(file_obj2);
+            DeleteFileW(temp_file1);
+            DeleteFileW(temp_file2);
+            return false;
+        }
+        long hr0 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
+        long hr1 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
+        long hr2 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 2);
+        reinterpret_cast<CloseFileFn>(file_obj1->vtable[3])(file_obj1);
+        reinterpret_cast<CloseFileFn>(file_obj2->vtable[3])(file_obj2);
+        DeleteFileW(temp_file1);
+        DeleteFileW(temp_file2);
+
+        if (hr0 != 0 || hr1 != 0 || hr2 != 0) return false;
+        for (unsigned char b : dest1_0) if (b != 0x41) return false;
+        for (unsigned char b : dest2) if (b != 0x42) return false;
+        for (unsigned char b : dest1_1) if (b != 0x41) return false;
+    }
+
+
+    // Control: independent same-size request at an accepted stride whose own read fails (beyond physical file end)
+    // fails without cache fallback, leaving its destination buffer completely untouched (Refs #1198).
+    {
+        const size_t stream_plain_size = 128 * 1024;
+        const auto comp = make_fixed_deflate_zlib(0x55, stream_plain_size);
+
+        wchar_t temp_dir[MAX_PATH];
+        if (!GetTempPathW(MAX_PATH, temp_dir)) return false;
+        wchar_t temp_file[MAX_PATH];
+        if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
+        HANDLE file = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        // The file on disk contains ONLY comp.size() bytes (< 1 KiB), so any read at 64 KiB or beyond fails on disk.
+        WriteFile(file, comp.data(), static_cast<DWORD>(comp.size()), &written, nullptr);
+        CloseHandle(file);
+
+        void* file_ptr = nullptr;
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, temp_file, nullptr, &file_ptr) != 0 || !file_ptr) {
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* file_obj = static_cast<Object*>(file_ptr);
+
+        void* status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 3, "IndependentRecordsStatus", nullptr, &status_ptr) != 0 || !status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* status = static_cast<Object*>(status_ptr);
+
+        void* queue_ptr = nullptr;
+        unsigned char desc[0x20] = {};
+        *reinterpret_cast<uint16_t*>(desc + 8) = 16;
+        if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, desc, nullptr, &queue_ptr) != 0 || !queue_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* queue = static_cast<Object*>(queue_ptr);
+
+        std::vector<unsigned char> dest0(64 * 1024, 0);
+        std::vector<unsigned char> dest_stride(64 * 1024, 0xA5);
+        std::vector<unsigned char> dest_eof(64 * 1024, 0x5A);
+
+        unsigned char req0[0x48] = {};
+        *reinterpret_cast<u64*>(req0 + 0x00) = 1;
+        *reinterpret_cast<void**>(req0 + 0x08) = dest0.data();
+        *reinterpret_cast<unsigned*>(req0 + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req0 + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req0 + 0x28) = 0;
+        *reinterpret_cast<unsigned*>(req0 + 0x30) = static_cast<unsigned>(comp.size());
+        *reinterpret_cast<unsigned*>(req0 + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        // An independent request at exactly the accepted stride (0x10000 = 64 KiB), with identical source_size.
+        // Even though its geometry matches the stride, its read fails on disk (past file EOF), so it must NOT
+        // be served from the stream cache. It must report failure and leave dest_stride completely untouched.
+        unsigned char req_stride[0x48] = {};
+        *reinterpret_cast<u64*>(req_stride + 0x00) = 1;
+        *reinterpret_cast<void**>(req_stride + 0x08) = dest_stride.data();
+        *reinterpret_cast<unsigned*>(req_stride + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req_stride + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req_stride + 0x28) = 64 * 1024;
+        *reinterpret_cast<unsigned*>(req_stride + 0x30) = static_cast<unsigned>(comp.size());
+        *reinterpret_cast<unsigned*>(req_stride + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        // A second request with an aligned gap (0x80000) beyond EOF.
+        unsigned char req_eof[0x48] = {};
+        *reinterpret_cast<u64*>(req_eof + 0x00) = 1;
+        *reinterpret_cast<void**>(req_eof + 0x08) = dest_eof.data();
+        *reinterpret_cast<unsigned*>(req_eof + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(req_eof + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(req_eof + 0x28) = 0x80000;
+        *reinterpret_cast<unsigned*>(req_eof + 0x30) = static_cast<unsigned>(comp.size());
+        *reinterpret_cast<unsigned*>(req_eof + 0x38) = static_cast<unsigned>(stream_plain_size);
+
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req0);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 0);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_stride);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 1);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, req_eof);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, 2);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) break;
+            Sleep(10);
+        }
+        if (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 0) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 1) ||
+            !reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, 2)) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        long hr0 = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 0);
+        long hr_stride = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 1);
+        long hr_eof = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, 2);
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
+
+        if (hr0 != 0) return false;
+        for (unsigned char b : dest0) if (b != 0x55) return false;
+
+        // Both the at-stride failed read and the gap request must report failure and leave destinations untouched.
+        if (hr_stride == 0 || hr_eof == 0) return false;
+        for (unsigned char b : dest_stride) if (b != 0xA5) return false;
+        for (unsigned char b : dest_eof) if (b != 0x5A) return false;
+    }
+
     // Control: standalone stream with damaged checksum at matching offset fails and leaves destination unchanged (Refs #1214)
     {
         const size_t stream_plain_size = 128 * 1024;
@@ -1718,39 +1966,40 @@ bool dstorage_checks() {
         std::memcpy(bc1_packed_trailing, bc1_packed, sizeof(bc1_packed));
         bc1_packed_trailing[515] = 0x01;
 
+        // GDK 1.2603.3.0 output for the unchanged synthetic_11 input above.
         const unsigned char bc1_expected[512] = {
-            0x85, 0x31, 0x64, 0xd5, 0xaf, 0xbe, 0xff, 0xbf, 0x50, 0x84, 0xc7, 0x6b, 0xba, 0xa5, 0xbf, 0xbf,
-            0x50, 0x84, 0x27, 0xc9, 0x56, 0x06, 0x5e, 0x5f, 0x25, 0x6a, 0x43, 0xaa, 0x5e, 0xee, 0xf5, 0xf5,
-            0xe8, 0x72, 0xa0, 0x91, 0x5e, 0x5e, 0xfb, 0xfb, 0x2a, 0x3b, 0x83, 0xf1, 0x9a, 0xa5, 0x7a, 0xfa,
-            0x81, 0x08, 0xcc, 0xa2, 0x9a, 0x9d, 0xbb, 0xff, 0x28, 0x73, 0x20, 0xbe, 0x8a, 0x8f, 0x05, 0x05,
-            0x41, 0x00, 0x8c, 0xda, 0xfa, 0x5f, 0xfa, 0xdb, 0xfe, 0x8a, 0x7a, 0x5a, 0x72, 0x3a, 0xfa, 0xba,
-            0x41, 0xf8, 0x8c, 0x32, 0x0f, 0xff, 0xfa, 0xba, 0xec, 0x5a, 0xa6, 0xa9, 0x6b, 0x5f, 0xaf, 0xaf,
-            0x50, 0x84, 0x26, 0x89, 0x5a, 0x5f, 0x5f, 0x5f, 0x44, 0x21, 0x23, 0xb1, 0xaf, 0x5d, 0xaf, 0xab,
-            0x0d, 0x6b, 0x24, 0x52, 0xaf, 0xf7, 0xbf, 0xfd, 0x0c, 0x5b, 0x26, 0x7c, 0xbe, 0x9e, 0x05, 0x05,
-            0x3e, 0x83, 0x7a, 0x39, 0xd5, 0x95, 0xaa, 0x5a, 0x61, 0x10, 0x6e, 0x68, 0x5b, 0x0f, 0xff, 0xbd,
-            0x8a, 0x9b, 0x65, 0x51, 0x2f, 0xaa, 0xaa, 0x5a, 0xb8, 0xc6, 0xd3, 0x4a, 0x4f, 0x45, 0xf0, 0xb0,
-            0x1e, 0xb6, 0x1e, 0x6d, 0x5b, 0x5f, 0xba, 0xba, 0x50, 0x84, 0x27, 0xe4, 0xfa, 0x5a, 0xaa, 0xaf,
-            0x65, 0x52, 0x45, 0xd2, 0x5e, 0x0f, 0xaf, 0xef, 0xaf, 0x73, 0x06, 0x55, 0xae, 0x8f, 0xae, 0x5f,
-            0x89, 0x52, 0xa1, 0x80, 0x0f, 0x0b, 0xa5, 0xa5, 0x03, 0x21, 0xe2, 0xe8, 0x7b, 0x5f, 0x0a, 0x0a,
-            0xa5, 0x39, 0x23, 0x99, 0xd0, 0xd0, 0xaa, 0xff, 0x2c, 0x8b, 0xca, 0x0a, 0x20, 0xa0, 0xaf, 0xfb,
-            0x28, 0x6b, 0xc1, 0x08, 0x0a, 0x5a, 0xff, 0xaa, 0x4a, 0x4a, 0x45, 0x09, 0xba, 0xab, 0x5e, 0x5e,
-            0x0c, 0x7a, 0x40, 0xaa, 0x7f, 0x7e, 0x0e, 0x0f, 0x20, 0x48, 0x9d, 0x3b, 0x5f, 0x5f, 0x00, 0x00,
-            0x4b, 0xd6, 0xc4, 0xd4, 0x60, 0x60, 0xfb, 0xef, 0x45, 0x3a, 0x41, 0xa9, 0xba, 0x9f, 0xa7, 0xf7,
-            0x0d, 0x5b, 0x37, 0x4a, 0xdb, 0x2b, 0xef, 0xaa, 0x20, 0x48, 0x8e, 0x0b, 0x8e, 0xaa, 0xaf, 0xaf,
-            0xd8, 0xcd, 0x75, 0x6d, 0x0e, 0x0a, 0xba, 0xff, 0xbc, 0xa3, 0xf8, 0x3e, 0xbf, 0xdf, 0x5a, 0xfa,
-            0x9f, 0x08, 0xd2, 0x9a, 0x25, 0x5f, 0xff, 0xba, 0x09, 0x94, 0xc3, 0x82, 0xff, 0xfe, 0xba, 0xba,
-            0x21, 0x79, 0x3c, 0x31, 0xaf, 0xfe, 0xaf, 0x5a, 0xbf, 0x53, 0xe1, 0xd1, 0xbf, 0xab, 0x5f, 0x5b,
-            0x26, 0x6b, 0xc3, 0xd8, 0x2a, 0xb5, 0xfb, 0xbf, 0x89, 0x42, 0x5f, 0xe1, 0xaf, 0xff, 0xb5, 0xb5,
-            0x0a, 0x94, 0x8b, 0xfb, 0xa5, 0xd5, 0x0f, 0x0f, 0xa8, 0x52, 0xc7, 0x01, 0x9f, 0xab, 0x55, 0x55,
-            0x29, 0xf8, 0x86, 0x7a, 0xfa, 0xfa, 0xff, 0xaa, 0x40, 0x00, 0x9a, 0x7a, 0xbe, 0xfe, 0xfa, 0xfa,
-            0x54, 0x8c, 0x29, 0xc4, 0x0a, 0x0a, 0xaf, 0xab, 0x6c, 0x6b, 0x08, 0x0a, 0xa0, 0xd0, 0xf0, 0xf0,
-            0x6b, 0x7c, 0xd9, 0x51, 0xa5, 0xd5, 0xf5, 0xe5, 0x82, 0x21, 0x00, 0x32, 0x00, 0x50, 0xa0, 0xa0,
-            0x42, 0x19, 0x35, 0x99, 0xbf, 0xe7, 0xaf, 0xff, 0x46, 0x7b, 0x60, 0x42, 0x60, 0x45, 0x0f, 0x0f,
-            0xd4, 0x31, 0x33, 0x99, 0xda, 0xaa, 0xa5, 0xaf, 0x1a, 0xd7, 0xe9, 0x80, 0xba, 0xba, 0x0a, 0x0f,
-            0xc6, 0x08, 0x97, 0xe0, 0xff, 0xfa, 0xba, 0xba, 0x51, 0xd6, 0xdf, 0xec, 0x65, 0x65, 0x5f, 0x5a,
-            0xbb, 0xbe, 0xda, 0x22, 0x2e, 0xaa, 0xf0, 0xf0, 0x6c, 0x63, 0x1d, 0x72, 0xeb, 0xeb, 0x5f, 0x5f,
-            0xce, 0x31, 0x36, 0x91, 0x70, 0x70, 0xaa, 0xf2, 0x57, 0x8c, 0x27, 0xb4, 0x8f, 0xab, 0xf0, 0xb0,
-            0x49, 0x7b, 0x6a, 0x42, 0xef, 0xfb, 0xa5, 0xb5, 0x7f, 0x6b, 0x2a, 0x3a, 0x75, 0x75, 0x5a, 0x5f
+            0x8d, 0x73, 0x0a, 0x07, 0xea, 0xb8, 0xfa, 0xbe, 0x91, 0x84, 0x04, 0x53, 0xd8, 0xa7, 0x2a, 0x4a,
+            0xc3, 0x18, 0xe2, 0x75, 0xa9, 0xf9, 0xa1, 0xa0, 0xef, 0x83, 0x6d, 0xd4, 0xf8, 0x8e, 0xa0, 0xb5,
+            0x48, 0x4a, 0x63, 0xaa, 0xd7, 0xd7, 0xbd, 0xb9, 0x8c, 0x6c, 0xc2, 0xf9, 0x3b, 0x05, 0xe0, 0xa0,
+            0x90, 0x84, 0xc5, 0x60, 0x30, 0x33, 0xb2, 0x5f, 0x2f, 0x84, 0xed, 0xf8, 0xba, 0xbc, 0xb4, 0x5a,
+            0x3e, 0x71, 0x3e, 0xa0, 0x2e, 0x08, 0xdf, 0x9d, 0x82, 0x18, 0xa1, 0xe9, 0xec, 0x20, 0x70, 0xb8,
+            0x91, 0x7c, 0x04, 0xab, 0xf7, 0x71, 0x5a, 0xc0, 0xe1, 0x07, 0x40, 0x88, 0xea, 0xdf, 0x25, 0x2f,
+            0xb2, 0x94, 0x6c, 0x2b, 0xf0, 0xfa, 0x5f, 0x5f, 0xc1, 0x10, 0xa1, 0xa0, 0x5f, 0xa4, 0x00, 0x04,
+            0xad, 0x8b, 0x88, 0x83, 0x2a, 0xae, 0x2b, 0xfd, 0x43, 0x29, 0x62, 0xf3, 0x2f, 0x3a, 0x7b, 0x7b,
+            0x68, 0x42, 0xe1, 0xd0, 0x40, 0xc5, 0xe0, 0x10, 0xad, 0x8b, 0x46, 0x57, 0x0d, 0xa5, 0x55, 0xd4,
+            0xa2, 0x18, 0x01, 0xd1, 0x14, 0xa0, 0x7a, 0x0a, 0x4b, 0x53, 0x87, 0xe7, 0xda, 0xdf, 0xa4, 0xb0,
+            0xe5, 0x39, 0x22, 0xe9, 0xda, 0x5e, 0xde, 0xda, 0x03, 0x19, 0xc5, 0xa1, 0x58, 0x08, 0xe0, 0xee,
+            0x0f, 0x84, 0x21, 0x88, 0x0e, 0xae, 0xaa, 0xc0, 0x69, 0x52, 0x46, 0x65, 0xe8, 0x92, 0x08, 0xdf,
+            0x4b, 0x63, 0x03, 0x99, 0xd8, 0xd0, 0xdb, 0xd3, 0x99, 0xce, 0xa6, 0xf9, 0xc2, 0xff, 0x50, 0x50,
+            0xbf, 0x53, 0xfd, 0xa9, 0x4a, 0xd2, 0x02, 0xaa, 0xeb, 0x62, 0x64, 0xb9, 0xca, 0x0e, 0x41, 0x2d,
+            0xb9, 0xd6, 0xa6, 0x21, 0xef, 0xb5, 0xda, 0xb5, 0x8b, 0x52, 0xa6, 0x19, 0x3a, 0x2a, 0xf8, 0xf8,
+            0xb9, 0xac, 0x25, 0x42, 0xc2, 0xea, 0x27, 0xa5, 0x6b, 0xac, 0xd3, 0xc1, 0xe2, 0xea, 0x54, 0x42,
+            0xc2, 0x7b, 0x9d, 0x82, 0xe1, 0xe0, 0xbd, 0xaf, 0xb0, 0x54, 0xc3, 0xc0, 0x4e, 0xd1, 0xf7, 0x4e,
+            0x4c, 0x53, 0x54, 0x00, 0xb2, 0x43, 0x8d, 0x0b, 0x91, 0x84, 0x15, 0x23, 0xb5, 0xa0, 0x7f, 0xff,
+            0xcc, 0x6a, 0xec, 0x22, 0x4e, 0x4a, 0x22, 0x8b, 0xb7, 0xde, 0xa2, 0xe9, 0x65, 0x30, 0x02, 0x4a,
+            0xcc, 0x73, 0xc9, 0x10, 0x67, 0x46, 0xd6, 0xb8, 0xfa, 0x9b, 0x7a, 0xa5, 0xc5, 0xd7, 0x4e, 0x4e,
+            0xee, 0x62, 0x62, 0xb1, 0x00, 0x5a, 0xaf, 0x52, 0xbf, 0x7a, 0x03, 0xfd, 0x3f, 0xab, 0xff, 0xfb,
+            0xa0, 0x18, 0x03, 0x91, 0x4b, 0x30, 0x5d, 0xd7, 0x67, 0x5a, 0x01, 0x1a, 0x90, 0x54, 0x4a, 0x42,
+            0x26, 0x4a, 0x43, 0x90, 0xa0, 0xd5, 0x5a, 0x72, 0xec, 0x52, 0xc6, 0xe0, 0x22, 0x03, 0x40, 0x00,
+            0x79, 0x84, 0x9c, 0xb0, 0xb0, 0xb8, 0xba, 0xa8, 0x8c, 0x73, 0x8f, 0xb0, 0xd7, 0xaa, 0x80, 0xa2,
+            0x07, 0x21, 0xc7, 0x81, 0x0a, 0x0a, 0xaf, 0xab, 0x40, 0x08, 0xe4, 0xe8, 0x35, 0xe0, 0xf2, 0xba,
+            0x37, 0x5b, 0x60, 0x11, 0x28, 0x37, 0x0e, 0xa8, 0xa1, 0x39, 0x7d, 0x39, 0x5d, 0x55, 0xa0, 0xa0,
+            0xff, 0xff, 0x52, 0x70, 0x97, 0xdc, 0xa1, 0x57, 0x1d, 0x41, 0xba, 0x18, 0xea, 0x94, 0x0d, 0xa5,
+            0x73, 0x21, 0x30, 0x70, 0xce, 0x91, 0xa8, 0xf7, 0xb7, 0xce, 0xa8, 0x49, 0x37, 0x3f, 0x2b, 0x84,
+            0x68, 0x19, 0x56, 0xd8, 0x5f, 0x20, 0x2f, 0x0b, 0x29, 0x29, 0x05, 0x7b, 0x30, 0x64, 0xfb, 0xf0,
+            0x85, 0x08, 0x08, 0xd8, 0x17, 0xbf, 0x08, 0x08, 0x01, 0xf8, 0x15, 0x68, 0x37, 0xfb, 0xef, 0x27,
+            0xa4, 0x52, 0x6c, 0x42, 0xe5, 0x71, 0xbe, 0xf2, 0xc4, 0x10, 0xbf, 0x90, 0x05, 0x49, 0xf2, 0xda,
+            0x33, 0x7c, 0x53, 0x42, 0x8d, 0xa9, 0xa5, 0xd5, 0x7f, 0x6b, 0xa9, 0x31, 0xae, 0x10, 0x1a, 0x0d,
         };
 
         void* status_ptr = nullptr;
@@ -1773,7 +2022,7 @@ bool dstorage_checks() {
         std::vector<unsigned char> dest_truncated(32, 0xCC);
         std::vector<unsigned char> dest_bc1_valid(512, 0xEE);
         std::vector<unsigned char> dest_bc1_trailing(512, 0xDD);
-        std::vector<unsigned char> dest_bc6h_blank(64, 0xAA);
+        std::vector<unsigned char> dest_bc6h_invalid(64, 0xAA);
         std::vector<unsigned char> dest_bc4_wrong_size(8, 0x5A);
         std::vector<unsigned char> dest_bc4_non_mult(7, 0x5B);
         std::vector<unsigned char> dest_bc5_wrong_size(16, 0x5C);
@@ -1851,11 +2100,11 @@ bool dstorage_checks() {
         *reinterpret_cast<unsigned*>(req5 + 0x30) = sizeof(bc1_packed_trailing);
         *reinterpret_cast<unsigned*>(req5 + 0x38) = 512;
 
-        // Request 6: BCPack format 6 (BC6H) is not decoded yet; it must be zero-filled and counted.
+        // Request 6: malformed BC6H must fail without publishing partial output.
         static const unsigned char bc6h_packed[] = {0x00, 0x01, 0x02, 0x03};
         unsigned char req6[0x48] = {};
         *reinterpret_cast<u64*>(req6 + 0x00) = (6ull << 1) | 0x400000;
-        *reinterpret_cast<void**>(req6 + 0x08) = dest_bc6h_blank.data();
+        *reinterpret_cast<void**>(req6 + 0x08) = dest_bc6h_invalid.data();
         *reinterpret_cast<u64*>(req6 + 0x10) = 0;
         *reinterpret_cast<unsigned*>(req6 + 0x18) = 64;
         *reinterpret_cast<const unsigned char**>(req6 + 0x20) = bc6h_packed;
@@ -1941,9 +2190,9 @@ bool dstorage_checks() {
         for (unsigned char b : dest_bc1_trailing) {
             if (b != 0xDD) return false;
         }
-        if (hrs[6] != 0) return false;
-        for (unsigned char b : dest_bc6h_blank) {
-            if (b != 0) return false;
+        if (hrs[6] == 0) return false;
+        for (unsigned char b : dest_bc6h_invalid) {
+            if (b != 0xAA) return false;
         }
         if (hrs[7] == 0) return false;
         for (unsigned char b : dest_bc4_wrong_size) {
@@ -2094,6 +2343,8 @@ bool dstorage_file_information_checks()
     return ok;
 }
 
+#include "bcpack_storage_checks.inl"
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -2101,6 +2352,7 @@ int main(int argc, char** argv)
     if (argc != 2) return 2;
     const char* which = argv[1];
     if (!std::strcmp(which, "none")) return 0;
+    if (!std::strcmp(which, "bcpack-storage")) return bcpack_storage_checks() ? 0 : 11;
     if (!std::strcmp(which, "chad")) return static_cast<int>(XDspActivate(0x11, 0x22, 0x33, 0x44));
     if (!std::strcmp(which, "xg_xs")) return static_cast<int>(XGSuggestSwizzleMode(0x55, 0, 0, 0));
     if (!std::strcmp(which, "physical")) {

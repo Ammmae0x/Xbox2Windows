@@ -24,7 +24,7 @@ translated to Load(int4(x, y, slice, mip)). Its fixtures are source-built stages
 of a slice (root constant 1) at a constant mip level. They are drawn with --startup-image-2d-array-mips: a
 4x4 texture of two slices with three mip levels whose cells all differ, texel (x, y) of slice s at mip m
 holding ((1 + x + 4y + 16s + 32m) / 128, x, y, s + 2m). The expected colours come from mip_cell() below.
-Cube maps stay refused. The mip fixtures use spellings that llvm-mc 19 assembles; LLVM 15 is not known to
+Cube loads stay refused (cube sampling: tests/startup_image_cube_check.py). The mip fixtures use spellings that llvm-mc 19 assembles; LLVM 15 is not known to
 accept them, so 'binary <llvm-mc> mip' is opt-in and CI does not pass it.
 """
 import re
@@ -226,8 +226,18 @@ def mip_controls():
     accepted[1] |= 0x10  # unorm
     assert 't = %s;' % MIP_CALL in translate(mip_words(1, 0, bytes(accepted))).hlsl_ps()
 
-    # Refused: packed 16-bit data or addresses and fault-status returns need their own lowering.
-    for flag, byte, mask in (('d16', 7, 0x80), ('a16', 7, 0x40), ('tfe', 2, 0x01)):
+    # Packed 16-bit data narrows the four channels into v[0:1] and marks SRV 0 for exact D16 validation.
+    d16 = bytearray(MIP_IMAGE)
+    d16[7] |= 0x80
+    d16_pipe = translate(mip_words(1, 0, bytes(d16)))
+    d16_ps = d16_pipe.hlsl_ps()
+    assert 't = %s;' % MIP_CALL in d16_ps, d16_ps
+    assert 'v0 = pack16_d16(t.x, ud4) | (pack16_d16(t.y, ud4) << 16);' in d16_ps, d16_ps
+    assert 'v1 = pack16_d16(t.z, ud4) | (pack16_d16(t.w, ud4) << 16);' in d16_ps, d16_ps
+    assert 'd16srv 0 exact' in d16_pipe.manifest().splitlines(), d16_pipe.manifest()
+
+    # Refused: packed addresses and fault-status returns need their own lowering.
+    for flag, byte, mask in (('a16', 7, 0x40), ('tfe', 2, 0x01)):
         refused = bytearray(MIP_IMAGE)
         refused[byte] |= mask
         try:
@@ -251,7 +261,7 @@ def mip_controls():
         G.D.MIMG_DIMS[5] = original
     assert G.D.MIMG_DIMS[5] == original
 
-    # Cube maps are refused as before. 2D and 3D keep their forms (same words, dim field changed).
+    # Cube loads are refused as before. 2D and 3D keep their forms (same words, dim field changed).
     cube = bytearray(MIP_IMAGE)
     cube[0] = 0x18
     try:

@@ -15,7 +15,9 @@ import importlib
 import json
 import os
 from pathlib import Path
+import struct
 import sys
+import tempfile
 import time
 
 FORMAT_NAMES = {
@@ -235,6 +237,20 @@ def export_texture_entry(pool, index: int, out_dir: Path,
                 pass
 
 
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    return left.exists() and right.exists() and left.samefile(right)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=path.parent) as staging_dir:
+        staged = Path(staging_dir) / path.name
+        staged.write_text(text, encoding="utf-8")
+        os.replace(staged, path)
+
+
 def batch_export(pool_path: Path, out_dir: Path,
                  indices: list[int] | None = None,
                  start: int = 0, count: int | None = None,
@@ -246,17 +262,65 @@ def batch_export(pool_path: Path, out_dir: Path,
                  require_rust: bool = False,
                  calibration_path: Path | None = None) -> dict:
     """Run batch export over a range of texture pool indices and write manifest.json."""
+    if threads < 1:
+        raise ValueError(f"--threads must be >= 1, got {threads}")
+    if start < 0:
+        raise ValueError(f"--start must be >= 0, got {start}")
+    if count is not None and count < 0:
+        raise ValueError(f"--count must be >= 0, got {count}")
+
+    if pool_path.exists() and (pool_path.is_dir() or not pool_path.is_file()):
+        raise ValueError(f"Pool path must be a regular file: {pool_path}")
+    if out_dir.exists() and not out_dir.is_dir():
+        raise ValueError(f"--out path is not a directory: {out_dir}")
+    if _same_path(out_dir, pool_path):
+        raise ValueError(f"--out path collides with pool: {out_dir}")
+
+    resolved_manifest = manifest_path if manifest_path is not None else out_dir / "manifest.json"
+    if resolved_manifest.exists() and resolved_manifest.is_dir():
+        raise ValueError(f"--manifest path is an existing directory: {resolved_manifest}")
+    if _same_path(resolved_manifest, pool_path):
+        raise ValueError(f"--manifest path collides with pool: {resolved_manifest}")
+    if _same_path(resolved_manifest, out_dir):
+        raise ValueError(f"--manifest path collides with --out: {resolved_manifest}")
+    if resolved_manifest.resolve() in out_dir.resolve().parents:
+        raise ValueError(f"--manifest path cannot be an ancestor of --out: {resolved_manifest}")
+    for option, source_path in (("history", history_path), ("calibration", calibration_path)):
+        if source_path is not None and _same_path(resolved_manifest, source_path):
+            raise ValueError(f"--manifest path collides with --{option}: {resolved_manifest}")
+
     if calibration_path is not None and (allow_provisional or history_path is not None):
         raise ValueError("--calibration cannot be combined with --allow-provisional or --history")
 
     history_dict = None
-    if allow_provisional and history_path is not None:
+    if history_path is not None:
+        if history_path.exists() and history_path.is_dir():
+            raise ValueError(f"Cannot read --history {history_path}: path is a directory")
         try:
             history_dict = json.loads(history_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             raise ValueError(f"Cannot read --history {history_path}: {exc}") from exc
         if not isinstance(history_dict, dict):
             raise ValueError(f"Expected a JSON object in --history {history_path}")
+        if not allow_provisional:
+            history_dict = None
+
+    calibration = None
+    if calibration_path is not None:
+        if calibration_path.exists() and calibration_path.is_dir():
+            raise ValueError(f"Cannot read --calibration {calibration_path}: path is a directory")
+        try:
+            calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(f"Cannot read --calibration {calibration_path}: {exc}") from exc
+        if not isinstance(calibration, dict) or calibration.get("version") != 1:
+            raise ValueError("Unsupported calibration version (expected version 1)")
+
+    if tools_path is not None:
+        if not tools_path.exists():
+            raise FileNotFoundError(f"--tools-path not found: {tools_path}")
+        if not tools_path.is_dir():
+            raise ValueError(f"--tools-path must be a directory: {tools_path}")
 
     ttpf = load_tools(tools_path)
     if ttpf is None:
@@ -265,7 +329,7 @@ def batch_export(pool_path: Path, out_dir: Path,
         require_rust_backend(ttpf)
 
     fitted_decoder = None
-    if calibration_path is not None:
+    if calibration is not None:
         try:
             calibrated = importlib.import_module("calibrated_texture")
             if (calibrated.ttpf is not ttpf
@@ -277,16 +341,9 @@ def batch_export(pool_path: Path, out_dir: Path,
                 f"Cannot load the fitted decoder from the selected Leonida tools: {exc}. "
                 "Install NumPy and build tools/bcpack_calibration in release mode."
             ) from exc
-        calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
-        if not isinstance(calibration, dict) or calibration.get("version") != 1:
-            raise ValueError("Unsupported calibration version (expected version 1)")
 
         def fitted_decoder(pool):
             return calibrated.LocalDecoder(pool, calibration)
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if manifest_path is None:
-        manifest_path = out_dir / "manifest.json"
 
     start_time = time.perf_counter()
     pool = ttpf.Pool(str(pool_path))
@@ -295,12 +352,21 @@ def batch_export(pool_path: Path, out_dir: Path,
     finally:
         pool.close()
 
+    manifest_path = resolved_manifest
+
     if indices is None:
         start_idx = max(0, start)
         end_idx = total_textures if count is None else min(total_textures, start_idx + count)
         target_indices = list(range(start_idx, end_idx))
     else:
         target_indices = [i for i in indices if 0 <= i < total_textures]
+
+    # The manifest is published after the workers finish. Its path must not name
+    # a requested DDS, including one preserved after a failed or skipped export.
+    for index in target_indices:
+        if _same_path(manifest_path, out_dir / f"tex_{index:05d}.dds"):
+            raise ValueError(f"--manifest path collides with DDS output: {manifest_path}")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_entries: list[dict] = []
     stats = {"strict": 0, "provisional": 0, "failed": 0, "skipped": 0}
@@ -333,7 +399,7 @@ def batch_export(pool_path: Path, out_dir: Path,
                 stats["failed"] += 1
 
     manifest_entries.sort(key=lambda x: x.get("index", 0))
-    manifest_path.write_text(json.dumps(manifest_entries, indent=2), encoding="utf-8")
+    _atomic_write_text(manifest_path, json.dumps(manifest_entries, indent=2))
     elapsed = time.perf_counter() - start_time
 
     return {
@@ -347,7 +413,7 @@ def batch_export(pool_path: Path, out_dir: Path,
     }
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pool", type=Path, help="Path to .ttpf texture pool archive")
     parser.add_argument("-o", "--out", type=Path, default=Path("extracted_dds"),
@@ -370,7 +436,7 @@ def main():
                         help="Require the optional Rust BCPack library to load before exporting")
     parser.add_argument("--calibration", type=Path,
                         help="Retry strict failures with a local version-1 Leonida calibration profile")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not args.pool.exists():
         parser.error(f"Pool not found: {args.pool}")
@@ -395,11 +461,12 @@ def main():
             require_rust=args.require_rust,
             calibration_path=args.calibration,
         )
-    except (RuntimeError, OSError, ValueError) as exc:
+    except (RuntimeError, OSError, ValueError, struct.error, json.JSONDecodeError) as exc:
         parser.error(str(exc))
 
     print(json.dumps(summary, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

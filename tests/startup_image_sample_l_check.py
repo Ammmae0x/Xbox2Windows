@@ -243,7 +243,9 @@ def controls():
     refused('offset', 'image_sample_l_o')
     refused('compare', 'image_sample_c_l')
     refused('gather', 'image_gather4_l')
-    refused('cube', 'image dimension SQ_RSRC_IMG_CUBE')
+    # Since #2943 a cube lowers to TextureCube with the face address rebuilt as a direction, level after it.
+    cube = stage('cube')
+    assert 'TextureCube<float4>' in cube and 'x2w_cube_dir(F(v0), F(v1), F(v2)), F(v3))' in cube, cube
     refused('unorm', 'image_sample_l modifier unorm')
     refused('tfe', 'image_sample_l modifier tfe')  # the extra status register is not modelled
     refused('a16', 'image_sample_l modifier a16')  # packed 16-bit address: v[0:1] holds u, v and the level as halves
@@ -251,11 +253,16 @@ def controls():
     refused('d16', 'image_sample_l modifier d16')  # half-precision result layout
     refused('r128', 'image_sample_l modifier r128')  # four-dword resource descriptor
     refused('dmask0', 'empty dmask')
-    refused('dim1d', 'unverified 1D image sample address or modifiers')
+    # A 1D image has one coordinate and the level in the next address dword, so it lowers to Texture1D
+    # with the same SampleLevel call shape a 2D image uses (issue #1721).
+    one_d = stage('dim1d')
+    assert 'Texture1D<float4>' in one_d, one_d
+    assert re.search(r'SampleLevel\(\w+, F\(v0\), F\(v1\)\)', one_d), one_d
     refused('msaa', 'image dimension SQ_RSRC_IMG_')
     for name in RESERVED:
         refused(name, 'image_sample_l modifier reserved')  # bits LLVM ignores must not be silently accepted
-    print('refused: offset, compare, gather, cube, 1D, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
+    print('cube: TextureCube SampleLevel with x2w_cube_dir')
+    print('refused: offset, compare, gather, MSAA, unorm, a16, tfe, lwe, d16, r128, dmask 0, reserved bits')
 
     # Cache-policy bits do not change the sampled value: same lowering as the plain form.
     for name in ('glc', 'slc', 'dlc'):
