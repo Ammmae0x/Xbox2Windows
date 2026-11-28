@@ -95,8 +95,20 @@ MUTATIONS = (
     ),
     (
         "decimal_as_hex",
-        "    if token.isdigit():\n        return int(token, 10)\n",
-        "    if token.isdigit():\n        return int(token, 16)\n",
+        "    if token.isdigit():\n"
+        '        if len(token) > 1 and token[0] == "0":\n'
+        "            raise ValueError(\n"
+        '                f"leading-zero decimal literal {token!r} is ambiguous: spirv-as reads it as octal; "\n'
+        '                "use a plain decimal or 0x-prefixed hex literal"\n'
+        "            )\n"
+        "        return int(token, 10)\n",
+        "    if token.isdigit():\n"
+        '        if len(token) > 1 and token[0] == "0":\n'
+        "            raise ValueError(\n"
+        '                f"leading-zero decimal literal {token!r} is ambiguous: spirv-as reads it as octal; "\n'
+        '                "use a plain decimal or 0x-prefixed hex literal"\n'
+        "            )\n"
+        "        return int(token, 16)\n",
     ),
     (
         "register_end_decimal_only",
@@ -186,6 +198,18 @@ def _load_temp_module(path: Path, name: str):
 
 
 class SpirvSamplerViewsTests(unittest.TestCase):
+    def _assert_register_end_none(self, mod, defs, table, binding, what) -> None:
+        """register_end must return None for missing/non-ASCII data, not crash.
+
+        A KeyError/ValueError here would be a raw crash, not the specified
+        safe-lookup behaviour, so convert it to an assertion failure.
+        """
+        try:
+            result = mod.register_end(defs, table, binding)
+        except Exception as exc:  # noqa: BLE001 - any crash is a contract failure
+            self.fail(f"register_end({what}) raised {type(exc).__name__} instead of returning None: {exc}")
+        self.assertIsNone(result, msg=what)
+
     def _verify_module_contract(self, mod) -> None:
         self.assertEqual(mod.BRIDGE, "%bridge_cmp")
         self.assertEqual(mod.BRIDGE_SET, "3")
@@ -210,11 +234,20 @@ class SpirvSamplerViewsTests(unittest.TestCase):
         )
 
         # Non-str rejection in strip_comments and split_sampler_views.
+        # The expected behaviour is a ValueError naming the type; any other
+        # exception (e.g. AttributeError from calling a method on None) is a
+        # contract failure, not a kill, so convert it to an assertion here.
         for bad in (None, 123, b"Dref", ["OpCapability Shader"]):
-            with self.assertRaises(ValueError, msg=f"strip_comments({bad!r})"):
-                mod.strip_comments(bad)
-            with self.assertRaises(ValueError, msg=f"split_sampler_views({bad!r})"):
-                mod.split_sampler_views(bad)
+            for fn_name in ("strip_comments", "split_sampler_views"):
+                fn = getattr(mod, fn_name)
+                try:
+                    fn(bad)
+                except ValueError as exc:
+                    self.assertIn("assembly must be a str", str(exc), msg=f"{fn_name}({bad!r})")
+                except Exception as exc:  # noqa: BLE001 - any other type is a contract failure
+                    self.fail(f"{fn_name}({bad!r}) raised {type(exc).__name__} instead of ValueError: {exc}")
+                else:
+                    self.fail(f"{fn_name}({bad!r}) did not raise ValueError")
 
         # Single-table splitting preserves BRIDGE, BRIDGE_SET, OpEntryPoint, and Dref formatting.
         base_lines = BASE_MODULE.splitlines()
@@ -356,6 +389,75 @@ class SpirvSamplerViewsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "overlap"):
             mod.split_sampler_views(dec10_overlap)
 
+        # _parse_uint_literal: 0, plain decimal and 0x/0X hex work; multi-digit
+        # decimals starting with 0 are refused (spirv-as reads them as octal).
+        self.assertEqual(mod._parse_uint_literal("0"), 0)
+        self.assertEqual(mod._parse_uint_literal("10"), 10)
+        self.assertEqual(mod._parse_uint_literal("0xa"), 10)
+        self.assertEqual(mod._parse_uint_literal("0XA"), 10)
+        self.assertIsNone(mod._parse_uint_literal("0x"))
+        self.assertIsNone(mod._parse_uint_literal("%bad"))
+        for leading_zero in ("010", "08", "00"):
+            with self.assertRaisesRegex(ValueError, "leading-zero"):
+                mod._parse_uint_literal(leading_zero)
+
+        # Leading-zero witness (pigalot): Binding 010 is octal 8, so a table
+        # at Binding 010 (8..10) overlaps a fixed array of 2 at Binding 7
+        # (7..9) at register 8. Reading 010 as decimal 10 would miss it.
+        leading_zero_overlap = _sub(multi, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 010")
+        leading_zero_overlap = _sub(leading_zero_overlap, "OpDecorate %second Binding 4", "OpDecorate %second Binding 7")
+        leading_zero_overlap = _sub(
+            leading_zero_overlap,
+            "%second = OpVariable %_ptr_UC_rt2 UniformConstant",
+            "%second = OpVariable %_ptr_UC_rt_smp UniformConstant",
+        )
+        with self.assertRaisesRegex(ValueError, "leading-zero"):
+            mod.split_sampler_views(leading_zero_overlap)
+        for bad_binding in ("010", "08"):
+            with self.assertRaisesRegex(ValueError, "leading-zero"):
+                mod.split_sampler_views(
+                    _sub(BASE_MODULE, "OpDecorate %samplers Binding 1", f"OpDecorate %samplers Binding {bad_binding}")
+                )
+
+        # DescriptorSet +3 is set 3 to spirv-as, so it must refuse like 3/03/0x3.
+        with self.assertRaisesRegex(ValueError, "free descriptor set 3"):
+            mod.split_sampler_views(_sub(BASE_MODULE, "OpDecorate %out DescriptorSet 0", "OpDecorate %out DescriptorSet +3"))
+
+        # Boundary mutant killers (each pins one surviving boundary):
+        # (a) length_num > 0 -> > 1: two adjacent length-1 tables (1..2, 2..3)
+        # must split, not refuse as overlap.
+        adj_len1 = _sub(multi, "%two = OpConstant %uint 2", "%two = OpConstant %uint 1")
+        adj_len1 = _sub(adj_len1, "OpDecorate %second Binding 4", "OpDecorate %second Binding 2")
+        adj_len1_lines = mod.split_sampler_views(adj_len1).splitlines()
+        self.assertIn("OpDecorate %bridge_cmp Binding 1", adj_len1_lines)
+        self.assertIn("OpDecorate %bridge_cmp_table_1 Binding 2", adj_len1_lines)
+
+        # (b) start < end -> start < end - 1: reverse-order one-register overlap.
+        # %samplers at Binding 2 (2..4) is processed first, %second at Binding 1
+        # (1..3) shares register 2 and must be refused.
+        rev_overlap = _sub(multi, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 2")
+        rev_overlap = _sub(rev_overlap, "OpDecorate %second Binding 4", "OpDecorate %second Binding 1")
+        rev_overlap = _sub(
+            rev_overlap,
+            "%second = OpVariable %_ptr_UC_rt2 UniformConstant",
+            "%second = OpVariable %_ptr_UC_rt_smp UniformConstant",
+        )
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            mod.split_sampler_views(rev_overlap)
+
+        # (c) uppercase-only hex class: a lowercase hex binding must split.
+        hex_lower = _sub(BASE_MODULE, "OpDecorate %samplers Binding 1", "OpDecorate %samplers Binding 0xa")
+        hex_lower_lines = mod.split_sampler_views(hex_lower).splitlines()
+        self.assertIn("OpDecorate %bridge_cmp Binding 0xa", hex_lower_lines)
+
+        # (d) len(token) > 2 -> >= 2: bare 0x/0X must refuse with the pinned
+        # message, not a raw ValueError from int('', 16).
+        for bare in ("0x", "0X"):
+            with self.assertRaisesRegex(ValueError, "literal DescriptorSet and Binding"):
+                mod.split_sampler_views(
+                    _sub(BASE_MODULE, "OpDecorate %samplers Binding 1", f"OpDecorate %samplers Binding {bare}")
+                )
+
         # Adjacent non-overlapping register ranges in both orders (1..2 vs 3, and 3..4 vs 1) + hex array length 0x2.
         adj_asc = _sub(multi, "OpDecorate %second Binding 4", "OpDecorate %second Binding 3")
         adj_asc = _sub(adj_asc, "%two = OpConstant %uint 2", "%two = OpConstant %uint 0x2")
@@ -371,40 +473,42 @@ class SpirvSamplerViewsTests(unittest.TestCase):
         self.assertIn("OpDecorate %bridge_cmp_table_1 Binding 1", adj_desc_lines)
 
         # register_end handles missing OpTypePointer / OpTypeArray keys and non-ASCII constant digits without KeyError.
-        self.assertIsNone(mod.register_end({}, "%samplers", "1"))
-        self.assertIsNone(mod.register_end({"%samplers": ["OpVariable", "%missing_ptr", "UniformConstant"]}, "%samplers", "1"))
-        self.assertIsNone(
-            mod.register_end(
-                {
-                    "%samplers": ["OpVariable", "%ptr", "UniformConstant"],
-                    "%ptr": ["OpTypePointer", "UniformConstant", "%missing_arr"],
-                },
-                "%samplers",
-                "1",
-            )
+        self._assert_register_end_none(mod, {}, "%samplers", "1", "empty defs")
+        self._assert_register_end_none(
+            mod, {"%samplers": ["OpVariable", "%missing_ptr", "UniformConstant"]}, "%samplers", "1", "missing pointer"
         )
-        self.assertIsNone(
-            mod.register_end(
-                {
-                    "%samplers": ["OpVariable", "%ptr", "UniformConstant"],
-                    "%ptr": ["OpTypePointer", "UniformConstant", "%arr"],
-                    "%arr": ["OpTypeArray", "%smp"],
-                },
-                "%samplers",
-                "1",
-            )
+        self._assert_register_end_none(
+            mod,
+            {
+                "%samplers": ["OpVariable", "%ptr", "UniformConstant"],
+                "%ptr": ["OpTypePointer", "UniformConstant", "%missing_arr"],
+            },
+            "%samplers",
+            "1",
+            "missing array",
         )
-        self.assertIsNone(
-            mod.register_end(
-                {
-                    "%samplers": ["OpVariable", "%ptr", "UniformConstant"],
-                    "%ptr": ["OpTypePointer", "UniformConstant", "%arr"],
-                    "%arr": ["OpTypeArray", "%smp", "%two"],
-                    "%two": ["OpConstant", "%uint", "\u00b3"],
-                },
-                "%samplers",
-                "1",
-            )
+        self._assert_register_end_none(
+            mod,
+            {
+                "%samplers": ["OpVariable", "%ptr", "UniformConstant"],
+                "%ptr": ["OpTypePointer", "UniformConstant", "%arr"],
+                "%arr": ["OpTypeArray", "%smp"],
+            },
+            "%samplers",
+            "1",
+            "array without length",
+        )
+        self._assert_register_end_none(
+            mod,
+            {
+                "%samplers": ["OpVariable", "%ptr", "UniformConstant"],
+                "%ptr": ["OpTypePointer", "UniformConstant", "%arr"],
+                "%arr": ["OpTypeArray", "%smp", "%two"],
+                "%two": ["OpConstant", "%uint", "\u00b3"],
+            },
+            "%samplers",
+            "1",
+            "non-ASCII length",
         )
         self.assertEqual(
             mod.register_end(
@@ -535,6 +639,18 @@ class SpirvSamplerViewsTests(unittest.TestCase):
         self._verify_module_contract(spirv_sampler_views)
 
     def test_fast_temp_copy_mutations(self) -> None:
+        # These three mutations used to die on raw crashes (AttributeError on
+        # None, int('³'), KeyError '%samplers') that the broad exception tuple
+        # accepted without checking the behaviour. The contract now converts
+        # those crashes into explicit assertion failures (see
+        # _verify_module_contract), so for these three only an AssertionError
+        # counts as a kill; a raw crash means the contract is not pinning the
+        # behaviour it claims to pin.
+        explicit_assertion_mutations = {
+            "drop_non_str_guard",
+            "drop_isascii_guard",
+            "drop_register_end_safe_lookup",
+        }
         source = MODULE_PATH.read_text(encoding="utf-8")
         for label, target, replacement in MUTATIONS:
             with self.subTest(mutation=label), TemporaryDirectory() as tmp:
@@ -543,9 +659,14 @@ class SpirvSamplerViewsTests(unittest.TestCase):
                 mut_path.write_text(source.replace(target, replacement, 1), encoding="utf-8")
                 mod_name = f"spirv_sampler_views_mut_{label}"
                 mod = _load_temp_module(mut_path, mod_name)
+                expected = (
+                    (AssertionError,)
+                    if label in explicit_assertion_mutations
+                    else (AssertionError, ValueError, KeyError, IndexError, AttributeError, TypeError)
+                )
                 try:
                     with self.assertRaises(
-                        (AssertionError, ValueError, KeyError, IndexError, AttributeError, TypeError),
+                        expected,
                         msg=f"mutation {label} escaped detection",
                     ):
                         self._verify_module_contract(mod)
