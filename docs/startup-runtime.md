@@ -923,6 +923,38 @@ It writes:
 | `<log>/files.txt` | every file the process opened |
 | `<log>/translate.txt` | with `-Translate`: one line per shader request translated during the run |
 
+### Package on another volume
+
+A console executable opens its package at a fixed drive letter, so a package that lives on another
+volume never mounts: the first open returns "not found", nothing is mounted, and the run usually
+stops within a second on a table sized from data that was never loaded. `-MapDrive` rewrites opens on
+a mapped letter to the real folder, in the caller's own path structure and inside the debugger's
+existing file hook, so the letter does not have to be free and a real volume on it is not disturbed:
+
+```powershell
+.\tools\startup\run.ps1 -Exe <folder>\<title>.exe -DataDir <package root> -LogDir out\startup\run1 `
+    -MapDrive "G=D:\package"
+```
+
+The value is `LETTER=FOLDER`, and several mappings are separated by `;`. The debugger logs a `MAP`
+line for each rewrite and the rewritten path in `<log>/files.txt`. An open on a letter that is not
+mapped is left untouched. The rewritten name is borrowed for the hooked call only: the caller's
+`UNICODE_STRING` is restored (length, buffer pointer and contents) when the call returns, so a
+failure or a retry sees the name it built. When the replacement does not fit the caller's buffer the
+debugger borrows a name buffer for the duration of that call and returns it to a pool on restore, so
+serial opens reuse one buffer instead of allocating per open and overlapping calls do not share one.
+One limit remains: only opens that pass through the file hooks are rewritten, so a title that reads
+its package through a memory-mapped API is not covered. A call that enters the same hooked function on
+another thread is rewritten too: the debugger holds the other threads for each step over a hooked byte
+([Concurrent calls through a hooked function](#concurrent-calls-through-a-hooked-function), #1281).
+`startup_map_drive` covers the rewrite, the negative control without the option, that an unmapped letter
+is left alone, and one caller-owned `UNICODE_STRING` reused across 32 serially opened files with its
+length, buffer pointer and contents checked after every return and a single name buffer.
+`startup_map_drive_overlap` runs two threads of 32 opens each with their own caller-owned names: all 64
+opens must see the mapped name and succeed, every caller string must be back as built and the debugger must
+report no unprotected window, three times. Its control without holding the other threads
+(`--suspend-others 0`) must lose opens.
+
 ### Translating shaders during a run
 
 With `-Render -Translate`, `run.ps1` starts `tools/startup/gfx2hlsl.py --watch <shader cache>` beside
@@ -3247,8 +3279,7 @@ arrive. It reports frame counts and FPS from the graphics heartbeat without infe
 draws were executed. Network refusals are shown when observed; the window does not establish
 that all network activity is blocked. To check this presentation with generated logs, run
 `python -B tests/startup_live_telemetry_check.py`. See [#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)
-for memory accounting and [#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281) for
-the launcher's concurrent-hook limitation.
+for memory accounting.
 
 ```powershell
 cmake --build --preset release --target xmem_shim startup_stub_xcrdapi xmem_slab_slots_check
