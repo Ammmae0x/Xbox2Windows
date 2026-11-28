@@ -14834,8 +14834,8 @@ native `lahf` execution on `CPUID.80000001H:ECX[0]` (returning exit code 77 when
 or branch target between the writer and `lahf`, in functions with indirect branches, and
 after any other flag writer (`inc`/`dec`/`neg`/`adc`/`sbb`/`clc`/`stc`/`cmc`/`and`/`or`/
 `xor`/`test`/shifts/`imul`, or memory-operand `add`/`cmp`); `sahf` outside the x87 profile,
-`pushf`/`popf`/`pushfq`/`popfq`, `setp`, disallowed prefixes, EVEX forms, and EIP-relative
-operands also reject.
+`setp`, disallowed prefixes, EVEX forms, and EIP-relative operands also reject (`pushf`/
+`popf`/`pushfq`/`popfq` are handled separately in the bounded flag-stack slice below).
 
 ```powershell
 cmake --build --preset dev --target cpu_integer_flags_original cpu_integer_flags_original_lifted cpu_integer_flags_altered cpu_integer_flags_altered_lifted cpu_integer_flags_controls
@@ -14877,8 +14877,9 @@ frame-stack tracking (`flag_stack_depths`) and path-sensitive definedness analys
   `rsp` register writes/reads or `lea` aliases, and `[rsp + disp]` accesses outside the
   pushed region.
 - Flag definedness, `DF=0` exit discipline, and unmodeled control-bit rejection (`flag_definedness`):
-  under the default `entry_state="defined"`, status flags start undefined while `DF`, `NT`,
-  `ID`, and `AC` are assumed clear (`false`) at function entry per the Windows x64 ABI (with
+  under the default `entry_state="defined"`, status flags start undefined while `DF` is assumed
+  clear (`false`) at function entry per the Windows x64 ABI and `NT`, `ID`, and `AC` are assumed
+  clear under this profile (with
   opt-in `entry_state="canonical"` assuming defined entry status flags, tested in the suite);
   `pushf`/`pushfq` require all six status flags (`CF`, `PF`, `AF`, `ZF`, `SF`, `OF`)
   to be defined by `add`, `sub`, `cmp`, `popf`, or `popfq` on every incoming path; `popf`/`popfq`
@@ -14915,8 +14916,9 @@ controls (`op_add8_al_pushf`: `21`, `op_add32_imm_pushfq`: `23`, `op_sub32_imm_p
 `3`, `ctrl_of_dropped`: `3`, `ctrl_id_dropped`: `4`, `ctrl_rsp_step_wrong`: `4`,
 `ctrl_pushf_df_dropped`: `3`, `ctrl_pushf_nt_dropped`: `3`), an output-mutation control,
 15 alternate-encoding/stack-edit and `entry_state` checks (plus a direct `flag_definedness`
-accept/reject pair for `btr [rsp], imm`), 50 unit rejection controls, one rejected host
-binding replacing the flag producer, and 13 end-to-end PE-patched DLL rejection controls.
+accept/reject pair for `btr [rsp], imm`), 52 unit rejection controls, four rejected host/profile
+controls (replaced flag producer, host-op register reset, `x87` alongside flag stack, and
+explicit `RSP` binding), and 13 end-to-end PE-patched DLL rejection controls.
 
 Not covered by this experiment: `sahf` outside the x87 profile, `TF`/`AC` trap semantics,
 and title CPU code execution.

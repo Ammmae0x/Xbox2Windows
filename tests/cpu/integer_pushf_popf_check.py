@@ -934,6 +934,10 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
          "may set unmodeled control flag(s) AC"),
         ("join_stack_one_arm_ac_popfq", bytes.fromhex("4801c89c85c9740848810c24000004009dfcc3"),
          "may set unmodeled control flag(s) AC"),
+        ("join_stack_taken_arm_ac_popfq", bytes.fromhex("4801c89c85c97402eb0848810c24000004009dfcc3"),
+         "may set unmodeled control flag(s) AC"),
+        ("df_join_one_arm_std_popfq", bytes.fromhex("83c0019c9d85c97403fdeb01fcc3"),
+         "direction flag may be set"),
         # Disallowed prefixes, out-of-scope ops, addressing & stream boundaries
         ("prefix_rep_pushfq", bytes.fromhex("f39c9dc3"), "unsupported instruction prefix"),
         ("prefix_repne_pushfq", bytes.fromhex("f29c9dc3"), "unsupported instruction prefix"),
@@ -979,6 +983,39 @@ def check_alt_encodings_and_rejections(original_path: Path) -> None:
             raise AssertionError(f"wrong diagnostic for replaced PUSHFQ flag writer: {exc}") from exc
     else:
         raise AssertionError("PUSHFQ accepted flags from a replaced ADD")
+
+    # Host-op writing a GP register must reset that register's may-be-1 mask
+    host_op_reg_reset = list(Decoder(64, bytes.fromhex("31c0488b014183c1019c488904249dc3"), ip=0x1000))
+    try:
+        lower(host_op_reg_reset, ["rcx = a;"], {}, {}, {}, host_ops={0x1002: "rax = load<word>(rcx);"})
+    except ValueError as exc:
+        if "may set unmodeled control flag(s) TF, AC" not in str(exc):
+            raise AssertionError(f"wrong diagnostic for host-op register reset: {exc}") from exc
+    else:
+        raise AssertionError("POPFQ accepted RAX after host-op overwrite")
+
+    # x87 profile alongside flag-stack instructions must be rejected
+    x87_with_pushfq = list(Decoder(64, encode_seq(
+        Instruction.create(Code.FLD1),
+        Instruction.create_reg(Code.FSTP_STI, R.ST0),
+        add_eax_1, pushfq_ins, popfq_ins, ret_ins), ip=0x1000))
+    try:
+        lower(x87_with_pushfq, [], {}, {}, {}, x87=True)
+    except ValueError as exc:
+        if "unsupported query operation" not in str(exc) or "pushfq" not in str(exc):
+            raise AssertionError(f"wrong diagnostic for x87 alongside flag stack: {exc}") from exc
+    else:
+        raise AssertionError("flag-stack sequence accepted alongside x87")
+
+    # Explicit RSP binding alongside flag-stack instructions must be rejected
+    rsp_bind_seq = list(Decoder(64, encode_seq(ld_rax, add_eax_1, pushfq_ins, popfq_ins, ret_ins), ip=0x1000))
+    try:
+        lower(rsp_bind_seq, ["rsp = a;"], {}, {}, {})
+    except ValueError as exc:
+        if "RSP binding is unsupported alongside flag stack" not in str(exc):
+            raise AssertionError(f"wrong diagnostic for RSP binding alongside flag stack: {exc}") from exc
+    else:
+        raise AssertionError("flag-stack sequence accepted with explicit RSP binding")
 
     # End-to-end PE patching controls on a copy of the built native DLL.
     pe_bytes = original_path.read_bytes()
