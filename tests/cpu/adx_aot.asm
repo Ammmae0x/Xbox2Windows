@@ -23,13 +23,12 @@ PACK_CF_OF_ZF_SF MACRO
     mov dword ptr [r8], r9d
 ENDM
 
-; --- Register forms (32-bit & 64-bit; mov rax,-1 before 32-bit tests [63:32] zero-ext) ---
+; --- Register forms (32-bit & 64-bit; mov rax,rcx before 32-bit pins [63:32] zero-ext by ADCX/ADOX) ---
 
 op_adcx32_c0 PROC FRAME
     .endprolog
     xor r9d, r9d
-    mov rax, -1
-    mov eax, ecx
+    mov rax, rcx
 IFDEF ALTER_ADX
     adox eax, edx
 ELSE
@@ -80,8 +79,7 @@ op_adcx64_c1 ENDP
 op_adox32_o0 PROC FRAME
     .endprolog
     xor r9d, r9d
-    mov rax, -1
-    mov eax, ecx
+    mov rax, rcx
 IFDEF ALTER_ADX
     adcx eax, edx
 ELSE
@@ -194,8 +192,7 @@ op_adcx32_flags PROC FRAME
     xor r11d, r11d
     mov r10d, 07fffffffh
     add r10d, 1
-    mov rax, -1
-    mov eax, ecx
+    mov rax, rcx
     adcx eax, edx
     PACK_CF_OF_ZF_SF
     ret
@@ -222,8 +219,7 @@ op_adox32_flags PROC FRAME
     xor r11d, r11d
     mov r10d, 0ffffffffh
     add r10d, 1
-    mov rax, -1
-    mov eax, ecx
+    mov rax, rcx
     adox eax, edx
     PACK_CF_OF_ZF_SF
     ret
