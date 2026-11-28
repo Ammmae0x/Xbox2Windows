@@ -7,7 +7,9 @@ from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
+import re
 import runpy
 import struct
 import subprocess
@@ -172,7 +174,7 @@ class CompileLdsRequestPositiveTests(unittest.TestCase):
             self.assertEqual(code_rep, 1)
             self.assertEqual(out_rep, "")
             self.assertNotIn("Traceback", err_rep)
-            self.assertTrue(err_rep.strip())
+            self.assertIn("damaged replay artifact replay.json", err_rep)
             self.assertEqual(list(output.iterdir()), [dest])
             (dest / "replay.json").write_bytes(replay_raw)
 
@@ -229,7 +231,7 @@ class CompileLdsRequestNegativeAndMutationTests(unittest.TestCase):
             req_dir = base / "req"
             req_dir.mkdir()
             compiler, sdk, _, cache = _setup_env(base)
-            _, marker = _write_case_f(req_dir)
+            key, marker = _write_case_f(req_dir)
             absent_out = base / "absent_parent" / "output"
             file_target = base / "regular_file"
             file_target.write_text("KEEP", encoding="utf-8")
@@ -316,28 +318,19 @@ class CompileLdsRequestNegativeAndMutationTests(unittest.TestCase):
                     fragments=("cache parent", "not a directory"),
                 )
 
-                # Non-regular file input & symlink output/cache (mocked unconditionally + live if OS allows).
+                # Non-regular file input (mocked unconditionally).
                 with mock.patch.object(Path, "is_file", return_value=False):
                     self._assert_clean_failure(
                         make_argv(),
                         fragments=("not a regular file",),
                         check_subprocess=False,
                     )
-                with mock.patch.object(Path, "is_symlink", return_value=True):
-                    self._assert_clean_failure(
-                        make_argv(),
-                        fragments=("symlink",),
-                        check_subprocess=False,
-                    )
-                    self._assert_clean_failure(
-                        make_argv(o=dir_path, ca=base / "sym_cache"),
-                        fragments=("symlink",),
-                        check_subprocess=False,
-                    )
 
             self.assertFalse(absent_out.parent.exists())
             self.assertEqual(file_target.read_text(encoding="utf-8"), "KEEP")
 
+            # Symlinked output/cache are the caller's chosen location and now
+            # succeed: the bundle is written through the link into its target.
             link_out = base / "link_out"
             try:
                 link_out.symlink_to(dir_path)
@@ -345,8 +338,125 @@ class CompileLdsRequestNegativeAndMutationTests(unittest.TestCase):
                 if getattr(exc, "winerror", None) != 1314:
                     raise
             else:
-                self._assert_clean_failure(make_argv(o=link_out), fragments=("output", "symlink"))
-                self._assert_clean_failure(make_argv(o=dir_path, ca=link_out), fragments=("cache", "symlink"))
+                with mock.patch.object(compile_lds_request.subprocess, "run", side_effect=_fake_compile_dxil()):
+                    code_link, out_link, err_link = _run_main(compile_lds_request, make_argv(o=link_out))
+                self.assertEqual(code_link, 0, err_link)
+                self.assertEqual(err_link, "")
+                dest_link = Path(out_link.strip())
+                self.assertEqual(dest_link.resolve().parent, dir_path)
+                self.assertTrue((dest_link / f"{key:016x}.cs.hlsl").is_file())
+                self.assertEqual(list(link_out.iterdir()), [dest_link])
+                # The same bundle through a symlinked cache warm-reuses the
+                # bundle written above instead of refusing the link.
+                with mock.patch.object(compile_lds_request.subprocess, "run", side_effect=_fake_compile_dxil()):
+                    code_ca, out_ca, err_ca = _run_main(compile_lds_request, make_argv(o=dir_path, ca=link_out))
+                self.assertEqual(code_ca, 0, err_ca)
+                self.assertEqual(err_ca, "")
+                self.assertEqual(Path(out_ca.strip()), dest_link.resolve())
+
+    def test_fifo_output_and_dangling_symlink_parent_refusals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            req_dir = base / "req"
+            req_dir.mkdir()
+            compiler, sdk, output, cache = _setup_env(base)
+            _, marker = _write_case_f(req_dir)
+
+            def make_argv(*, o: Path = output, ca: Path = cache) -> list[str]:
+                return [
+                    str(marker),
+                    str(o),
+                    "--compiler",
+                    str(compiler),
+                    "--sdk",
+                    str(sdk),
+                    "--cache",
+                    str(ca),
+                    "--rw-image",
+                    "0",
+                    "0",
+                    "--wave-size",
+                    "32",
+                ]
+
+            ran = False
+            # A FIFO is neither a file nor a directory: refused, not written through.
+            if hasattr(os, "mkfifo"):
+                fifo_out = base / "fifo_out"
+                os.mkfifo(fifo_out)
+                self._assert_clean_failure(make_argv(o=fifo_out), fragments=("output", "not a directory"))
+                ran = True
+
+            # A dangling symlink as a parent is not a directory: refused, not followed.
+            dangling = base / "dangling"
+            try:
+                dangling.symlink_to(base / "no_such_target")
+            except OSError as exc:
+                if getattr(exc, "winerror", None) != 1314:
+                    raise
+            else:
+                self._assert_clean_failure(
+                    make_argv(o=dangling / "output"),
+                    fragments=("output parent", "not a directory"),
+                )
+                self._assert_clean_failure(
+                    make_argv(ca=dangling / "cache"),
+                    fragments=("cache parent", "not a directory"),
+                )
+                ran = True
+
+            if not ran:
+                self.skipTest("neither FIFOs nor symlinks are available on this platform")
+
+    def test_translator_bug_keeps_traceback_and_out_of_range_branch_is_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            req_dir = base / "req"
+            req_dir.mkdir()
+            compiler, sdk, output, cache = _setup_env(base)
+
+            def make_argv(m: Path) -> list[str]:
+                return [
+                    str(m),
+                    str(output),
+                    "--compiler",
+                    str(compiler),
+                    "--sdk",
+                    str(sdk),
+                    "--cache",
+                    str(cache),
+                    "--rw-image",
+                    "0",
+                    "0",
+                    "--wave-size",
+                    "32",
+                ]
+
+            def write_modified_case(name: str, dword_index: int, value: int) -> Path:
+                _, code, rsrc2, group, _ = CASES[name]
+                words = list(struct.unpack(f"<{len(code) // 4}I", code))
+                words[dword_index] = value
+                key = write_request(req_dir, struct.pack(f"<{len(words)}I", *words), state_a(group, rsrc2))
+                return req_dir / f"req_{key:016x}.c67"
+
+            # A translator bug (bad literal) must keep its traceback instead of
+            # being swallowed into a clean "error:" line.
+            bad_marker = write_modified_case("F", 4, 0xbf84C07F)
+            with self.assertRaises(ValueError) as raised:
+                _run_main(compile_lds_request, make_argv(bad_marker))
+            self.assertIn("invalid literal for int()", str(raised.exception))
+            proc = _run_subprocess(*make_argv(bad_marker))
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout, "")
+            self.assertIn("Traceback", proc.stderr)
+            self.assertIn("invalid literal for int()", proc.stderr)
+
+            # An out-of-range branch target is refused cleanly as unsupported.
+            branch_marker = write_modified_case("extracted-tid", 9, 0xbf852005)
+            self._assert_clean_failure(
+                make_argv(branch_marker),
+                fragments=("branch target", "outside the compute stage"),
+            )
 
     def test_cli_arg_errors_key_mismatch_conditional_barrier_and_compiler_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -466,8 +576,15 @@ class CompileLdsRequestNegativeAndMutationTests(unittest.TestCase):
             saved_cso = cso_path.read_bytes()
 
             def check_drop_marker_guard(mod):
-                with mock.patch.object(mod.subprocess, "run", side_effect=_fake_compile_dxil()):
-                    _, _, err = _run_main(mod, argv_for(m=req_dir / "req_0123456789abcdef.c67"))
+                # Dropping the guard no longer refuses the missing marker
+                # cleanly: the tool either reaches the copy and crashes on the
+                # missing file, or reports a different error. Either way the
+                # guard's refusal is gone, which is what this control detects.
+                try:
+                    with mock.patch.object(mod.subprocess, "run", side_effect=_fake_compile_dxil()):
+                        _, _, err = _run_main(mod, argv_for(m=req_dir / "req_0123456789abcdef.c67"))
+                except Exception:
+                    return
                 self.assertNotIn("request marker file not found", err.lower())
 
             def check_drop_companion_guard(mod):
@@ -475,8 +592,11 @@ class CompileLdsRequestNegativeAndMutationTests(unittest.TestCase):
                 saved = root_file.read_bytes()
                 root_file.unlink()
                 try:
-                    with mock.patch.object(mod.subprocess, "run", side_effect=_fake_compile_dxil()):
-                        _, _, err = _run_main(mod, argv_for())
+                    try:
+                        with mock.patch.object(mod.subprocess, "run", side_effect=_fake_compile_dxil()):
+                            _, _, err = _run_main(mod, argv_for())
+                    except Exception:
+                        return
                     self.assertNotIn("companion .root file not found", err.lower())
                 finally:
                     root_file.write_bytes(saved)
@@ -490,11 +610,6 @@ class CompileLdsRequestNegativeAndMutationTests(unittest.TestCase):
                 with mock.patch.object(mod.subprocess, "run", side_effect=_fake_compile_dxil(validate_paths=False)):
                     _, _, err = _run_main(mod, argv_for(s=base / "missing_sdk"))
                 self.assertNotIn("sdk directory not found", err.lower())
-
-            def check_drop_symlink_guard(mod):
-                with mock.patch.object(Path, "is_symlink", return_value=True):
-                    _, _, err = _run_main(mod, argv_for())
-                self.assertNotIn("must not be a symlink", err.lower())
 
             def check_drop_rw_image_guard(mod):
                 with mock.patch.object(mod.subprocess, "run", side_effect=_fake_compile_dxil()):
@@ -517,73 +632,74 @@ class CompileLdsRequestNegativeAndMutationTests(unittest.TestCase):
                 self.assertNotIn("workgroup barrier is conditional", err.lower())
                 self.assertEqual(code, 0, err)
 
+            # Mutation targets are regular expressions, not exact source lines:
+            # they pin the distinctive structure (call, guard, loop) without
+            # depending on quote style, exception type or message wording, so
+            # a reword or requote of a guard does not silently unpin the control.
             mutations = (
                 (
                     "drop_marker_guard",
-                    "    _validate_regular_file(args.marker, 'request marker')\n",
+                    r"    _validate_regular_file\(args\.marker, [^\n]*\)\n",
                     "    pass\n",
                     check_drop_marker_guard,
                 ),
                 (
                     "drop_companion_guard",
-                    "    for ext in ('.root', '.data', '.desc', '.sa', '.sb'):\n"
-                    "        _validate_regular_file(args.marker.with_suffix(ext), f'companion {ext}')\n",
+                    r"    for ext in \([^\n]*\):\n"
+                    r"        _validate_regular_file\(args\.marker\.with_suffix\(ext\), [^\n]*\)\n",
                     "    pass\n",
                     check_drop_companion_guard,
                 ),
                 (
                     "drop_compiler_guard",
-                    "    _validate_regular_file(args.compiler, 'compiler')\n",
+                    r"    _validate_regular_file\(args\.compiler, [^\n]*\)\n",
                     "    pass\n",
                     check_drop_compiler_guard,
                 ),
                 (
                     "drop_sdk_guard",
-                    "    if not args.sdk.exists():\n"
-                    "        raise FileNotFoundError(f'SDK directory not found: {args.sdk}')\n"
-                    "    if not args.sdk.is_dir():\n"
-                    "        raise NotADirectoryError(f'SDK path is not a directory: {args.sdk}')\n",
+                    r"    if not args\.sdk\.exists\(\):\n"
+                    r"        raise [^\n]*\n"
+                    r"    if not args\.sdk\.is_dir\(\):\n"
+                    r"        raise [^\n]*\n",
                     "    pass\n",
                     check_drop_sdk_guard,
                 ),
                 (
-                    "drop_symlink_guard",
-                    "    if path.is_symlink():\n"
-                    "        raise ValueError(f'{label} directory must not be a symlink: {path}')\n",
-                    "    pass\n",
-                    check_drop_symlink_guard,
-                ),
-                (
                     "drop_rw_image_guard",
-                    "    if param < 0 or off < 0 or off % 32:\n"
-                    "        parser.error('expected a nonnegative parameter and a 32-byte-aligned descriptor offset')\n",
+                    r"    if param < 0 or off < 0 or off ?% ?32:\n"
+                    r"        parser\.error\([^\n]*\)\n",
                     "    pass\n",
                     check_drop_rw_image_guard,
                 ),
                 (
                     "drop_bundle_sha256",
-                    "                for relative, digest in metadata['sha256'].items():\n"
-                    "                    if hashlib.sha256((dest / relative).read_bytes()).hexdigest() != digest:\n"
-                    "                        raise RuntimeError(f'damaged replay artifact {relative}')\n",
+                    r"                for relative, digest in metadata\[['\"]sha256['\"]\]\.items\(\):\n"
+                    r"                    try:\n"
+                    r"                        data = \(dest / relative\)\.read_bytes\(\)\n"
+                    r"                    except OSError:\n"
+                    r"                        raise [^\n]*\n"
+                    r"                    if hashlib\.sha256\(data\)\.hexdigest\(\) != digest:\n"
+                    r"                        raise [^\n]*\n",
                     "                pass\n",
                     check_drop_bundle_sha256,
                 ),
                 (
                     "drop_conditional_barrier",
-                    "                    if i not in post[0]:\n"
-                    "                        raise gfx.Unsupported('workgroup barrier is conditional')\n",
+                    r"                    if i not in post\[0\]:\n"
+                    r"                        raise [^\n]*\n",
                     "                    pass\n",
                     check_drop_conditional_barrier,
                 ),
             )
-            for label, target, replacement, check_fn in mutations:
+            for label, pattern, replacement, check_fn in mutations:
                 with self.subTest(mutation=label):
-                    self.assertEqual(source.count(target), 1, f"target not unique for {label}")
+                    self.assertEqual(len(re.findall(pattern, source)), 1, f"target not unique for {label}")
                     mod = types.ModuleType(f"compile_lds_request_mut_{label}")
                     mod.__file__ = str(TOOL)
                     sys.modules[mod.__name__] = mod
                     try:
-                        exec(compile(source.replace(target, replacement, 1), str(TOOL), "exec"), mod.__dict__)
+                        exec(compile(re.sub(pattern, replacement, source, count=1), str(TOOL), "exec"), mod.__dict__)
                         check_fn(mod)
                     finally:
                         sys.modules.pop(mod.__name__, None)

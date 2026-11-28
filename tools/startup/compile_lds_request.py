@@ -96,8 +96,12 @@ class ComputeStage(gfx.Stage):
             elif term[0] == 'end':
                 dest = []
             elif term[0] == 'jump':
+                if term[1] not in index:
+                    raise gfx.Unsupported(f'branch target {term[1]} is outside the compute stage')
                 dest = [index[term[1]]]
             elif term[0] == 'branch':
+                if term[2] not in index:
+                    raise gfx.Unsupported(f'branch target {term[2]} is outside the compute stage')
                 dest = [i+1,index[term[2]]]
             else:
                 raise gfx.Unsupported('unsupported compute branch')
@@ -134,6 +138,15 @@ class ComputeStage(gfx.Stage):
         return lines
 
 
+class CompileLdsRequestError(ValueError):
+    """Error raised by this tool's own CLI and artifact guards.
+
+    Only this type (plus gfx.Unsupported and subprocess.CalledProcessError)
+    is caught in main(); anything else keeps its traceback, so a real
+    translator bug is never mistaken for a deliberate refusal.
+    """
+
+
 class ComputePipeline(gfx.ComputePipeline):
     stage_type = ComputeStage
 
@@ -144,21 +157,26 @@ class ComputePipeline(gfx.ComputePipeline):
 
 def _validate_regular_file(path: Path, label: str) -> None:
     if path.is_dir():
-        raise IsADirectoryError(f'{label} path is a directory: {path}')
+        raise CompileLdsRequestError(f'{label} path is a directory: {path}')
     if not path.exists():
-        raise FileNotFoundError(f'{label} file not found: {path}')
+        raise CompileLdsRequestError(f'{label} file not found: {path}')
     if not path.is_file():
-        raise ValueError(f'{label} path is not a regular file: {path}')
+        raise CompileLdsRequestError(f'{label} path is not a regular file: {path}')
 
 
 def _validate_writable_dir(path: Path, label: str) -> None:
-    if path.is_symlink():
-        raise ValueError(f'{label} directory must not be a symlink: {path}')
+    """Reject paths that are files or whose parents are files or dangling links.
+
+    A symlink component is allowed: the bundle is written through a
+    TemporaryDirectory inside the output and moved into place with an atomic
+    rename, so a symlinked output or cache is simply the caller's chosen
+    location. Only a component that is not a directory at all is refused.
+    """
     if path.is_file() or (path.exists() and not path.is_dir()):
-        raise NotADirectoryError(f'{label} path is not a directory: {path}')
+        raise CompileLdsRequestError(f'{label} path is not a directory: {path}')
     for parent in path.parents:
         if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
-            raise NotADirectoryError(f'{label} parent is not a directory: {parent}')
+            raise CompileLdsRequestError(f'{label} parent is not a directory: {parent}')
 
 
 def _validate_paths(args: argparse.Namespace) -> None:
@@ -167,29 +185,29 @@ def _validate_paths(args: argparse.Namespace) -> None:
         _validate_regular_file(args.marker.with_suffix(ext), f'companion {ext}')
     _validate_regular_file(args.compiler, 'compiler')
     if not args.sdk.exists():
-        raise FileNotFoundError(f'SDK directory not found: {args.sdk}')
+        raise CompileLdsRequestError(f'SDK directory not found: {args.sdk}')
     if not args.sdk.is_dir():
-        raise NotADirectoryError(f'SDK path is not a directory: {args.sdk}')
+        raise CompileLdsRequestError(f'SDK path is not a directory: {args.sdk}')
     _validate_writable_dir(args.output, 'output')
     _validate_writable_dir(args.cache, 'cache')
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('marker', type=Path)
-    parser.add_argument('output', type=Path)
-    parser.add_argument('--compiler', required=True, type=Path)
-    parser.add_argument('--sdk', required=True, type=Path)
-    parser.add_argument('--cache', required=True, type=Path)
-    parser.add_argument('--rw-image', required=True, nargs=2, type=int, metavar=('PARAM', 'BYTE_OFFSET'))
-    parser.add_argument('--wave-size', required=True, type=int, choices=[32, 64])
+    parser.add_argument('marker',type=Path)
+    parser.add_argument('output',type=Path)
+    parser.add_argument('--compiler',required=True,type=Path)
+    parser.add_argument('--sdk',required=True,type=Path)
+    parser.add_argument('--cache',required=True,type=Path)
+    parser.add_argument('--rw-image',required=True,nargs=2,type=int,metavar=('PARAM','BYTE_OFFSET'))
+    parser.add_argument('--wave-size',required=True,type=int,choices=[32,64])
     args = parser.parse_args(argv)
     name = args.marker.name
-    if not re.fullmatch(r'req_[0-9a-f]{16}\.c67', name):
+    if not re.fullmatch(r'req_[0-9a-f]{16}\.c67',name):
         parser.error('expected req_<16 hex digits>.c67')
-    key = int(name[4:20], 16)
-    param, off = args.rw_image
-    if param < 0 or off < 0 or off % 32:
+    key = int(name[4:20],16)
+    param,off = args.rw_image
+    if param < 0 or off < 0 or off%32:
         parser.error('expected a nonnegative parameter and a 32-byte-aligned descriptor offset')
     try:
         _validate_paths(args)
@@ -224,14 +242,21 @@ def main(argv=None) -> int:
             dest = args.output / f'{key:016x}-{hashlib.sha256(replay.encode()).hexdigest()}'
             try:
                 bundle.rename(dest)
-            except OSError:
-                if not dest.is_dir() or (dest / 'replay.json').read_bytes() != replay.encode():
-                    raise
+            except OSError as error:
+                if not dest.is_dir():
+                    raise CompileLdsRequestError(f'cannot move replay bundle to {dest}: {error}') from error
+                replay_path = dest / 'replay.json'
+                if not replay_path.is_file() or replay_path.read_bytes() != replay.encode():
+                    raise CompileLdsRequestError(f'damaged replay artifact replay.json in {dest}') from error
                 for relative, digest in metadata['sha256'].items():
-                    if hashlib.sha256((dest / relative).read_bytes()).hexdigest() != digest:
-                        raise RuntimeError(f'damaged replay artifact {relative}')
+                    try:
+                        data = (dest / relative).read_bytes()
+                    except OSError:
+                        raise CompileLdsRequestError(f'damaged replay artifact {relative}') from None
+                    if hashlib.sha256(data).hexdigest() != digest:
+                        raise CompileLdsRequestError(f'damaged replay artifact {relative}')
             print(dest)
-    except (OSError, ValueError, gfx.Unsupported, RuntimeError, subprocess.CalledProcessError) as error:
+    except (gfx.Unsupported, subprocess.CalledProcessError, CompileLdsRequestError) as error:
         print(f'error: {error}', file=sys.stderr)
         return 1
     return 0
