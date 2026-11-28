@@ -47,18 +47,24 @@ def program(wave_size, width, offset, scc):
         0x34100082,  # v_lshlrev_b32 v8, 2, v0
         0x4A101007,  # v_add_nc_u32 v8, s7, v8
     ]
+    # EXEC is never narrowed here (unlike the s_not_b64 template, which
+    # narrows it to a mask), so there is nothing to restore before readback:
+    # in wave64 it is already all ones, and in wave32 widening EXEC_HI from
+    # the seeded 1 to all ones would only enable lanes that do not exist.
     words += [
         set_scc(scc),
         scalar(BFM_B64, VCC, ZERO + width, ZERO + offset),
         vmove(1, 129),  # v_mov_b32 v1, 1
         vop2(1, 9, 128, 1),  # v_cndmask_b32 v9, 0, v1, vcc
-        sop1(MOV_B64, EXEC, NEG_ONE),
         scalar(0x0A, SCC_OUT, ZERO + 1, ZERO),  # s_cselect_b32 s26, 1, 0
     ]
     # Plane 0 holds the v_cndmask_b32 result: a fourth plane would need a
     # 4096-byte immediate offset, past the 12-bit field of the store word.
-    for vgpr, plane in ((9, 0), (VCC, 1), (VCC + 1, 2), (SCC_OUT, 3)):
-        words += [vmove(1, vgpr), *store(1, plane)]
+    # Store v9 directly: vmove(1, 9) would encode v_mov_b32 v1, s9 (an
+    # unbound SGPR), not VGPR v9. Only SGPR sources go through vmove.
+    words += [*store(9, 0)]
+    for sgpr, plane in ((VCC, 1), (VCC + 1, 2), (SCC_OUT, 3)):
+        words += [vmove(1, sgpr), *store(1, plane)]
     return words + [END]
 
 
