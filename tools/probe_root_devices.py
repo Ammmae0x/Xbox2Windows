@@ -52,19 +52,13 @@ def main(argv=None):
             parser.error("Choose an input directory separate from the report directory")
         if not args.build.is_dir():
             raise NotADirectoryError(f"Build directory is not a directory: {args.build}")
-        if dest.parent.is_symlink():
-            raise OSError(f"Output directory must not be a symlink: {dest.parent}")
         if dest.parent.is_file():
             raise NotADirectoryError(f"Output parent is not a directory: {dest.parent}")
-        if dest.is_symlink():
-            raise OSError(f"Output path must not be a symlink: {dest}")
         if dest.is_dir():
             raise IsADirectoryError(f"Output path is a directory: {dest}")
         inventory_path = dest.parent / "six-apis.json"
         if not inventory_path.is_file():
             raise FileNotFoundError(f"Inventory file is missing or not a file: {inventory_path}")
-        if dest.resolve() == inventory_path.resolve() or (dest.exists() and dest.samefile(inventory_path)):
-            raise ValueError(f"Output path must not alias inventory: {dest}")
         inventory = json.loads(inventory_path.read_bytes())
         if not isinstance(inventory, dict):
             raise ValueError("Invalid six-apis.json inventory")

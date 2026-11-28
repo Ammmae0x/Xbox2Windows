@@ -42,13 +42,6 @@ MUTATIONS = (
         '                raise FileNotFoundError(f"Control shader is missing or not a file: {control_path}")\n',
     ),
     (
-        "drop_dest_is_symlink_guard",
-        "        if dest.is_symlink():\n"
-        '            raise OSError(f"Output path must not be a symlink: {dest}")\n',
-        "        if False:\n"
-        '            raise OSError(f"Output path must not be a symlink: {dest}")\n',
-    ),
-    (
         "drop_dest_is_dir_guard",
         "        if dest.is_dir():\n"
         '            raise IsADirectoryError(f"Output path is a directory: {dest}")\n',
@@ -313,7 +306,7 @@ class ProbeRootDevicesCliTests(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
             self.assertIn("probe_root_devices:", proc.stderr)
 
-    def test_dest_dir_symlink_file_parent_inside_build_and_hardlink_guards(self) -> None:
+    def test_dest_dir_file_parent_and_inside_build_guards(self) -> None:
         with TemporaryDirectory() as tmp:
             base = Path(tmp)
             repo, calls, build_dir, bin_dir = self._create_fixture(base)
@@ -337,50 +330,6 @@ class ProbeRootDevicesCliTests(unittest.TestCase):
             self.assertNotIn("Traceback", err)
             self.assertIn("separate from the report directory", err)
 
-            # dest hardlinked to six-apis.json is rejected without overwriting inventory
-            inv = calls / "six-apis.json"
-            inv_text = inv.read_text(encoding="utf-8")
-            dest.hardlink_to(inv)
-            code, _, err = _run_main(
-                probe_root_devices, [str(build_dir), "--warp-only", "--bin", str(bin_dir)], repo
-            )
-            self.assertEqual(code, 1)
-            self.assertNotIn("Traceback", err)
-            self.assertIn("must not alias inventory", err)
-            self.assertEqual(inv.read_text(encoding="utf-8"), inv_text)
-            dest.unlink()
-
-            # dest is a symlink (real symlink if permitted, else mock Path.is_symlink)
-            target = base / "untouched_target.json"
-            target.write_text("keep-target", encoding="ascii")
-            try:
-                dest.symlink_to(target)
-                symlink_created = True
-            except OSError as exc:
-                if getattr(exc, "winerror", None) != 1314:
-                    raise
-                symlink_created = False
-
-            if symlink_created:
-                code, _, err = _run_main(
-                    probe_root_devices, [str(build_dir), "--warp-only", "--bin", str(bin_dir)], repo
-                )
-                dest.unlink()
-            else:
-                real_is_symlink = Path.is_symlink
-
-                def fake_is_symlink(path_self):
-                    return path_self == dest or real_is_symlink(path_self)
-
-                with mock.patch.object(Path, "is_symlink", fake_is_symlink):
-                    code, _, err = _run_main(
-                        probe_root_devices, [str(build_dir), "--warp-only", "--bin", str(bin_dir)], repo
-                    )
-            self.assertEqual(code, 1)
-            self.assertNotIn("Traceback", err)
-            self.assertIn("Output path must not be a symlink", err)
-            self.assertEqual(target.read_text(encoding="ascii"), "keep-target")
-
             # dest.parent is a regular file
             repo2 = base / "repo_file_parent"
             (repo2 / "out").mkdir(parents=True)
@@ -393,19 +342,134 @@ class ProbeRootDevicesCliTests(unittest.TestCase):
             self.assertIn("Output parent is not a directory", err)
             self.assertEqual((repo2 / "out" / "calls").read_text(encoding="ascii"), "keep-parent-file")
 
-            # dest.parent is a symlink
-            real_is_symlink = Path.is_symlink
+    def test_atomic_replace_allows_symlink_and_hardlink_dest(self) -> None:
+        # Restored main behaviour: temporary.replace(dest) renames over the
+        # directory entry, so it never writes through a symlink or hardlink.
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo, calls, build_dir, bin_dir = self._create_fixture(base)
+            dest = calls / "root-devices-warp.json"
+            inv = calls / "six-apis.json"
+            inv_text = inv.read_text(encoding="utf-8")
 
-            def fake_parent_symlink(path_self):
-                return path_self == calls or real_is_symlink(path_self)
+            # dest hardlinked to six-apis.json: report written, inventory unchanged.
+            dest.hardlink_to(inv)
+            code, _, err = _run_main(
+                probe_root_devices, [str(build_dir), "--warp-only", "--bin", str(bin_dir)], repo
+            )
+            self.assertEqual(code, 0, err)
+            self.assertTrue(dest.is_file())
+            self.assertFalse(dest.is_symlink())
+            self.assertEqual(inv.read_text(encoding="utf-8"), inv_text)
+            self.assertIn(probe_root_devices.NAMES[0], json.loads(dest.read_text(encoding="utf-8"))["images"])
 
-            with mock.patch.object(Path, "is_symlink", fake_parent_symlink):
+            # dest a symlink to six-apis.json: the link is replaced by the report.
+            dest.unlink()
+            dest.symlink_to(inv)
+            code, _, err = _run_main(
+                probe_root_devices, [str(build_dir), "--warp-only", "--bin", str(bin_dir)], repo
+            )
+            self.assertEqual(code, 0, err)
+            self.assertTrue(dest.is_file())
+            self.assertFalse(dest.is_symlink())
+            self.assertEqual(inv.read_text(encoding="utf-8"), inv_text)
+
+            # dest.parent a directory symlink to another folder: report lands there.
+            target = base / "target_calls"
+            target.mkdir()
+            (target / "six-apis.json").write_text(inv_text, encoding="utf-8")
+            repo2 = base / "repo_parent_link"
+            (repo2 / "out").mkdir(parents=True)
+            (repo2 / "out" / "calls").symlink_to(target, target_is_directory=True)
+            code, _, err = _run_main(
+                probe_root_devices, [str(build_dir), "--warp-only", "--bin", str(bin_dir)], repo2
+            )
+            self.assertEqual(code, 0, err)
+            self.assertTrue((target / "root-devices-warp.json").is_file())
+            self.assertEqual((target / "six-apis.json").read_text(encoding="utf-8"), inv_text)
+
+    def test_guards_fail_before_reading_or_measuring(self) -> None:
+        # Behavioural pins for the remaining guards (M1-M4): each guard must
+        # fail before the guarded read/measure is attempted, not merely with a
+        # different message. A deleted guard lets the guarded operation run,
+        # which the mocks below turn into a test error.
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo, calls, build_dir, bin_dir = self._create_fixture(base)
+            real_read_bytes = Path.read_bytes
+
+            def _no_read(name):
+                def _guarded(path_self, *args, **kwargs):
+                    if path_self.name == name:
+                        raise AssertionError(f"read attempted for {name} despite guard")
+                    return real_read_bytes(path_self, *args, **kwargs)
+
+                return _guarded
+
+            def _no_image_measure(cmd, *, input, stdout, check, timeout):
+                if input not in (b"CTRL_ROOT", b"CTRL_TABLES"):
+                    raise AssertionError("image probe called despite guard")
+                return _fake_probe_ok(cmd, input=input, stdout=stdout, check=check, timeout=timeout)
+
+            # M1: missing build fails before the inventory is read, and wins
+            # over a missing inventory (guard ordering, not just wording).
+            (calls / "six-apis.json").unlink()
+            with mock.patch.object(Path, "read_bytes", _no_read("six-apis.json")):
+                code, _, err = _run_main(
+                    probe_root_devices,
+                    [str(base / "missing_build"), "--warp-only", "--bin", str(bin_dir)],
+                    repo,
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("Build directory is not a directory", err)
+            (calls / "six-apis.json").write_text(
+                json.dumps(
+                    {
+                        probe_root_devices.NAMES[0]: {
+                            "sha256": "0" * 64,
+                            "containers": [],
+                        },
+                        probe_root_devices.NAMES[1]: {"sha256": "0" * 64, "containers": []},
+                        probe_root_devices.NAMES[2]: {"sha256": "0" * 64, "containers": []},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # M2: dest.parent is a file fails before any image probe runs.
+            repo2 = base / "repo_file_parent"
+            (repo2 / "out").mkdir(parents=True)
+            (repo2 / "out" / "calls").write_text("keep-parent-file", encoding="ascii")
+            code, _, err = _run_main(
+                probe_root_devices,
+                [str(build_dir), "--warp-only", "--bin", str(bin_dir)],
+                repo2,
+                fake_run=_no_image_measure,
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("Output parent is not a directory", err)
+
+            # M3: missing inventory fails before the inventory is read.
+            (calls / "six-apis.json").unlink()
+            with mock.patch.object(Path, "read_bytes", _no_read("six-apis.json")):
                 code, _, err = _run_main(
                     probe_root_devices, [str(build_dir), "--warp-only", "--bin", str(bin_dir)], repo
                 )
             self.assertEqual(code, 1)
-            self.assertNotIn("Traceback", err)
-            self.assertIn("Output directory must not be a symlink", err)
+            self.assertIn("Inventory file is missing or not a file", err)
+            # Restore the fixture inventory for the M4 case below.
+            repo3, calls3, build_dir3, bin_dir3 = self._create_fixture(base / "fixture2")
+            repo, calls, build_dir, bin_dir = repo3, calls3, build_dir3, bin_dir3
+
+            # M4: missing build image fails before the image is read.
+            img = build_dir / probe_root_devices.NAMES[0]
+            img.unlink()
+            with mock.patch.object(Path, "read_bytes", _no_read(probe_root_devices.NAMES[0])):
+                code, _, err = _run_main(
+                    probe_root_devices, [str(build_dir), "--warp-only", "--bin", str(bin_dir)], repo
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("Build image is missing or not a file", err)
 
     def test_os_replace_failure_preserves_bytes_and_zero_temps(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -460,9 +524,6 @@ class ProbeRootDevicesCliTests(unittest.TestCase):
                         "Control shader is missing or not a file",
                         _run_main(mod, ["--warp-only", "--bin", str(bad_cso_bin)], repo)[2],
                     ),
-                    "drop_dest_is_symlink_guard": lambda mod: self._assert_symlink_guard_fires(
-                        mod, build_dir, bin_dir, repo, dest
-                    ),
                     "drop_dest_is_dir_guard": lambda mod: self._assert_dir_guard_fires(
                         mod, build_dir, bin_dir, repo, dest
                     ),
@@ -485,16 +546,6 @@ class ProbeRootDevicesCliTests(unittest.TestCase):
                         checks[label](mod)
                 finally:
                     sys.modules.pop(mod_name, None)
-
-    def _assert_symlink_guard_fires(self, mod, build_dir: Path, bin_dir: Path, repo: Path, dest: Path) -> None:
-        real_is_symlink = Path.is_symlink
-
-        def fake_is_symlink(path_self):
-            return path_self == dest or real_is_symlink(path_self)
-
-        with mock.patch.object(Path, "is_symlink", fake_is_symlink):
-            _, _, err = _run_main(mod, [str(build_dir), "--warp-only", "--bin", str(bin_dir)], repo)
-        self.assertIn("Output path must not be a symlink", err)
 
     def _assert_dir_guard_fires(self, mod, build_dir: Path, bin_dir: Path, repo: Path, dest: Path) -> None:
         dest.mkdir()
