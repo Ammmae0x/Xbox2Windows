@@ -1954,6 +1954,12 @@ if(TARGET compile_dxil AND EXISTS "${DXC_BIN_DIR}/dxcompiler.dll" AND EXISTS "${
         "${CMAKE_SOURCE_DIR}/tests/native_compute_clear_check.py" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
     add_test(NAME native_compute_raw_root COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/native_compute_raw_root_check.py" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_native_graphics_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_native_graphics_draw_check.py"
+            "$<TARGET_FILE:startup_stream_consumer>" "$<TARGET_FILE:compile_dxil>" "${DXC_BIN_DIR}" ${adapter})
+        set_tests_properties(startup_native_graphics_draw_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     foreach(backend IN ITEMS hardware warp)
         add_test(NAME native_descriptor_scc_${backend} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/native_descriptor_scc_check.py" "$<TARGET_FILE:compile_dxil>"
